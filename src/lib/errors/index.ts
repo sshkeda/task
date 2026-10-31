@@ -1,0 +1,15 @@
+export {
+  AwaitedTaskFailed,
+  CapturedCommandFailed,
+  CommandFailed,
+  CommandNotStarted,
+  CommandStandardInputFailed,
+  PrintableError,
+  ReportedErrors,
+  REPORTED_FAILURE_FIELDS,
+  SettledTasksFailed,
+  TaskError,
+  TaskNotMadeAtTopLevel,
+  TaskResultNotJson,
+  TaskWaitsOnItself,
+} from "./internal/errors.ts";

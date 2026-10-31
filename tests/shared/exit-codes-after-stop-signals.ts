@@ -1,0 +1,5 @@
+export const EXIT_CODE_AFTER_SIGHUP = 129;
+
+export const EXIT_CODE_AFTER_SIGINT = 130;
+
+export const EXIT_CODE_AFTER_SIGTERM = 143;
