@@ -326,8 +326,8 @@ export default lintConfig({
       },
     ],
   },
-  vendor: { allow: ["isAnUnlistedDirectory"] },
-  "vendor/sshkeda-check-1.0.0.tgz": { allow: ["hasAnUnlistedFileType"] },
   "src/lib/main-thread": { cannotImport: ["src/lib/worker-thread"] },
   "src/lib/worker-thread": { cannotImport: ["src/lib/main-thread"] },
+  ".github": { allow: ["isAnUnlistedDirectory"] },
+  ".github/workflows/publish.yml": { allow: ["hasAnUnlistedFileType"] },
 });

@@ -10,7 +10,7 @@
       },
       "devDependencies": {
         "@effect/tsgo": "0.55.0",
-        "@sshkeda/check": "file:./vendor/sshkeda-check-1.0.0.tgz",
+        "@sshkeda/check": "^1.0.1",
         "@sshkeda/task": "file:.",
         "@types/bun": "1.4.3",
         "effect": "4.1.0",
@@ -180,7 +180,7 @@
 
     "@oxlint/plugins": ["@oxlint/plugins@1.87.0", "", {}, "sha512-OtSZ6NxNkS7bkVy7zk9zGnajz2hVIu0uRPP/dJvJesGRaXtimpA4lpxap7FaIJndG2UIoKhnBU4DxyDQIWv6yg=="],
 
-    "@sshkeda/check": ["@sshkeda/check@./vendor/sshkeda-check-1.0.0.tgz", { "dependencies": { "@effect/platform-bun": "4.1.0", "@effect/tsgo": "0.55.0", "@oxlint/plugins": "1.87.0", "oxc-parser": "0.153.0", "oxc-resolver": "11.24.2", "oxlint": "1.87.0", "oxlint-tsgolint": "7.0.2005", "typescript": "7.0.2" }, "peerDependencies": { "@sshkeda/task": "^1.0.0", "effect": "^4.1.0" }, "optionalPeers": ["@sshkeda/task"] }, "sha512-76W5Bs+3fl7A/9dyLyRaN4s6W+OT/DEagONWvemHK3A+GCnsHrSL8C7+pElOk5SMydY9vI31P7/cedMVRo9pNg=="],
+    "@sshkeda/check": ["@sshkeda/check@1.0.1", "", { "dependencies": { "@effect/platform-bun": "4.1.0", "@effect/tsgo": "0.55.0", "@oxlint/plugins": "1.87.0", "oxc-parser": "0.153.0", "oxc-resolver": "11.24.2", "oxlint": "1.87.0", "oxlint-tsgolint": "7.0.2005", "typescript": "7.0.2" }, "peerDependencies": { "@sshkeda/task": "^1.0.0", "effect": "^4.1.0" }, "optionalPeers": ["@sshkeda/task"] }, "sha512-d1MV25kBAZ4slI6Wz7LKux8c9yC1y9wKv1qZiH33bNebduRGIq5GLWN7ECCT8ljGWu6Zho3VF10lPFEsn8b3QQ=="],
 
     "@sshkeda/task": ["@sshkeda/task@root:", {}],
 

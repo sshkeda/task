@@ -28,7 +28,7 @@
   },
   "devDependencies": {
     "@effect/tsgo": "0.55.0",
-    "@sshkeda/check": "file:./vendor/sshkeda-check-1.0.0.tgz",
+    "@sshkeda/check": "^1.0.1",
     "@sshkeda/task": "file:.",
     "@types/bun": "1.4.3",
     "effect": "4.1.0",
