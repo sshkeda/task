@@ -110,9 +110,79 @@ const reportReason = (
 
 const isRangeError = Schema.is(Schema.instanceOf(RangeError));
 
-export const causeWithPrintableErrors = <Failure>(cause: Cause.Cause<Failure>) =>
+const MOST_NESTED_PRINTED_CAUSES = 100;
+
+const FailureWithCause = Schema.Struct({ cause: Schema.Unknown });
+
+const EFFECT_INTERNAL_STACK_LINE = /Generator\.next|~effect\/(?:Effect|Utils)/u;
+
+const withoutCause = <Link>(link: Link) =>
+  Option.match(Schema.decodeUnknownOption(ErrorFields)(link), {
+    onSome: (fields) =>
+      Object.fromEntries(Object.entries(fields).filter(([key]) => key !== "cause")),
+    onNone: () => link,
+  });
+
+const causeChainOfReason = <Failure>(reason: Cause.Reason<Failure>) => {
+  const followed = new Set();
+  return Arrays.unfold(Arrays.head(failureValuesOfReason(reason)), (link) =>
+    Option.map(
+      Option.filter(link, (linkValue) => !followed.has(linkValue)),
+      (linkValue) => {
+        followed.add(linkValue);
+        const cause = Option.filter(
+          Option.map(
+            Schema.decodeUnknownOption(FailureWithCause)(linkValue),
+            (withCause) => withCause.cause,
+          ),
+          (causeValue) => causeValue !== undefined,
+        );
+        return [linkValue, cause] as const;
+      },
+    ),
+  );
+};
+
+const withFlatDeepCauseChains = <Failure>(cause: Cause.Cause<Failure>) =>
+  Cause.fromReasons(
+    cause.reasons.flatMap((reason): readonly Cause.Reason<Failure>[] => {
+      const chain = causeChainOfReason(reason);
+      if (chain.length <= MOST_NESTED_PRINTED_CAUSES) {
+        return [reason];
+      }
+      const chainLines = chain.map((link) =>
+        Option.match(Schema.decodeUnknownOption(ErrorStack)(link), {
+          onSome: (withStack) => withStack.stack,
+          onNone: () =>
+            Option.match(Schema.decodeUnknownOption(UserError)(link), {
+              onSome: (userError) => `${userError.name}: ${userError.message}`,
+              onNone: () => Formatter.format(withoutCause(link)),
+            }),
+        }),
+      );
+      const [firstLink] = chain;
+      const flatChain = Option.getOrElse(Schema.decodeUnknownOption(UserError)(firstLink), () => ({
+        name: "Error",
+        message: Formatter.format(withoutCause(firstLink)),
+      }));
+      return Cause.annotate(
+        Cause.die({
+          ...flatChain,
+          stack: chainLines
+            .join("\n[cause]: ")
+            .split("\n")
+            .filter((line) => !EFFECT_INTERNAL_STACK_LINE.test(line))
+            .join("\n"),
+        }),
+        Cause.reasonAnnotations(reason),
+      ).reasons;
+    }),
+  );
+
+export const causeWithPrintableErrors = <Failure>(failedCause: Cause.Cause<Failure>) =>
   Result.getOrElse(
     Result.try(() => {
+      const cause = withFlatDeepCauseChains(failedCause);
       Cause.pretty(cause);
       return cause;
     }),
@@ -121,7 +191,9 @@ export const causeWithPrintableErrors = <Failure>(cause: Cause.Cause<Failure>) =
         throw formattingFailure;
       }
       return Cause.die(
-        new Error(Formatter.format({ cause, formattingFailure }, { ignoreToString: true })),
+        new Error(
+          Formatter.format({ cause: failedCause, formattingFailure }, { ignoreToString: true }),
+        ),
       );
     },
   );
