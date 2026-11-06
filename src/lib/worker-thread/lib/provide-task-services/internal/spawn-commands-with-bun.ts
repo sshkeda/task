@@ -266,6 +266,7 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
       const signal = killOptions?.killSignal ?? "SIGTERM";
       const forceKillAfter = readForceKillAfter(killOptions);
       yield* signalProcessGroupUnlessReused(subprocess, signal);
+      yield* signalProcessGroupUnlessReused(subprocess, "SIGCONT");
       const ended = yield* Deferred.await(exitedDeferred).pipe(
         Effect.timeoutOption(forceKillAfter),
       );

@@ -696,6 +696,33 @@ if (import.meta.main) Task.main(main);`,
   { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
+export const suspendedCommandGetsTerm = Task.make(
+  "stopping a task whose command was suspended with SIGSTOP continues it, so it handles SIGTERM and exits instead of waiting out the task's cleanup limit",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+import { TaskError } from "@sshkeda/task/errors";
+export const suspended = Task.make("suspended", Task.exec("sh", ["-c", "trap 'echo got TERM; exit 0' TERM; echo $$ > pid; kill -STOP $$; while true; do sleep 1; done"]), { cleanup: "4 seconds" });
+export const failing = Task.make("failing", Effect.gen(function* () {
+  yield* Task.exec("sh", ["-c", "until [ -s pid ] && ps -o stat= -p $(cat pid) | grep -q T; do sleep 0.05; done"]);
+  return yield* Effect.fail(new TaskError({ message: "lint failed" }));
+}));
+export const main = Task.make("main", Task.all([suspended, failing]));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toContain("[suspended] got TERM\n");
+      expect(ran.standardError).not.toContain("still stopping");
+      expect(ran.standardError).not.toContain("did not exit within");
+      expect(ran.standardError).toMatch(/^failed: failing \(1 of 3 tasks\), 1 stopped, [\d.]+s$/mu);
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
 export const stoppedCommandGetsCleanupLimit = Task.make(
   "a command stopped by its task's timeout gets the task's whole cleanup limit, not 5s, to exit after SIGTERM",
   Effect.scoped(
