@@ -114,20 +114,17 @@ const connectToMainThread = Effect.gen(function* () {
   const mainThread = yield* RpcClient.make(MainThreadRpcs, { disableTracing: true }).pipe(
     Effect.provideServiceEffect(RpcClient.Protocol, makeMainThreadRpcProtocol(mainThreadPort)),
   );
+  const notifyMainThread = (request: Pick<typeof MainThreadRpcRequest.Type, "payload" | "tag">) => {
+    mainThreadPort.postMessage(
+      MainThreadRpcRequest.make({ ...request, id: "", headers: [], isNotification: true }),
+    );
+  };
   const reportToMainThread = (event: typeof TaskEvent.Type) =>
     encodeTaskEvent(event).pipe(
       dieOnInvariantFailure("worker protocol", "reports reach the main thread"),
       Effect.flatMap((payload) =>
         Effect.sync(() => {
-          mainThreadPort.postMessage(
-            MainThreadRpcRequest.make({
-              id: "",
-              tag: "ReportTaskEvent",
-              payload,
-              headers: [],
-              isNotification: true,
-            }),
-          );
+          notifyMainThread({ tag: "ReportTaskEvent", payload });
         }),
       ),
     );
@@ -136,14 +133,7 @@ const connectToMainThread = Effect.gen(function* () {
     runInWorkerScope(reportToMainThread(event));
   };
   const recordTraceSpanNow = (spanJson: string) => {
-    runInWorkerScope(
-      mainThread
-        .RecordTraceSpan({ spanJson }, { discard: true })
-        .pipe(
-          dieOnInvariantFailure("worker protocol", "trace spans reach the main thread"),
-          completeOnceSent(reportScope),
-        ),
-    );
+    notifyMainThread({ tag: "RecordTraceSpan", payload: { spanJson } });
   };
   yield* Deferred.succeed(standardErrorLinesToTheMainThreadDeferred, (logLevel, text) =>
     reportToMainThread(TaskEvent.cases.StandardErrorLineRequested.make({ logLevel, text })),
