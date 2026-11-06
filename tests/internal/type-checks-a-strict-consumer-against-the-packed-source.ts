@@ -31,6 +31,12 @@ const STRICT_COMPILER_OPTIONS = {
   types: ["bun"],
 } as const;
 
+const PACKAGE_FILES_LOADED_BY_PATH = [
+  "src/lib/worker-thread/index.ts",
+  "src/lib/preload-rewritten-imports-into-each-worker/index.ts",
+  "src/lib/supervise-the-run/internal/start-watching-the-supervisor.ts",
+].map((packageFile) => `node_modules/${packageJson.name}/${packageFile}`);
+
 const CONSUMER_SOURCE_FILES = {
   "tasks.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
@@ -69,10 +75,12 @@ const CONSUMER_TSCONFIG_FILES = {
       emitDeclarationOnly: true,
       outDir: "declarations",
     },
+    files: PACKAGE_FILES_LOADED_BY_PATH,
     include: Object.keys(CONSUMER_SOURCE_FILES),
   },
   "tsconfig.bun-condition-node-next.json": {
     compilerOptions: { ...STRICT_COMPILER_OPTIONS, noEmit: true, customConditions: ["bun"] },
+    files: PACKAGE_FILES_LOADED_BY_PATH,
     include: Object.keys(CONSUMER_SOURCE_FILES),
   },
   "tsconfig.bun-init-without-dom.json": {
@@ -84,6 +92,7 @@ const CONSUMER_TSCONFIG_FILES = {
       moduleResolution: "Bundler",
       noEmit: true,
     },
+    files: PACKAGE_FILES_LOADED_BY_PATH,
     include: Object.keys(CONSUMER_SOURCE_FILES),
   },
   "tsconfig.without-target-or-module.json": {
@@ -91,6 +100,7 @@ const CONSUMER_TSCONFIG_FILES = {
       "target",
       "module",
     ]),
+    files: PACKAGE_FILES_LOADED_BY_PATH,
     include: Object.keys(CONSUMER_SOURCE_FILES),
   },
   "tsconfig.bun-condition-bundler.json": {
@@ -101,6 +111,7 @@ const CONSUMER_TSCONFIG_FILES = {
       noEmit: true,
       customConditions: ["bun"],
     },
+    files: PACKAGE_FILES_LOADED_BY_PATH,
     include: Object.keys(CONSUMER_SOURCE_FILES),
   },
 };
@@ -134,6 +145,12 @@ export const strictConsumerUsesPackedTarball = Task.make(
         yield* fileSystem.writeFileString(path.join(consumer, fileName), text);
       }
       yield* Task.exec("bun", ["install"], { cwd: consumer });
+      const packedSourceDirectory = path.join(consumer, "node_modules", packageJson.name, "src");
+      const shippedSourceFiles = (yield* fileSystem.readDirectory(packedSourceDirectory, {
+        recursive: true,
+      }))
+        .filter((sourceFile) => sourceFile.endsWith(".ts"))
+        .map((sourceFile) => path.join(packedSourceDirectory, sourceFile));
       for (const tsconfigFileName of Object.keys(CONSUMER_TSCONFIG_FILES)) {
         const typeCheckedFiles = (yield* Task.exec(
           path.join(repository, "node_modules/.bin/tsc"),
@@ -143,10 +160,8 @@ export const strictConsumerUsesPackedTarball = Task.make(
         const taskPackageFiles = typeCheckedFiles.filter((typeCheckedFile) =>
           typeCheckedFile.includes(`/node_modules/${packageJson.name}/`),
         );
-        for (const packageExport of Object.values(packageJson.exports)) {
-          expect(taskPackageFiles, tsconfigFileName).toContain(
-            path.join(consumer, "node_modules", packageJson.name, packageExport),
-          );
+        for (const shippedSourceFile of shippedSourceFiles) {
+          expect(taskPackageFiles, tsconfigFileName).toContain(shippedSourceFile);
         }
       }
       const emittedDeclarations = yield* fileSystem.readFileString(
