@@ -393,6 +393,36 @@ if (import.meta.main) Task.main(main);`,
   { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
+export const timeoutReachesAllSettledBeforeCleanup = Task.make(
+  "a task that times out inside allSettled fails it before the task's cleanup ends, so code that catches that failure runs even when the cleanup outlasts its limit",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const slow = Task.make("slow", Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.log("cleanup started").pipe(Effect.andThen(Effect.never)));
+  return yield* Effect.never;
+}), { timeout: "300 millis", cleanup: "2 seconds" });
+export const main = Task.make("main", Task.allSettled([slow]).pipe(
+  Effect.catchTag("SettledTasksFailed", (failure) => Effect.log(\`main caught \${failure.failedTaskNames.join(", ")}\`)),
+));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode).toBe(1);
+      const lines = ran.standardError.split("\n");
+      expect(lines).toContain("[slow] error TaskTimedOut: timed out after 300ms");
+      expect(lines.indexOf("[main] main caught slow")).toBeGreaterThan(-1);
+      expect(lines.indexOf("[main] main caught slow")).toBeLessThan(
+        lines.indexOf("[slow] error TaskCleanupTimedOut: its cleanup did not finish within 2s"),
+      );
+      expect(ran.standardError).not.toContain(STOPPED_LINE);
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
 export const inferredTypes = Task.make(
   "allSettled infers its result and error types",
   Effect.scoped(

@@ -194,8 +194,11 @@ export const executeTask = Effect.fn("executeTaskFiber")(
       if (Option.isNone(outcome)) {
         const timedOut = taskTimedOut(taskName, timeoutDuration);
         yield* failTask(timedOut, taskRunsState.markFailed);
-        yield* stopTask(taskRunsState, taskName, (watch) =>
-          FiberSet.run(taskRunsState.taskFibers, watch).pipe(Effect.asVoid),
+        yield* FiberSet.run(
+          taskRunsState.taskFibers,
+          stopTask(taskRunsState, taskName, (watch) =>
+            FiberSet.run(taskRunsState.taskFibers, watch).pipe(Effect.asVoid),
+          ),
         );
         return yield* timedOut;
       }

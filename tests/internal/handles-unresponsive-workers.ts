@@ -346,16 +346,19 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toContain(
         "[freezer] error TaskCleanupTimedOut: its cleanup did not finish within 1s",
       );
+      const mainCleanupNotStarted =
+        "[main] error TaskCleanupNotStarted: its worker did not start its cleanup within 1s, so task terminated that worker\n";
       const workerTerminations = [
         "[freezer] error TaskCleanupFrozeWorker: its cleanup ran past its 1s limit and then stopped its worker from answering, so task terminated that worker\n",
-        "[main] error TaskCleanupNotStarted: its worker did not start its cleanup within 1s, so task terminated that worker\n",
+        mainCleanupNotStarted,
       ].filter((line) => ran.standardError.includes(line));
       expect(workerTerminations, ran.standardError).not.toEqual([]);
       expect(ran.standardError).not.toContain("waiter cleaned up");
       expect(ran.standardError).not.toContain("[waiter] error");
-      const { seconds } =
-        /^failed: freezer, main \(2 of 3 tasks\), (?<seconds>[\d.]+)s$/mu.exec(ran.standardError)
-          ?.groups ?? {};
+      const summary = ran.standardError.includes(mainCleanupNotStarted)
+        ? /^failed: freezer, main \(2 of 3 tasks\), (?<seconds>[\d.]+)s$/mu
+        : /^failed: freezer \(1 of 3 tasks\), (?<seconds>[\d.]+)s$/mu;
+      const { seconds } = summary.exec(ran.standardError)?.groups ?? {};
       const elapsedSeconds = Number(seconds);
       expect(elapsedSeconds).toBeLessThan(MAXIMUM_ELAPSED_SECONDS);
     }),
