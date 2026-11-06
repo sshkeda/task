@@ -12,6 +12,10 @@ const LOOP_LINE_COUNT = 20_000;
 
 const LINES_AFTER_THE_LOOP = 2;
 
+const LOGGED_BEFORE_EXIT_COUNT = 2000;
+
+const WORKER_EXIT_CODE = 7;
+
 export const logs = Task.make(
   "a task's logs print under its name",
   Effect.scoped(
@@ -28,6 +32,34 @@ if (import.meta.main) Task.main(main);`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.standardError).toContain('[main] hello {"n":1}\n[main] careful\n[main] broken');
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const logsBeforeProcessExit = Task.make(
+  "every line a body logs right before it calls process.exit prints in order, before its worker's exit",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const main = Task.make("main", Effect.forEach(Array.from({ length: ${LOGGED_BEFORE_EXIT_COUNT} }, (_, line) => line), (line) => Effect.log(\`line \${line}\`), { discard: true }).pipe(Effect.andThen(Effect.sync(() => process.exit(${WORKER_EXIT_CODE})))));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      const lines = ran.standardError.split("\n");
+      const exitLine = lines.findIndex((line) =>
+        line.startsWith(
+          `[main] error WorkerExited: its worker exited on its own with code ${WORKER_EXIT_CODE}`,
+        ),
+      );
+      expect(lines.filter((line) => line.startsWith("[main] line "))).toEqual(
+        Array.from({ length: LOGGED_BEFORE_EXIT_COUNT }, (_unused, line) => `[main] line ${line}`),
+      );
+      expect(exitLine).toBeGreaterThan(
+        lines.indexOf(`[main] line ${LOGGED_BEFORE_EXIT_COUNT - 1}`),
+      );
     }),
   ),
   { timeout: "1 minute", cleanup: "5 seconds" },

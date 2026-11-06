@@ -463,6 +463,62 @@ if (import.meta.main) Task.main(main);`,
   { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
+export const deepErrorCauses = Task.make(
+  "an error with a cause chain 20,000 deep is reported with every cause in the trace",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+let failure = new Error("deepest cause");
+for (let depth = 0; depth < 20_000; depth++) failure = new Error(\`cause \${depth}\`, { cause: failure });
+export const main = Task.make("main", Effect.fail(failure));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode).toBe(1);
+      expect(ran.standardError).toMatch(
+        /^\[main\] main\.ts:4:\d+: error TaskBodyFailed: its body failed with cause 19999$/mu,
+      );
+      const tracePath = yield* Effect.fromNullishOr(
+        /wrote the trace to (?<tracePath>.+)/u.exec(ran.standardError)?.[1],
+      );
+      const fileSystem = yield* FileSystem.FileSystem;
+      const trace = yield* fileSystem.readFileString(tracePath);
+      expect(trace).toContain("[cause]: Error: deepest cause");
+      expect(trace).not.toContain("Error: Error: cause 19999");
+      expect(ran.standardError).not.toContain("still stopping");
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const deepPlainObjectCauses = Task.make(
+  "an error whose cause chain is 20,000 plain objects deep is reported with every cause in the trace",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+let cause: object = { message: "deepest cause" };
+for (let depth = 0; depth < 20_000; depth++) cause = { message: \`cause \${depth}\`, cause };
+export const main = Task.make("main", Effect.fail(new Error("deploy failed", { cause })));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode).toBe(1);
+      const tracePath = yield* Effect.fromNullishOr(
+        /wrote the trace to (?<tracePath>.+)/u.exec(ran.standardError)?.[1],
+      );
+      const fileSystem = yield* FileSystem.FileSystem;
+      const trace = yield* fileSystem.readFileString(tracePath);
+      expect(trace).toContain("deepest cause");
+      expect(ran.standardError).not.toContain("still stopping");
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
 export const thrownValuesWithoutMessages = Task.make(
   "an empty thrown string or Error says that the thrown value has no message",
   Effect.scoped(

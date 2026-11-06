@@ -113,6 +113,46 @@ if (import.meta.main) Task.main(main);`,
   { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
+export const independentStops = Task.make(
+  "serving tasks that do not request each other stop at the same time when the run ends",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const serve = (name: string) => Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.log(\`\${name} stopping\`).pipe(Effect.andThen(Effect.sleep("2 seconds")), Effect.andThen(Effect.log(\`\${name} stopped\`))));
+  return yield* Task.serve(name);
+});
+export const first = Task.make("first", serve("first"));
+export const second = Task.make("second", serve("second"));
+export const third = Task.make("third", serve("third"));
+export const fourth = Task.make("fourth", serve("fourth"));
+export const main = Task.make("main", Effect.all([first, second, third, fourth], { concurrency: "unbounded", discard: true }));
+if (import.meta.main) Task.main(main);`,
+      });
+
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      const told = ran.standardError
+        .split("\n")
+        .filter((line) => / (?:stopping|stopped)$/u.test(line))
+        .map((line) => line.replace(/^\[\w+\] \w+ /u, ""));
+      expect(told, ran.standardError).toEqual([
+        "stopping",
+        "stopping",
+        "stopping",
+        "stopping",
+        "stopped",
+        "stopped",
+        "stopped",
+        "stopped",
+      ]);
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
 export const stopOrderThroughCompletedTasks = Task.make(
   "a serving task keeps its transitive services alive through completed tasks during cleanup on success and failure",
   Effect.forEach(
@@ -376,6 +416,32 @@ export const finalizers = Task.make(
       ),
     ],
     { concurrency: "unbounded", discard: true },
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const failedTaskFinalizerAwaitsTask = Task.make(
+  "a failed task's finalizer that awaits a task as the run ends gets that task's interrupt instead of waiting out its cleanup limit",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+import { TaskError } from "@sshkeda/task/errors";
+export const notify = Task.make("notify", Effect.log("notifying"));
+export const build = Task.make("build", Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => notify.pipe(Effect.catchCause(() => Effect.log("notify ended"))));
+  return yield* Effect.fail(new TaskError({ message: "build broke" }));
+}));
+export const main = Task.make("main", build.pipe(Effect.catchTag("AwaitedTaskFailed", () => Effect.log("main caught it"))));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.standardError).toContain("[main] main caught it");
+      expect(ran.standardError).toContain("[build] notify ended");
+      expect(ran.standardError).not.toContain("TaskCleanupTimedOut");
+      expect(ran.standardError).not.toContain("still stopping");
+    }),
   ),
   { timeout: "1 minute", cleanup: "5 seconds" },
 );

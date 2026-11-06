@@ -42,9 +42,9 @@ export const reviveRedactedTaskResults = (
     if (Arrays.isArray<Schema.JsonArray | Schema.JsonObject>(value)) {
       return yield* Effect.forEach(value, reviveRedactedTaskResults);
     }
-    const tagged = value[REDACTED_TASK_RESULT_KEY];
+    const { [REDACTED_TASK_RESULT_KEY]: tagged, label } = value;
     if (Predicate.isString(tagged)) {
-      return Redacted.make(tagged);
+      return Redacted.make(tagged, { label: Predicate.isString(label) ? label : undefined });
     }
     return Object.fromEntries(
       yield* Effect.forEach(Object.entries(value), ([key, child]) =>

@@ -4,6 +4,7 @@ import { ChildProcess } from "effect/process";
 
 import { failTestCleanup } from "./fail-test-cleanup.ts";
 import { findMisprintedErrorLines } from "./find-misprinted-error-lines.ts";
+import { REPOSITORY_DIRECTORY } from "./find-repository-directory.ts";
 import type { makeProjectUsingTaskFrom } from "./make-projects.ts";
 import { ErrorsMisprinted, NeverPrinted } from "./test-errors.ts";
 
@@ -29,6 +30,7 @@ export const makeTaskProcessEnvironment = (
     return {
       ...(yield* readParentEnvironmentWithoutTaskConfig),
       HOME: project.home,
+      BUN_RUNTIME_TRANSPILER_CACHE_PATH: `${yield* REPOSITORY_DIRECTORY}/.scratch/transpiler-cache`,
       [`${TASK_ENVIRONMENT_VARIABLE_PREFIX}_WORKERS`]: String(navigator.hardwareConcurrency),
       ...environment,
     };

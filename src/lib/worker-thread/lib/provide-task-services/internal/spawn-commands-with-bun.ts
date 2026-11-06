@@ -176,6 +176,7 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
     stdout: Deferred.makeUnsafe<void>(),
     stderr: Deferred.makeUnsafe<void>(),
   };
+  const outputMayEndWhenIdle = Deferred.makeUnsafe<void>();
   const exitedDeferred = Deferred.makeUnsafe<
     ReturnType<typeof describeExit>,
     PlatformError.PlatformError
@@ -266,6 +267,7 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
       const signal = killOptions?.killSignal ?? "SIGTERM";
       const forceKillAfter = readForceKillAfter(killOptions);
       yield* signalProcessGroupUnlessReused(subprocess, signal);
+      yield* signalProcessGroupUnlessReused(subprocess, "SIGCONT");
       const ended = yield* Deferred.await(exitedDeferred).pipe(
         Effect.timeoutOption(forceKillAfter),
       );
@@ -278,11 +280,14 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
       yield* Deferred.await(exitedDeferred);
     });
 
+  const endOutputOnceIdle = Deferred.done(outputMayEndWhenIdle, Exit.void).pipe(Effect.asVoid);
+
   const endMembersLeftByLeader = (
     subprocess: Bun.Subprocess,
     latestMemberStartTimeAtLeaderExit: string,
   ) =>
     signalProcessGroup(subprocess, spawnOptions.killSignal ?? "SIGTERM").pipe(
+      Effect.andThen(signalProcessGroup(subprocess, "SIGCONT")),
       Effect.andThen(
         Effect.forEach(
           OUTPUT_NAMES.filter((name) => subprocess[name] instanceof ReadableStream),
@@ -293,10 +298,9 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
           Effect.flatMap((released) =>
             Option.isSome(released)
               ? Effect.void
-              : leaderExitHandlers.killMembersLeftByLeader(
-                  subprocess.pid,
-                  latestMemberStartTimeAtLeaderExit,
-                ),
+              : leaderExitHandlers
+                  .killMembersLeftByLeader(subprocess.pid, latestMemberStartTimeAtLeaderExit)
+                  .pipe(Effect.andThen(endOutputOnceIdle)),
           ),
           reportProcessCleanupFailure(subprocess.pid),
           workerState.forkInWorkerScope,
@@ -381,7 +385,7 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
             ),
             Effect.tap((latestMemberStartTime) =>
               latestMemberStartTime === null
-                ? Effect.void
+                ? endOutputOnceIdle
                 : endMembersLeftByLeader(subprocess, latestMemberStartTime).pipe(
                     reportProcessCleanupFailure(subprocess.pid),
                   ),
@@ -426,7 +430,32 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
           releaseLockOnEnd: true,
           onError: (cause) =>
             toPlatformError(`fromReadable(${name})`, programName)(new Cause.UnknownError(cause)),
-        }).pipe(Stream.ensuring(Deferred.done(outputReleased[name], Exit.void)))
+        }).pipe(
+          (output) =>
+            Stream.transformPull(output, (pull) =>
+              Effect.succeed(
+                Effect.gen(function* () {
+                  const reading = yield* Effect.forkChild(pull);
+                  const mayEndFirst = yield* Effect.raceFirst(
+                    Fiber.await(reading).pipe(Effect.as(false)),
+                    Deferred.await(outputMayEndWhenIdle).pipe(Effect.as(true)),
+                  );
+                  if (!mayEndFirst) {
+                    return yield* Fiber.join(reading);
+                  }
+                  const read = yield* Fiber.join(reading).pipe(
+                    Effect.timeoutOption(readForceKillAfter(spawnOptions)),
+                  );
+                  if (Option.isSome(read)) {
+                    return read.value;
+                  }
+                  yield* Fiber.interrupt(reading);
+                  return yield* Cause.done();
+                }),
+              ),
+            ),
+          Stream.ensuring(Deferred.done(outputReleased[name], Exit.void)),
+        )
       : Stream.empty;
   const standardOutput = readOutput(child.stdout, "stdout");
   const standardError = readOutput(child.stderr, "stderr");

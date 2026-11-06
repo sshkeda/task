@@ -6,6 +6,7 @@ import { waitWhileTaskLogsAreHeld } from "../../../../../shared/hold-task-logs.t
 import { TaskEvent } from "../../../../../shared/rpc.ts";
 import type { StartTaskFiber } from "../../../../../shared/rpc.ts";
 import type { makeTaskBodyRecord } from "../../../shared/define-task-body-record.ts";
+import { makeTraceLogRecordJson } from "../../../shared/make-trace-log-record.ts";
 
 export const makeTaskLogger = (
   startMessage: typeof StartTaskFiber.Type,
@@ -29,6 +30,7 @@ export const makeTaskLogger = (
       TaskEvent.cases.StandardErrorLineRequested.make({
         logLevel: logEntry.logLevel,
         text: prefixLines(startMessage.taskName, line),
+        traceLogRecordJson: makeTraceLogRecordJson(logEntry),
       }),
     );
   });

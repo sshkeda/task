@@ -53,8 +53,11 @@ export const StandardErrorLine = Schema.Struct({
 });
 
 export const TASK_EVENT_FIELDS = {
-  TraceWriteFailed: { reason: Schema.String },
-  StandardErrorLineRequested: StandardErrorLine.fields,
+  TraceLogRecordRequested: { traceLogRecordJson: Schema.String },
+  StandardErrorLineRequested: {
+    ...StandardErrorLine.fields,
+    traceLogRecordJson: Schema.optional(Schema.String),
+  },
   TaskFiberLoading: { taskName: Schema.String },
   TaskFiberStarted: { taskName: Schema.String },
   TaskFiberReceivedAwaitedFailure: { taskName: Schema.String, awaitedTaskName: Schema.String },
@@ -105,6 +108,7 @@ export const MainThreadRpcs = RpcGroup.make(
     success: StandardInputRead,
   }),
   Rpc.make("RecordStartedProcess", { payload: StartedProcess }),
+  Rpc.make("RecordTraceSpan", { payload: { spanJson: Schema.String } }),
   Rpc.make("ClaimProcessReports", {
     payload: ProcessReportsToClaim,
     success: Schema.Array(ProcessIdentity),
@@ -115,13 +119,16 @@ export const WorkerInitialMessage = Schema.Struct({ mainThreadPort: Transferable
 
 const RequestIdentifier = Schema.Union([Schema.String, Schema.Finite]);
 
+export const MainThreadRpcRequest = Schema.TaggedStruct("Request", {
+  id: RequestIdentifier,
+  tag: Schema.String,
+  payload: Schema.Unknown,
+  headers: Schema.Array(Schema.mutable(Schema.Tuple([Schema.String, Schema.String]))),
+  isNotification: Schema.optionalKey(Schema.Literal(true)),
+});
+
 export const MessageFromMainThreadRpcClient = Schema.Union([
-  Schema.TaggedStruct("Request", {
-    id: RequestIdentifier,
-    tag: Schema.String,
-    payload: Schema.Unknown,
-    headers: Schema.Array(Schema.mutable(Schema.Tuple([Schema.String, Schema.String]))),
-  }),
+  MainThreadRpcRequest,
   Schema.TaggedStruct("Ack", { requestId: RequestIdentifier }),
   Schema.TaggedStruct("Interrupt", { requestId: RequestIdentifier }),
   Schema.TaggedStruct("Eof", {}),
@@ -150,7 +157,6 @@ export const MessageFromMainThreadRpcServer = Schema.Union([
 
 export const WorkerData = Schema.Struct({
   workerId: Schema.Int,
-  traceFilePath: Schema.String,
   projectDirectoryPath: Schema.String,
   rewrittenFiles: Schema.Record(
     Schema.String,

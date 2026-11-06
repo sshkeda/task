@@ -2,21 +2,22 @@ import { Cause, Clock, Deferred, Effect, Exit, Logger, Result, Schema, Tracer } 
 import { RpcServer } from "effect/rpc";
 
 import { TASK_ERROR_FIELDS } from "../../../shared/error-fields.ts";
-import { reportCause } from "../../../shared/report-cause.ts";
+import { causeWithPrintableErrors, reportCause } from "../../../shared/report-cause.ts";
 import {
   describeCauseMessage,
   THROWN_VALUE_WITHOUT_MESSAGE,
 } from "../../../shared/report-errors.ts";
 import { TaskEvent, TaskFiberResult, TaskWorkerRpcs } from "../../../shared/rpc.ts";
 import type { StartTaskFiber } from "../../../shared/rpc.ts";
-import { makeTraceFile } from "../../../shared/write-trace-file.ts";
 import {
   forgetEndedProcessGroups,
   killTaskProcessGroups,
 } from "../../kill-leftover-processes/index.ts";
 import { makeTaskBodyRecord } from "../shared/define-task-body-record.ts";
+import { makeTraceLogRecordJson } from "../shared/make-trace-log-record.ts";
 import { WorkerState, reportToMainThread } from "../shared/provide-worker-state.ts";
 import { describeCleanupFailure, describeTaskBodyResult } from "./describe-task-body-result.ts";
+import { makeTraceSpanJson } from "./make-trace-span-json.ts";
 import { runTaskBody } from "./run-task-body.ts";
 
 class TaskResultNotHandedOver extends Schema.TaggedError<TaskResultNotHandedOver>()(
@@ -125,17 +126,39 @@ const serveUntilExitRequested = Effect.gen(function* () {
 
 export const serveTheMainThread = Effect.gen(function* () {
   const workerState = yield* WorkerState;
-  const traceFile = yield* makeTraceFile({
-    traceFilePath: workerState.traceFilePath,
-    thread: "worker",
-    maxBatchSize: 1,
-    onIncomplete: (reason) =>
-      Effect.sync(() => {
-        workerState.reportToMainThreadNow(TaskEvent.cases.TraceWriteFailed.make({ reason }));
-      }),
+  const tracer = Tracer.make({
+    span: (options) => {
+      const span = new Tracer.NativeSpan(options);
+      const end = span.end.bind(span);
+      const ending = { hasEnded: false };
+      span.end = (endTime, exit) => {
+        const isExported = span.sampled && !ending.hasEnded;
+        ending.hasEnded = true;
+        end(endTime, exit);
+        const spanJson = isExported
+          ? makeTraceSpanJson(
+              span,
+              endTime,
+              Exit.isFailure(exit) ? Exit.failCause(causeWithPrintableErrors(exit.cause)) : exit,
+            )
+          : undefined;
+        if (spanJson !== undefined) {
+          workerState.recordTraceSpanNow(spanJson);
+        }
+      };
+      return span;
+    },
+  });
+  const logger = Logger.make((logEntry) => {
+    const traceLogRecordJson = makeTraceLogRecordJson(logEntry);
+    if (traceLogRecordJson !== undefined) {
+      workerState.reportToMainThreadNow(
+        TaskEvent.cases.TraceLogRecordRequested.make({ traceLogRecordJson }),
+      );
+    }
   });
   yield* serveUntilExitRequested.pipe(
-    Effect.provideService(Tracer.Tracer, traceFile.tracer),
-    Effect.provideService(Logger.CurrentLoggers, new Set([traceFile.logger])),
+    Effect.provideService(Tracer.Tracer, tracer),
+    Effect.provideService(Logger.CurrentLoggers, new Set([logger])),
   );
 });

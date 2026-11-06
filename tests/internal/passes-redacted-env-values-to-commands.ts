@@ -164,3 +164,33 @@ export const returnedRedactedValueReachesOtherTasks = Task.make(
   ),
   { timeout: "1 minute", cleanup: "5 seconds" },
 );
+
+const LABELLED_SOURCE = `import { Effect, Redacted } from "effect";
+import { Task } from "@sshkeda/task";
+export const token = Task.make("token", Effect.succeed({ token: Redacted.make("fake-labelled-token", { label: "API_TOKEN" }) }));
+export const password = Task.make("password", Effect.gen(function* () {
+  return yield* Task.serve(Redacted.make("fake-labelled-password", { label: "DB_PASSWORD" }));
+}));
+export const main = Task.make("main", Effect.gen(function* () {
+  const returned = yield* token;
+  const served = yield* password;
+  yield* Effect.log(\`token \${returned.token}, password \${served}\`);
+}));
+if (import.meta.main) Task.main(main);
+`;
+
+export const labelledRedactedValueKeepsItsLabel = Task.make(
+  "a labelled Redacted value that a task returns or serves reaches other tasks with its label",
+  Effect.scoped(
+    Effect.gen(function* () {
+      yield* typeCheckSource(LABELLED_SOURCE);
+      const project = yield* makeProject({ "main.ts": LABELLED_SOURCE });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(ran.standardError).toContain(
+        "[main] token <redacted:API_TOKEN>, password <redacted:DB_PASSWORD>\n",
+      );
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);

@@ -14,7 +14,8 @@ import {
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import { inheritedEnvironment } from "../../src/shared/read-environment-config.ts";
-import { read } from "../shared/access-files.ts";
+import { exists, read } from "../shared/access-files.ts";
+import { failTestCleanup } from "../shared/fail-test-cleanup.ts";
 import { exitAsValue, failureAsValue } from "../shared/failure-as-value.ts";
 import { findMisprintedErrorLines } from "../shared/find-misprinted-error-lines.ts";
 import { isProcessAlive } from "../shared/is-process-alive.ts";
@@ -735,6 +736,88 @@ export const successfulCommandWithBackgroundChild = Task.make(
     }),
   ),
   { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const successfulCommandWithEscapedBackgroundChild = Task.make(
+  "a command that exits 0 returns its output once its cleanup limit passes, even while a background child that left its process group holds its output open",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const main = Task.make("main", Task.exec("sh", ["-c", "perl -MPOSIX -e 'defined POSIX::setsid() or die; open my $f, q(>), q(escaped) or die; close $f; exec qw(sleep 600)' & echo $! > pid; until [ -e escaped ]; do sleep 0.01; done; printf finished"]).pipe(Effect.flatMap((output) => Effect.log(\`output: \${output}\`))), { timeout: "20 seconds", cleanup: "1 second" });
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      const sleep = Number((yield* read(`${project.directory}/pid`)).trim());
+      yield* Effect.addFinalizer(() =>
+        isProcessAlive(sleep).pipe(
+          Effect.flatMap((alive) =>
+            alive ? Task.exec("kill", ["-KILL", String(sleep)]) : Effect.void,
+          ),
+          failTestCleanup(`kill test process ${sleep}`),
+        ),
+      );
+      expect(yield* exists(`${project.directory}/escaped`)).toBe(true);
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(ran.standardError).toContain("[main] output: finished");
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const successfulCommandWithEscapedAndGroupBackgroundChildren = Task.make(
+  "a command that exits 0 returns its output once its cleanup limit passes, even while a background child that left its process group and one that stayed in it hold its output open",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const main = Task.make("main", Task.exec("sh", ["-c", "perl -MPOSIX -e 'defined POSIX::setsid() or die; open my $f, q(>), q(escaped) or die; close $f; exec qw(sleep 600)' & echo $! > pid; until [ -e escaped ]; do sleep 0.01; done; sleep 600 & printf finished"]).pipe(Effect.flatMap((output) => Effect.log(\`output: \${output}\`))), { timeout: "20 seconds", cleanup: "1 second" });
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      const sleep = Number((yield* read(`${project.directory}/pid`)).trim());
+      yield* Effect.addFinalizer(() =>
+        isProcessAlive(sleep).pipe(
+          Effect.flatMap((alive) =>
+            alive ? Task.exec("kill", ["-KILL", String(sleep)]) : Effect.void,
+          ),
+          failTestCleanup(`kill test process ${sleep}`),
+        ),
+      );
+      expect(yield* exists(`${project.directory}/escaped`)).toBe(true);
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(ran.standardError).toContain("[main] output: finished");
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const outputReadLongAfterExit = Task.make(
+  "a command's output read after its cleanup limit has passed since it exited still holds everything it printed",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const command = yield* ChildProcess.make("printf", ["finished"], {
+        forceKillAfter: "100 millis",
+      });
+      expect(Number(yield* command.exitCode)).toBe(0);
+      yield* Task.exec("sleep", ["1"]);
+      expect(yield* command.stdout.pipe(Stream.decodeText, Stream.mkString)).toBe("finished");
+    }),
+  ),
+);
+
+export const stoppedBackgroundChildCleansUp = Task.make(
+  "a background child that stopped itself and holds a successful command's output open is continued after SIGTERM, so its TERM handler's output reaches Task.exec",
+  Effect.gen(function* () {
+    const output = yield* Task.exec("sh", [
+      "-c",
+      "sh -c 'trap \"echo cleaned; exit 0\" TERM; kill -STOP $$' & until ps -o stat= -p $! | grep -q T; do sleep 0.01; done; echo finished",
+    ]);
+    expect(output).toBe("finished\ncleaned\n");
+  }),
+  { timeout: "30 seconds", cleanup: "5 seconds" },
 );
 
 export const successfulCommandWithBackgroundChildIgnoringTerm = Task.make(

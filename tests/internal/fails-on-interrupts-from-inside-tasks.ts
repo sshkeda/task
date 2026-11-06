@@ -337,7 +337,7 @@ export const ctrlCAsABodyInterruptsItself = Task.make(
 );
 
 export const bodyInterruptsItselfWhileTheRunStopsAnotherTask = Task.make(
-  "a serving body that interrupts itself while the run is still stopping another serving task fails with CauseWithoutFailure",
+  "a serving body that interrupts itself while the run is still stopping a serving task that requested it fails with CauseWithoutFailure",
   Effect.scoped(
     Effect.gen(function* () {
       const directory = yield* makeTemporaryDirectory();
@@ -345,7 +345,7 @@ export const bodyInterruptsItselfWhileTheRunStopsAnotherTask = Task.make(
       const ran = yield* runMainTaskSource(
         `import { Task } from "@sshkeda/task";
 export const interrupting = Task.make("interrupting", Effect.raceFirst(Task.serve("up"), Effect.promise(async () => { while (!(await Bun.file("${cleaningStartedFile}").exists())) await Bun.sleep(5); }).pipe(Effect.andThen(Effect.interrupt))));
-export const cleaning = Task.make("cleaning", Effect.gen(function* () { yield* Effect.addFinalizer(() => Effect.promise(async () => { await Bun.write("${cleaningStartedFile}", ""); await Bun.sleep(1000); })); return yield* Task.serve("up"); }));
+export const cleaning = Task.make("cleaning", Effect.gen(function* () { yield* interrupting; yield* Effect.addFinalizer(() => Effect.promise(async () => { await Bun.write("${cleaningStartedFile}", ""); await Bun.sleep(1000); })); return yield* Task.serve("up"); }));
 export const main = Task.make("main", Effect.all([interrupting, cleaning], { concurrency: "unbounded", discard: true }));`,
       );
       expect(ran.exitCode, ran.standardError).toBe(1);

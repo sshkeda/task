@@ -16,12 +16,12 @@ import type { HttpClient } from "effect/http";
 import { RpcClient, RpcSerialization, RpcWorker } from "effect/rpc";
 import type { RpcMessage } from "effect/rpc";
 
-import { completeOnceSent } from "../../../shared/complete-discarded-calls-once-sent.ts";
 import { setProjectDirectoryPath } from "../../../shared/find-user-locations-in-stack-traces.ts";
 import { dieOnInvariantFailure } from "../../../shared/invariant-errors.ts";
 import { standardErrorLinesToTheMainThreadDeferred } from "../../../shared/print-to-standard-error.ts";
 import {
   MainThreadRpcs,
+  MainThreadRpcRequest,
   MessageFromMainThreadRpcServer,
   TaskEvent,
   WorkerData,
@@ -33,6 +33,8 @@ import { makeMainThreadAnswers } from "./await-main-thread-answers.ts";
 const decodeMessageFromMainThreadRpcServer = Schema.decodeUnknownEffect(
   MessageFromMainThreadRpcServer,
 );
+
+const encodeTaskEvent = Schema.encodeEffect(TaskEvent);
 
 const makeMainThreadRpcProtocol = (mainThreadPort: MessagePort) =>
   RpcClient.Protocol.make((writeResponse, clientIds) =>
@@ -112,22 +114,37 @@ const connectToMainThread = Effect.gen(function* () {
   const mainThread = yield* RpcClient.make(MainThreadRpcs, { disableTracing: true }).pipe(
     Effect.provideServiceEffect(RpcClient.Protocol, makeMainThreadRpcProtocol(mainThreadPort)),
   );
-  const reportScope = yield* Effect.scope;
+  const notifyMainThread = (request: Pick<typeof MainThreadRpcRequest.Type, "payload" | "tag">) => {
+    mainThreadPort.postMessage(
+      MainThreadRpcRequest.make({ ...request, id: "", headers: [], isNotification: true }),
+    );
+  };
   const reportToMainThread = (event: typeof TaskEvent.Type) =>
-    mainThread
-      .ReportTaskEvent(event, { discard: true })
-      .pipe(
-        dieOnInvariantFailure("worker protocol", "reports reach the main thread"),
-        completeOnceSent(reportScope),
-      );
+    encodeTaskEvent(event).pipe(
+      dieOnInvariantFailure("worker protocol", "reports reach the main thread"),
+      Effect.flatMap((payload) =>
+        Effect.sync(() => {
+          notifyMainThread({ tag: "ReportTaskEvent", payload });
+        }),
+      ),
+    );
   const runInWorkerScope = yield* FiberSet.makeRuntime<never, void, never>();
   const reportToMainThreadNow = (event: typeof TaskEvent.Type) => {
     runInWorkerScope(reportToMainThread(event));
   };
+  const recordTraceSpanNow = (spanJson: string) => {
+    notifyMainThread({ tag: "RecordTraceSpan", payload: { spanJson } });
+  };
   yield* Deferred.succeed(standardErrorLinesToTheMainThreadDeferred, (logLevel, text) =>
     reportToMainThread(TaskEvent.cases.StandardErrorLineRequested.make({ logLevel, text })),
   );
-  return { ...decodedWorkerData, mainThread, reportToMainThread, reportToMainThreadNow };
+  return {
+    ...decodedWorkerData,
+    mainThread,
+    reportToMainThread,
+    reportToMainThreadNow,
+    recordTraceSpanNow,
+  };
 });
 
 const makeWorkerState = Effect.gen(function* () {

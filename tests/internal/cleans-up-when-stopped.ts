@@ -365,14 +365,40 @@ export const main = Task.make("main", Effect.gen(function* () {
 }), { timeout: "5 seconds", cleanup: "5 seconds" });
 if (import.meta.main) Task.main(main);`;
 
+const INTERRUPT_ONCE_SERVING_IS_READ_AND_STANDARD_ERROR_CLOSED = `const shell = Bun.spawn(["sh", "-c", \`(\${process.execPath} main.ts; echo $? > exit-code) 2>&1 | { sed '/main is serving/q'; exec 0<&-; kill -INT $(cat task-pid); }\`], { stdio: ["ignore", "inherit", "inherit"] });
+process.exitCode = await shell.exited;`;
+
 export const interruptAfterOutputClosed = Task.make(
   "Ctrl-C after standard error closes, when the stopping line is the first write that finds it closed, still exits 130",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": SERVING_ROOT_THAT_RECORDS_ITS_PROCESS_ID,
-        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`(\${process.execPath} main.ts; echo $? > exit-code) 2>&1 | { sed '/main is serving/q'; exec 0<&-; kill -INT $(cat task-pid); }\`], { stdio: ["ignore", "inherit", "inherit"] });
-process.exitCode = await shell.exited;`,
+        "piped.ts": INTERRUPT_ONCE_SERVING_IS_READ_AND_STANDARD_ERROR_CLOSED,
+      });
+      const piped = yield* runTaskProcess(project, "piped.ts");
+      expect(piped.standardOutput).toEndWith("main is serving\n");
+      expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("130");
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const interruptAfterOutputClosedDuringLongCleanup = Task.make(
+  "Ctrl-C after standard error closes still exits 130 when the cleanup outlasts the 1s task waits once standard error closed",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { isMainThread } from "node:worker_threads";
+import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+if (isMainThread) await Bun.write("task-pid", String(process.pid));
+export const main = Task.make("main", Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.sleep("3 seconds"));
+  return yield* Task.serve("up");
+}), { timeout: "5 seconds", cleanup: "5 seconds" });
+if (import.meta.main) Task.main(main);`,
+        "piped.ts": INTERRUPT_ONCE_SERVING_IS_READ_AND_STANDARD_ERROR_CLOSED,
       });
       const piped = yield* runTaskProcess(project, "piped.ts");
       expect(piped.standardOutput).toEndWith("main is serving\n");
@@ -665,6 +691,33 @@ if (import.meta.main) Task.main(main);`,
       );
       expect(ran.standardError).not.toContain("did not exit within 5s");
       expect(ran.standardError).toMatch(/^failed: \S.*, [\d.]+s$/mu);
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const suspendedCommandGetsTerm = Task.make(
+  "stopping a task whose command was suspended with SIGSTOP continues it, so it handles SIGTERM and exits instead of waiting out the task's cleanup limit",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+import { TaskError } from "@sshkeda/task/errors";
+export const suspended = Task.make("suspended", Task.exec("sh", ["-c", "trap 'echo got TERM; exit 0' TERM; echo $$ > pid; kill -STOP $$; while true; do sleep 1; done"]), { cleanup: "4 seconds" });
+export const failing = Task.make("failing", Effect.gen(function* () {
+  yield* Task.exec("sh", ["-c", "until [ -s pid ] && ps -o stat= -p $(cat pid) | grep -q T; do sleep 0.05; done"]);
+  return yield* Effect.fail(new TaskError({ message: "lint failed" }));
+}));
+export const main = Task.make("main", Task.all([suspended, failing]));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toContain("[suspended] got TERM\n");
+      expect(ran.standardError).not.toContain("still stopping");
+      expect(ran.standardError).not.toContain("did not exit within");
+      expect(ran.standardError).toMatch(/^failed: failing \(1 of 3 tasks\), 1 stopped, [\d.]+s$/mu);
     }),
   ),
   { timeout: "1 minute", cleanup: "5 seconds" },
