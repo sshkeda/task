@@ -176,6 +176,7 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
     stdout: Deferred.makeUnsafe<void>(),
     stderr: Deferred.makeUnsafe<void>(),
   };
+  const outputAbandoned = Deferred.makeUnsafe<void>();
   const exitedDeferred = Deferred.makeUnsafe<
     ReturnType<typeof describeExit>,
     PlatformError.PlatformError
@@ -279,6 +280,19 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
       yield* Deferred.await(exitedDeferred);
     });
 
+  const abandonOutputHeldOutsideTheGroup = (subprocess: Bun.Subprocess) =>
+    Effect.forEach(
+      OUTPUT_NAMES.filter((name) => subprocess[name] instanceof ReadableStream),
+      (name) => Deferred.await(outputReleased[name]),
+      { discard: true },
+    ).pipe(
+      Effect.timeoutOption(readForceKillAfter(spawnOptions)),
+      Effect.flatMap((released) =>
+        Option.isSome(released) ? Effect.void : Deferred.done(outputAbandoned, Exit.void),
+      ),
+      workerState.forkInWorkerScope,
+    );
+
   const endMembersLeftByLeader = (
     subprocess: Bun.Subprocess,
     latestMemberStartTimeAtLeaderExit: string,
@@ -294,10 +308,9 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
           Effect.flatMap((released) =>
             Option.isSome(released)
               ? Effect.void
-              : leaderExitHandlers.killMembersLeftByLeader(
-                  subprocess.pid,
-                  latestMemberStartTimeAtLeaderExit,
-                ),
+              : leaderExitHandlers
+                  .killMembersLeftByLeader(subprocess.pid, latestMemberStartTimeAtLeaderExit)
+                  .pipe(Effect.andThen(abandonOutputHeldOutsideTheGroup(subprocess))),
           ),
           reportProcessCleanupFailure(subprocess.pid),
           workerState.forkInWorkerScope,
@@ -382,7 +395,7 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
             ),
             Effect.tap((latestMemberStartTime) =>
               latestMemberStartTime === null
-                ? Effect.void
+                ? abandonOutputHeldOutsideTheGroup(subprocess)
                 : endMembersLeftByLeader(subprocess, latestMemberStartTime).pipe(
                     reportProcessCleanupFailure(subprocess.pid),
                   ),
@@ -427,7 +440,10 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
           releaseLockOnEnd: true,
           onError: (cause) =>
             toPlatformError(`fromReadable(${name})`, programName)(new Cause.UnknownError(cause)),
-        }).pipe(Stream.ensuring(Deferred.done(outputReleased[name], Exit.void)))
+        }).pipe(
+          Stream.interruptWhen(Deferred.await(outputAbandoned)),
+          Stream.ensuring(Deferred.done(outputReleased[name], Exit.void)),
+        )
       : Stream.empty;
   const standardOutput = readOutput(child.stdout, "stdout");
   const standardError = readOutput(child.stderr, "stderr");
