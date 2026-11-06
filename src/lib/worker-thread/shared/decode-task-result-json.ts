@@ -41,7 +41,10 @@ const encodeTaskResultParts = (
       return part;
     }
     if (isRedactedString(part)) {
-      return { [REDACTED_TASK_RESULT_KEY]: Redacted.value(part) };
+      return {
+        [REDACTED_TASK_RESULT_KEY]: Redacted.value(part),
+        ...(part.label === undefined ? {} : { label: part.label }),
+      };
     }
     if (onPath.has(part)) {
       return yield* notJson(valuePath, "a reference back to an enclosing value");
