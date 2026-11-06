@@ -79,13 +79,13 @@ const findErrnoCode = flow(
   Option.getOrNull,
 );
 
-const readerHasGone = (errnoCode: string | null) =>
-  errnoCode === "EPIPE" || (errnoCode === "EIO" && isatty(STANDARD_ERROR_FILE_DESCRIPTOR));
+const readerHasGone = (errnoCode: string | null, isTerminal: boolean) =>
+  errnoCode === "EPIPE" || (errnoCode === "EIO" && isTerminal);
 
-const recordWriteFailure = (failure: PlatformError) =>
+const recordWriteFailure = (failure: PlatformError, isTerminal: boolean) =>
   Effect.sync(() => {
     const errnoCode = findErrnoCode(failure.reason);
-    if (readerHasGone(errnoCode)) {
+    if (readerHasGone(errnoCode, isTerminal)) {
       return Deferred.doneUnsafe(standardErrorClosedDeferred, Exit.void);
     }
     return Deferred.doneUnsafe(
@@ -98,13 +98,14 @@ const writeLines = (
   stdio: Stdio.Stdio,
   lines: Queue.Queue<typeof StandardErrorLine.Type, Cause.Done>,
   minimumLogLevel: LogLevel.LogLevel,
+  isTerminal: boolean,
 ) =>
   Stream.fromQueue(lines).pipe(
     Stream.filter((line) => LogLevel.isGreaterThanOrEqualTo(line.logLevel, minimumLogLevel)),
     Stream.map((line) => line.text),
     Stream.run(stdio.stderr()),
     Effect.catchTag("PlatformError", (error) =>
-      recordWriteFailure(error).pipe(Effect.andThen(Queue.end(lines))),
+      recordWriteFailure(error, isTerminal).pipe(Effect.andThen(Queue.end(lines))),
     ),
     Effect.asVoid,
   );
@@ -127,10 +128,12 @@ const printLinesDuring = <Ended extends NodeJS.Signals | number, Failure, Servic
     const stopSignals = yield* listenToSignals(STOP_SIGNALS);
     const lines = yield* Queue.unbounded<typeof StandardErrorLine.Type, Cause.Done>();
     yield* Deferred.succeed(standardErrorLinesDeferred, lines);
-    const writer = yield* writeLines(stdio, lines, minimumLogLevel).pipe(
-      Effect.interruptible,
-      Effect.forkScoped,
-    );
+    const writer = yield* writeLines(
+      stdio,
+      lines,
+      minimumLogLevel,
+      isatty(STANDARD_ERROR_FILE_DESCRIPTOR),
+    ).pipe(Effect.interruptible, Effect.forkScoped);
     const ended = yield* program;
     yield* Queue.end(lines);
     const linesWritten = Fiber.join(writer);

@@ -157,6 +157,7 @@ const startOnTerminal = (
           ),
           Effect.flatMap((text) => Effect.fromNullishOr(wanted.exec(text)?.[0])),
         ),
+      close: Effect.sync(() => started.terminal?.close()),
       exited: Effect.promise(() => started.exited),
       screen: Ref.get(screen),
     };
@@ -286,6 +287,24 @@ export const terminalSuspend = Task.make(
       for (const processId of started) {
         yield* waitUntilEnded(processId);
       }
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const terminalClosed = Task.make(
+  "closing the terminal of a run ends its command, and the run exits 129 as after a SIGHUP",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({ "main.ts": RUNNING_A_COMMAND });
+      const terminal = yield* startOnTerminal(project, [process.execPath, "main.ts"]);
+      const [commandProcessId] = yield* decodeProcessId(
+        parseProcessIds(yield* terminal.waitFor(/\[main\] command \d+\r\n/u)),
+      );
+      yield* killWhenDone([commandProcessId]);
+      yield* terminal.close;
+      expect(yield* terminal.exited).toBe(EXIT_CODE_AFTER_SIGHUP);
+      yield* waitUntilEnded(commandProcessId);
     }),
   ),
   { timeout: "1 minute", cleanup: "5 seconds" },
