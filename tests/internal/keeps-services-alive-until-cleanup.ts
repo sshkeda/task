@@ -420,6 +420,32 @@ export const finalizers = Task.make(
   { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
+export const failedTaskFinalizerAwaitsTask = Task.make(
+  "a failed task's finalizer that awaits a task as the run ends gets that task's interrupt instead of waiting out its cleanup limit",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+import { TaskError } from "@sshkeda/task/errors";
+export const notify = Task.make("notify", Effect.log("notifying"));
+export const build = Task.make("build", Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => notify.pipe(Effect.catchCause(() => Effect.log("notify ended"))));
+  return yield* Effect.fail(new TaskError({ message: "build broke" }));
+}));
+export const main = Task.make("main", build.pipe(Effect.catchTag("AwaitedTaskFailed", () => Effect.log("main caught it"))));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.standardError).toContain("[main] main caught it");
+      expect(ran.standardError).toContain("[build] notify ended");
+      expect(ran.standardError).not.toContain("TaskCleanupTimedOut");
+      expect(ran.standardError).not.toContain("still stopping");
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
 export const exceeded = Task.make(
   "when a task's cleanup outlasts its duration, the processes the task started are killed and reported with that task",
   Effect.scoped(

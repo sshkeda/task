@@ -46,6 +46,19 @@ const sendDependencyResultToWorker = Effect.fn("sendDependencyResultToWorker")(f
     Effect.raceFirst(
       Deferred.await(requestingTaskRun.bodyFinishedDeferred).pipe(Effect.andThen(Effect.interrupt)),
     ),
+    Effect.onInterrupt(() => {
+      const isRequesterCleaningUp =
+        Deferred.isDoneUnsafe(requestingTaskRun.bodyCleanupStartedDeferred) ||
+        Deferred.isDoneUnsafe(requestingTaskRun.bodyFailedBeforeCleanupDeferred);
+      return isRequesterCleaningUp
+        ? WorkerPool.use((workerPool) =>
+            workerPool.answerDependencyRequest(
+              messageFromWorker.dependencyRequestId,
+              Exit.interrupt(),
+            ),
+          )
+        : Effect.void;
+    }),
   );
   const workerId = findAssignedWorkerId(requestingTaskRun.status);
   if (workerId === null) {
