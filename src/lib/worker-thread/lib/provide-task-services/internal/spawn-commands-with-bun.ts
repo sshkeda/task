@@ -287,6 +287,7 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
     latestMemberStartTimeAtLeaderExit: string,
   ) =>
     signalProcessGroup(subprocess, spawnOptions.killSignal ?? "SIGTERM").pipe(
+      Effect.andThen(signalProcessGroup(subprocess, "SIGCONT")),
       Effect.andThen(
         Effect.forEach(
           OUTPUT_NAMES.filter((name) => subprocess[name] instanceof ReadableStream),

@@ -808,6 +808,18 @@ export const outputReadLongAfterExit = Task.make(
   ),
 );
 
+export const stoppedBackgroundChildCleansUp = Task.make(
+  "a background child that stopped itself and holds a successful command's output open is continued after SIGTERM, so its TERM handler's output reaches Task.exec",
+  Effect.gen(function* () {
+    const output = yield* Task.exec("sh", [
+      "-c",
+      "sh -c 'trap \"echo cleaned; exit 0\" TERM; kill -STOP $$' & until ps -o stat= -p $! | grep -q T; do sleep 0.01; done; echo finished",
+    ]);
+    expect(output).toBe("finished\ncleaned\n");
+  }),
+  { timeout: "30 seconds", cleanup: "5 seconds" },
+);
+
 export const successfulCommandWithBackgroundChildIgnoringTerm = Task.make(
   "a background child that ignores SIGTERM and holds a successful command's output open is killed and reported once the SIGKILL grace period passes, and Task.exec returns its output",
   Effect.scoped(
