@@ -345,7 +345,11 @@ export const command = Task.exec("echo", ["command"]);
 export const buildOptions = { timeout: "1 minute", cleanup: "5 seconds" } satisfies Parameters<typeof Task.make<unknown, never, never>>[2];
 export const main = Task.make("main", Task.all([lint, build, user]));`,
       });
-      yield* Task.exec(`${repository}/node_modules/.bin/tsc`, ["-p", project.directory]);
+      yield* Task.exec(`${repository}/node_modules/.bin/tsc`, [
+        "-p",
+        project.directory,
+        "--singleThreaded",
+      ]);
       for (const declarationFileName of ["options.d.ts", "main.d.ts"]) {
         const declarations = yield* read(
           `${project.directory}/declarations/${declarationFileName}`,

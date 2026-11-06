@@ -16,5 +16,9 @@ export const typeCheckSource = (text: string) =>
       yield* encodeJson({ extends: `${repository}/tsconfig.json`, include: ["main.ts"] }),
     );
     yield* write(`${directory}/main.ts`, text);
-    return yield* Task.exec(`${repository}/node_modules/.bin/tsc`, ["-p", directory]);
+    return yield* Task.exec(`${repository}/node_modules/.bin/tsc`, [
+      "-p",
+      directory,
+      "--singleThreaded",
+    ]);
   });
