@@ -9,12 +9,12 @@ import {
 } from "../../../shared/report-errors.ts";
 import { TaskEvent, TaskFiberResult, TaskWorkerRpcs } from "../../../shared/rpc.ts";
 import type { StartTaskFiber } from "../../../shared/rpc.ts";
-import { makeTraceFile } from "../../../shared/write-trace-file.ts";
 import {
   forgetEndedProcessGroups,
   killTaskProcessGroups,
 } from "../../kill-leftover-processes/index.ts";
 import { makeTaskBodyRecord } from "../shared/define-task-body-record.ts";
+import { makeTraceLogRecordJson } from "../shared/make-trace-log-record.ts";
 import { WorkerState, reportToMainThread } from "../shared/provide-worker-state.ts";
 import { describeCleanupFailure, describeTaskBodyResult } from "./describe-task-body-result.ts";
 import { makeTraceSpanJson } from "./make-trace-span-json.ts";
@@ -126,15 +126,6 @@ const serveUntilExitRequested = Effect.gen(function* () {
 
 export const serveTheMainThread = Effect.gen(function* () {
   const workerState = yield* WorkerState;
-  const traceFile = yield* makeTraceFile({
-    traceFilePath: workerState.traceFilePath,
-    thread: "worker",
-    maxBatchSize: 1,
-    onIncomplete: (reason) =>
-      Effect.sync(() => {
-        workerState.reportToMainThreadNow(TaskEvent.cases.TraceWriteFailed.make({ reason }));
-      }),
-  });
   const tracer = Tracer.make({
     span: (options) => {
       const span = new Tracer.NativeSpan(options);
@@ -158,8 +149,16 @@ export const serveTheMainThread = Effect.gen(function* () {
       return span;
     },
   });
+  const logger = Logger.make((logEntry) => {
+    const traceLogRecordJson = makeTraceLogRecordJson(logEntry);
+    if (traceLogRecordJson !== undefined) {
+      workerState.reportToMainThreadNow(
+        TaskEvent.cases.TraceLogRecordRequested.make({ traceLogRecordJson }),
+      );
+    }
+  });
   yield* serveUntilExitRequested.pipe(
     Effect.provideService(Tracer.Tracer, tracer),
-    Effect.provideService(Logger.CurrentLoggers, new Set([traceFile.logger])),
+    Effect.provideService(Logger.CurrentLoggers, new Set([logger])),
   );
 });

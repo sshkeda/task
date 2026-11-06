@@ -35,7 +35,6 @@ import * as typeErrors from "./internal/rejects-invalid-task-types.ts";
 import * as killedOnce from "./internal/reports-each-killed-process-once.ts";
 import * as runtimeBoundaryFailures from "./internal/reports-runtime-boundary-failures.ts";
 import * as startupResources from "./internal/reports-startup-resource-failures.ts";
-import * as workerTraceFailures from "./internal/reports-worker-trace-failures.ts";
 import * as packageRelativePaths from "./internal/resolves-paths-from-the-task-package.ts";
 import * as commands from "./internal/runs-commands.ts";
 import * as standaloneExecutables from "./internal/runs-inside-standalone-executables.ts";
@@ -45,6 +44,7 @@ import * as settledGroups from "./internal/settles-every-task-in-all-settled.ts"
 import * as supervision from "./internal/supervises-each-run.ts";
 import * as leftoverProcesses from "./internal/terminates-leftover-process-groups.ts";
 import { TESTS_AT_ONCE } from "./internal/tests-at-once.ts";
+import * as workerTraces from "./internal/traces-workers-from-the-main-thread.ts";
 import * as packedSource from "./internal/type-checks-a-strict-consumer-against-the-packed-source.ts";
 import * as rootTaskPackage from "./internal/validates-root-task-package.ts";
 
@@ -67,7 +67,7 @@ export const runtimeTests = Task.make(
       processObservers,
       notEffects,
       interruptsFromInside,
-      workerTraceFailures,
+      workerTraces,
       stateDirectory,
       startupResources,
       commands,

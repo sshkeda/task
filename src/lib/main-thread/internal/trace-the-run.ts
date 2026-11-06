@@ -16,9 +16,9 @@ import {
 import { formatFailureLines } from "../../../shared/format-error-lines.ts";
 import { formatIsoTimestamp } from "../../../shared/format-task-lines.ts";
 import { printLine } from "../../../shared/print-to-standard-error.ts";
-import { TraceFile, makeTraceFile } from "../../../shared/write-trace-file.ts";
 import { TraceFileIncomplete } from "../shared/main-thread-errors.ts";
 import { RunRootTaskConfig } from "../shared/provide-run-root-task-config.ts";
+import { TraceFile, makeTraceFile } from "../shared/write-trace-file.ts";
 
 const TRACE_RETENTION = "14 days";
 
@@ -87,7 +87,7 @@ export const TraceFileLive = Layer.effect(
         Effect.andThen(Fiber.join(sweepOfOldTraces)),
       ),
     );
-    const traceFile = yield* makeTraceFile({ traceFilePath, thread: "main-thread" });
+    const traceFile = yield* makeTraceFile({ traceFilePath });
     yield* Ref.set(made, traceFile);
     return traceFile;
   }),

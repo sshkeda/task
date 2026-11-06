@@ -40,11 +40,11 @@ import {
 import type { StandardInputRead, StartTaskFiber, WorkerData } from "../../../shared/rpc.ts";
 import type { TaskRequestFailure } from "../../../shared/task-errors.ts";
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
-import { TraceFile } from "../../../shared/write-trace-file.ts";
 import { ModuleGraph } from "../lib/find-code-each-task-depends-on/index.ts";
 import { DiscoveredTasks } from "./provide-discovered-tasks.ts";
 import { RunRootTaskConfig } from "./provide-run-root-task-config.ts";
 import { StopState } from "./provide-stop-state.ts";
+import { TraceFile } from "./write-trace-file.ts";
 
 const WORKER_EXIT_GRACE_SECONDS = 2;
 
@@ -339,7 +339,6 @@ const makeWorkerPool = Effect.gen(function* () {
     Effect.gen(function* () {
       const workerData = {
         workerId,
-        traceFilePath: traceFile.filePath,
         projectDirectoryPath: runRootTaskConfig.rootTaskPackageJsonDirectoryPath,
         rewrittenFiles,
         taskLogHold: shutdown.taskLogHold,

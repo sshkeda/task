@@ -53,7 +53,7 @@ export const StandardErrorLine = Schema.Struct({
 });
 
 export const TASK_EVENT_FIELDS = {
-  TraceWriteFailed: { reason: Schema.String },
+  TraceLogRecordRequested: { traceLogRecordJson: Schema.String },
   StandardErrorLineRequested: {
     ...StandardErrorLine.fields,
     traceLogRecordJson: Schema.optional(Schema.String),
@@ -157,7 +157,6 @@ export const MessageFromMainThreadRpcServer = Schema.Union([
 
 export const WorkerData = Schema.Struct({
   workerId: Schema.Int,
-  traceFilePath: Schema.String,
   projectDirectoryPath: Schema.String,
   rewrittenFiles: Schema.Record(
     Schema.String,

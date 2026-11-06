@@ -60,7 +60,6 @@ export default lintConfig({
     ],
   },
   "src/shared/mark-task-worker-thread-contexts.ts": { services: ["InsideTaskBody"] },
-  "src/shared/write-trace-file.ts": { services: ["TraceFile"] },
   "src/lib/main-thread/shared/find-tasks-reachable-from-root-task-file.ts": {
     allow: ["importsDynamically"],
   },
@@ -68,6 +67,7 @@ export default lintConfig({
   "src/lib/main-thread/shared/provide-process-groups.ts": { services: ["ProcessGroups"] },
   "src/lib/main-thread/shared/provide-run-root-task-config.ts": { services: ["RunRootTaskConfig"] },
   "src/lib/main-thread/shared/provide-stop-state.ts": { services: ["StopState"] },
+  "src/lib/main-thread/shared/write-trace-file.ts": { services: ["TraceFile"] },
   "src/lib/main-thread/lib/find-code-each-task-depends-on/internal/make-module-graph.ts": {
     services: ["ModuleGraph"],
   },

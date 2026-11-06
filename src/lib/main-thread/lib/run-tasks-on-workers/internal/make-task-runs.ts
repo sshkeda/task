@@ -4,13 +4,13 @@ import type { FileSystem, Schema } from "effect";
 import { printLine, printTaskLines } from "../../../../../shared/print-to-standard-error.ts";
 import type { TaskRequestFailure } from "../../../../../shared/task-errors.ts";
 import { TASK_PACKAGE } from "../../../../../shared/task-package.ts";
-import type { TraceFile } from "../../../../../shared/write-trace-file.ts";
 import { failRunOnFailure, failTask } from "../../../shared/fail-run.ts";
 import { ServingTaskRequestsItself } from "../../../shared/main-thread-errors.ts";
 import type { ProcessGroups } from "../../../shared/provide-process-groups.ts";
 import type { RunRootTaskConfig } from "../../../shared/provide-run-root-task-config.ts";
 import { StopState } from "../../../shared/provide-stop-state.ts";
 import type { WorkerEvent, WorkerPool } from "../../../shared/provide-worker-pool.ts";
+import type { TraceFile } from "../../../shared/write-trace-file.ts";
 import {
   runRequestedTask,
   runRequestedDependencyTask,

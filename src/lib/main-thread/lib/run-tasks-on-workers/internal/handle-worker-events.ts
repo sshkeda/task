@@ -14,12 +14,12 @@ import {
   TaskBodyFailed,
 } from "../../../../../shared/task-errors.ts";
 import type { AwaitedTasksFailure, TaskRequestFailure } from "../../../../../shared/task-errors.ts";
-import { TraceFile } from "../../../../../shared/write-trace-file.ts";
 import { failRun, failTask } from "../../../shared/fail-run.ts";
 import { ProcessGroups } from "../../../shared/provide-process-groups.ts";
 import { StopState } from "../../../shared/provide-stop-state.ts";
 import { FromWorker, WorkerEvent, WorkerPool } from "../../../shared/provide-worker-pool.ts";
 import { reportFailure } from "../../../shared/report-task-failure.ts";
+import { TraceFile } from "../../../shared/write-trace-file.ts";
 import { findAssignedWorkerId, TaskRunStatus } from "../shared/define-task-run-state.ts";
 import type { makeTaskRunsState } from "../shared/define-task-run-state.ts";
 
@@ -222,7 +222,7 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
   messageFromWorker: Exclude<
     typeof FromWorker.Type,
     | typeof FromWorker.cases.StandardErrorLineRequested.Type
-    | typeof FromWorker.cases.TraceWriteFailed.Type
+    | typeof FromWorker.cases.TraceLogRecordRequested.Type
   >,
 ) {
   const processGroups = yield* ProcessGroups;
@@ -343,18 +343,16 @@ export const handleWorkerEvent = Effect.fn("handleWorkerEvent")(function* (
     );
   }
   const messageFromWorker = workerEvent.message;
+  const traceFile = yield* TraceFile;
   if (FromWorker.guards.StandardErrorLineRequested(messageFromWorker)) {
     if (messageFromWorker.traceLogRecordJson !== undefined) {
-      (yield* TraceFile).writeWorkerLogRecord(messageFromWorker.traceLogRecordJson);
+      traceFile.writeWorkerLogRecord(messageFromWorker.traceLogRecordJson);
     }
     return yield* printLine(messageFromWorker.logLevel, messageFromWorker.text);
   }
-  if (FromWorker.guards.TraceWriteFailed(messageFromWorker)) {
-    return yield* TraceFile.use((traceFile) =>
-      traceFile.markIncomplete(
-        `worker ${workerEvent.workerId} reported that ${messageFromWorker.reason}`,
-      ),
-    );
+  if (FromWorker.guards.TraceLogRecordRequested(messageFromWorker)) {
+    traceFile.writeWorkerLogRecord(messageFromWorker.traceLogRecordJson);
+    return;
   }
   yield* Effect.annotateCurrentSpan({
     [`${TASK_TRACE_LABEL_PREFIX}.message`]: messageFromWorker._tag,

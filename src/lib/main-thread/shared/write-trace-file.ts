@@ -15,10 +15,13 @@ import type { PlatformError } from "effect";
 import { HttpBody, HttpClient, HttpClientResponse } from "effect/http";
 import { OtlpExporter, OtlpLogger, OtlpResource, OtlpTracer } from "effect/observability";
 
-import { InternalInvariantBroken } from "./invariant-errors.ts";
-import { TASK_STATE_DIRECTORY_NAME, TASK_TRACE_LABEL_PREFIX } from "./names-from-package-json.ts";
-import { causeWithPrintableErrors } from "./report-cause.ts";
-import { TASK_PACKAGE } from "./task-package.ts";
+import { InternalInvariantBroken } from "../../../shared/invariant-errors.ts";
+import {
+  TASK_STATE_DIRECTORY_NAME,
+  TASK_TRACE_LABEL_PREFIX,
+} from "../../../shared/names-from-package-json.ts";
+import { causeWithPrintableErrors } from "../../../shared/report-cause.ts";
+import { TASK_PACKAGE } from "../../../shared/task-package.ts";
 
 const NEWLINE = new TextEncoder().encode("\n");
 
@@ -37,21 +40,12 @@ export class TraceFile extends Context.Service<
 
 export const makeTraceFile = Effect.fn("makeTraceFile")(function* (input: {
   readonly traceFilePath: string;
-  readonly thread: "main-thread" | "worker";
-  readonly maxBatchSize?: number;
-  readonly onIncomplete?: (reason: string) => Effect.Effect<void>;
 }) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const whyIncomplete = yield* Ref.make<string | null>(null);
   const markIncomplete = (reason: string) =>
-    Ref.modify(whyIncomplete, (firstReason) =>
-      firstReason === null ? [true, reason] : [false, firstReason],
-    ).pipe(
-      Effect.andThen((isFirstReason) =>
-        isFirstReason ? (input.onIncomplete?.(reason) ?? Effect.void) : Effect.void,
-      ),
-    );
+    Ref.update(whyIncomplete, (firstReason) => firstReason ?? reason);
   yield* fileSystem
     .makeDirectory(path.dirname(input.traceFilePath), { recursive: true })
     .pipe(
@@ -84,9 +78,8 @@ export const makeTraceFile = Effect.fn("makeTraceFile")(function* (input: {
     resource: {
       serviceName: TASK_PACKAGE.name,
       serviceVersion: TASK_PACKAGE.version,
-      attributes: { [`${TASK_TRACE_LABEL_PREFIX}.thread`]: input.thread },
+      attributes: { [`${TASK_TRACE_LABEL_PREFIX}.thread`]: "main-thread" },
     },
-    maxBatchSize: input.maxBatchSize,
     shutdownTimeout: Duration.infinity,
   };
   const workerResource = yield* OtlpResource.fromConfig({
@@ -177,6 +170,5 @@ export const makeTraceFile = Effect.fn("makeTraceFile")(function* (input: {
       exporters.workerSpans.push(spanJson);
     },
     whyIncomplete: Ref.get(whyIncomplete),
-    markIncomplete,
   };
 });
