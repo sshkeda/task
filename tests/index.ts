@@ -58,6 +58,8 @@ export const runtimeTests = Task.make(
   Task.allSettled(
     [
       runtimeBoundaryFailureSuite,
+      workers,
+      ctrlC,
       taskLifecycleTypes,
       failureArtifacts,
       shutdownTransitions,
@@ -98,8 +100,6 @@ export const runtimeTests = Task.make(
       killedOnce,
       workerFailures,
       unresponsiveWorkers,
-      workers,
-      ctrlC,
       supervision,
     ],
     { concurrency: TESTS_AT_ONCE },
