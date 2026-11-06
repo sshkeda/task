@@ -119,13 +119,16 @@ export const WorkerInitialMessage = Schema.Struct({ mainThreadPort: Transferable
 
 const RequestIdentifier = Schema.Union([Schema.String, Schema.Finite]);
 
+export const MainThreadRpcRequest = Schema.TaggedStruct("Request", {
+  id: RequestIdentifier,
+  tag: Schema.String,
+  payload: Schema.Unknown,
+  headers: Schema.Array(Schema.mutable(Schema.Tuple([Schema.String, Schema.String]))),
+  isNotification: Schema.optionalKey(Schema.Literal(true)),
+});
+
 export const MessageFromMainThreadRpcClient = Schema.Union([
-  Schema.TaggedStruct("Request", {
-    id: RequestIdentifier,
-    tag: Schema.String,
-    payload: Schema.Unknown,
-    headers: Schema.Array(Schema.mutable(Schema.Tuple([Schema.String, Schema.String]))),
-  }),
+  MainThreadRpcRequest,
   Schema.TaggedStruct("Ack", { requestId: RequestIdentifier }),
   Schema.TaggedStruct("Interrupt", { requestId: RequestIdentifier }),
   Schema.TaggedStruct("Eof", {}),

@@ -209,7 +209,7 @@ export default lintConfig({
       },
     ],
   },
-  "src/shared/complete-discarded-calls-once-sent.ts": {
+  "src/lib/supervise-the-run/internal/complete-discarded-calls-once-sent.ts": {
     allow: [{ handlesEveryFailure: "a call that already finished hands back its own result" }],
   },
   "tests/shared/fail-test-cleanup.ts": {
