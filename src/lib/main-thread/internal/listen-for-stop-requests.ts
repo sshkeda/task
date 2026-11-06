@@ -1,4 +1,4 @@
-import { Deferred, Duration, Effect, Layer, Option, Stream } from "effect";
+import { Deferred, Duration, Effect, Layer, Option, Schema, Stream } from "effect";
 import type { Queue } from "effect";
 
 import { findUserLocationInStack } from "../../../shared/find-user-locations-in-stack-traces.ts";
@@ -25,6 +25,8 @@ const STOPPING_LINES = {
 
 const GRACE_AFTER_STANDARD_ERROR_CLOSED = Duration.seconds(1);
 
+const isStopRequested = Schema.is(StopRequested);
+
 const requestStopOnSignal = Effect.fn("requestStopOnSignal")(function* (
   signal: (typeof STOP_SIGNALS)[number],
 ) {
@@ -49,6 +51,13 @@ export const stopRequestsLayer = (signals: Queue.Dequeue<(typeof STOP_SIGNALS)[n
         Effect.forkScoped,
       );
       const shutdown = yield* StopState;
+      const forceStopKeepingTheStopSignal = shutdown.outcome.pipe(
+        Effect.flatMap((outcome) =>
+          shutdown.forceStop(
+            isStopRequested(outcome) ? outcome : new StopRequested({ signal: "SIGPIPE" }),
+          ),
+        ),
+      );
       yield* Deferred.await(standardErrorWriteFailedDeferred).pipe(
         Effect.flatMap(shutdown.forceStop),
         Effect.interruptible,
@@ -63,9 +72,7 @@ export const stopRequestsLayer = (signals: Queue.Dequeue<(typeof STOP_SIGNALS)[n
           shutdown.awaitForcedStop.pipe(Effect.timeoutOption(GRACE_AFTER_STANDARD_ERROR_CLOSED)),
         ),
         Effect.flatMap((forcedStop) =>
-          Option.isSome(forcedStop)
-            ? Effect.void
-            : shutdown.forceStop(new StopRequested({ signal: "SIGPIPE" })),
+          Option.isSome(forcedStop) ? Effect.void : forceStopKeepingTheStopSignal,
         ),
         Effect.interruptible,
         Effect.forkScoped,

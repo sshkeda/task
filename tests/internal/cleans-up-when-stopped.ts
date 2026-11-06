@@ -365,14 +365,40 @@ export const main = Task.make("main", Effect.gen(function* () {
 }), { timeout: "5 seconds", cleanup: "5 seconds" });
 if (import.meta.main) Task.main(main);`;
 
+const INTERRUPT_ONCE_SERVING_IS_READ_AND_STANDARD_ERROR_CLOSED = `const shell = Bun.spawn(["sh", "-c", \`(\${process.execPath} main.ts; echo $? > exit-code) 2>&1 | { sed '/main is serving/q'; exec 0<&-; kill -INT $(cat task-pid); }\`], { stdio: ["ignore", "inherit", "inherit"] });
+process.exitCode = await shell.exited;`;
+
 export const interruptAfterOutputClosed = Task.make(
   "Ctrl-C after standard error closes, when the stopping line is the first write that finds it closed, still exits 130",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": SERVING_ROOT_THAT_RECORDS_ITS_PROCESS_ID,
-        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`(\${process.execPath} main.ts; echo $? > exit-code) 2>&1 | { sed '/main is serving/q'; exec 0<&-; kill -INT $(cat task-pid); }\`], { stdio: ["ignore", "inherit", "inherit"] });
-process.exitCode = await shell.exited;`,
+        "piped.ts": INTERRUPT_ONCE_SERVING_IS_READ_AND_STANDARD_ERROR_CLOSED,
+      });
+      const piped = yield* runTaskProcess(project, "piped.ts");
+      expect(piped.standardOutput).toEndWith("main is serving\n");
+      expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("130");
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const interruptAfterOutputClosedDuringLongCleanup = Task.make(
+  "Ctrl-C after standard error closes still exits 130 when the cleanup outlasts the 1s task waits once standard error closed",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { isMainThread } from "node:worker_threads";
+import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+if (isMainThread) await Bun.write("task-pid", String(process.pid));
+export const main = Task.make("main", Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.sleep("3 seconds"));
+  return yield* Task.serve("up");
+}), { timeout: "5 seconds", cleanup: "5 seconds" });
+if (import.meta.main) Task.main(main);`,
+        "piped.ts": INTERRUPT_ONCE_SERVING_IS_READ_AND_STANDARD_ERROR_CLOSED,
       });
       const piped = yield* runTaskProcess(project, "piped.ts");
       expect(piped.standardOutput).toEndWith("main is serving\n");
