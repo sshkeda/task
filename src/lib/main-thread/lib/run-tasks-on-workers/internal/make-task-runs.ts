@@ -65,7 +65,7 @@ export const makeTaskRuns = Effect.gen(function* () {
       ),
     stopAll: Effect.gen(function* () {
       const stopState = yield* StopState;
-      const failedBeforeStopping = yield* stopState.begin;
+      yield* stopState.begin;
       const unfinishedTaskNames = new Set(
         [...taskRunsByName]
           .filter(
@@ -162,7 +162,7 @@ export const makeTaskRuns = Effect.gen(function* () {
             ),
             Effect.ensuring(Deferred.done(stop.stopped, Exit.void)),
           ),
-        { concurrency: failedBeforeStopping ? "unbounded" : 1, discard: true },
+        { concurrency: "unbounded", discard: true },
       );
     }).pipe(Effect.scoped, Effect.provide(taskExecutionServices)),
     awaitServingTaskClosure: (taskName: string) =>
