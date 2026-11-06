@@ -71,7 +71,6 @@ export const provideTaskServices =
         Effect.provideService(
           Logger.CurrentLoggers,
           new Set([
-            ...(yield* Logger.CurrentLoggers),
             makeTaskLogger(
               startMessage,
               body,

@@ -280,6 +280,10 @@ const makeWorkerPool = Effect.gen(function* () {
               }),
             null,
           ),
+        RecordTraceSpan: (recorded) =>
+          Effect.sync(() => {
+            traceFile.writeWorkerSpan(recorded.spanJson);
+          }),
         RecordStartedProcess: (started) =>
           reportAndAwaitAnswer(
             workerId,

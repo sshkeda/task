@@ -344,6 +344,9 @@ export const handleWorkerEvent = Effect.fn("handleWorkerEvent")(function* (
   }
   const messageFromWorker = workerEvent.message;
   if (FromWorker.guards.StandardErrorLineRequested(messageFromWorker)) {
+    if (messageFromWorker.traceLogRecordJson !== undefined) {
+      (yield* TraceFile).writeWorkerLogRecord(messageFromWorker.traceLogRecordJson);
+    }
     return yield* printLine(messageFromWorker.logLevel, messageFromWorker.text);
   }
   if (FromWorker.guards.TraceWriteFailed(messageFromWorker)) {

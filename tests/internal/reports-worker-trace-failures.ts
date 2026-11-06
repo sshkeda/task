@@ -51,7 +51,13 @@ if (import.meta.main) Task.main(main);`,
       expect(traceNames).toHaveLength(1);
       const trace = yield* fileSystem.readFileString(`${traceDirectory}/${traceNames[0]}`);
       expect(trace).toContain('"stringValue":"main-thread"');
-      expect(trace).not.toContain('"stringValue":"worker"');
+      expect(trace).toContain('"stringValue":"second worker log"');
+      expect(
+        trace
+          .split("\n")
+          .filter((line) => line.includes('"resourceSpans"'))
+          .join("\n"),
+      ).toContain('"stringValue":"worker"');
     }),
   ),
   { timeout: "1 minute", cleanup: "5 seconds" },

@@ -54,7 +54,10 @@ export const StandardErrorLine = Schema.Struct({
 
 export const TASK_EVENT_FIELDS = {
   TraceWriteFailed: { reason: Schema.String },
-  StandardErrorLineRequested: StandardErrorLine.fields,
+  StandardErrorLineRequested: {
+    ...StandardErrorLine.fields,
+    traceLogRecordJson: Schema.optional(Schema.String),
+  },
   TaskFiberLoading: { taskName: Schema.String },
   TaskFiberStarted: { taskName: Schema.String },
   TaskFiberReceivedAwaitedFailure: { taskName: Schema.String, awaitedTaskName: Schema.String },
@@ -105,6 +108,7 @@ export const MainThreadRpcs = RpcGroup.make(
     success: StandardInputRead,
   }),
   Rpc.make("RecordStartedProcess", { payload: StartedProcess }),
+  Rpc.make("RecordTraceSpan", { payload: { spanJson: Schema.String } }),
   Rpc.make("ClaimProcessReports", {
     payload: ProcessReportsToClaim,
     success: Schema.Array(ProcessIdentity),

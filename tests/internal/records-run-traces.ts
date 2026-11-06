@@ -5,6 +5,7 @@ import { Clock, Duration, Effect, Exit, FileSystem, Path } from "effect";
 
 import taskPackageJson from "../../package.json" with { type: "json" };
 import { availableParallelism } from "../../src/shared/read-environment-config.ts";
+import { countOccurrences } from "../shared/count-occurrences.ts";
 import { failTestCleanup } from "../shared/fail-test-cleanup.ts";
 import { exitAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
@@ -24,6 +25,14 @@ const SPAN_STATUS_ERROR = 2;
 const ANNOTATED_COUNT = 2;
 
 const PROCESS_EXIT_CODE = 3;
+
+const LOGGED_LINE_COUNT = 100;
+
+const LOGGED_BEFORE_EXIT_COUNT = 500;
+
+const WORKER_EXIT_CODE = 7;
+
+const SPANS_BEFORE_EXIT_COUNT = 500;
 
 const DAY_MILLISECONDS = Duration.toMillis(Duration.days(1));
 
@@ -330,6 +339,107 @@ if (import.meta.main) Task.main(main);`,
       const run = trace?.findOnlySpan("runRootTaskFiber");
       expect(run).toBeDefined();
       expect(trace?.findOnlySpan("executeTaskFiber main")?.parentSpanId).toBe(run?.spanId);
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const loggedLineBatches = Task.make(
+  "lines a body logs reach the trace file in batches of log records, not one file line each",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const main = Task.make("main", Effect.forEach(Array.from({ length: ${LOGGED_LINE_COUNT} }, (_, line) => line), (line) => Effect.log(\`line \${line}\`), { discard: true }));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode).toBe(0);
+      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      expect(
+        trace?.logs.filter((log) => log.body.stringValue?.startsWith("line ") === true),
+      ).toHaveLength(LOGGED_LINE_COUNT);
+      expect(
+        trace?.text.split("\n").filter((line) => line.includes('"resourceLogs"')).length,
+      ).toBeLessThan(LOGGED_LINE_COUNT);
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const loggedBeforeProcessExit = Task.make(
+  "every line a body logs right before it calls process.exit reaches the trace file as a log record",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const main = Task.make("main", Effect.forEach(Array.from({ length: ${LOGGED_BEFORE_EXIT_COUNT} }, (_, line) => line), (line) => Effect.log(\`line \${line}\`), { discard: true }).pipe(Effect.andThen(Effect.sync(() => process.exit(${WORKER_EXIT_CODE})))));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.standardError).toContain(
+        `[main] error WorkerExited: its worker exited on its own with code ${WORKER_EXIT_CODE}`,
+      );
+      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const logged = (trace?.logs ?? []).filter(
+        (log) =>
+          log.body.stringValue?.startsWith("line ") === true &&
+          readAttribute(log.attributes, "sshkeda_task.task") === "main",
+      );
+      expect(new Set(logged.map((log) => log.body.stringValue)).size).toBe(
+        LOGGED_BEFORE_EXIT_COUNT,
+      );
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const spansBeforeProcessExit = Task.make(
+  "every span a body ends right before it calls process.exit reaches the trace file, in batches of spans",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const main = Task.make("main", Effect.forEach(Array.from({ length: ${SPANS_BEFORE_EXIT_COUNT} }, (_, span) => span), (span) => Effect.withSpan(Effect.void, \`span \${span}\`), { discard: true }).pipe(Effect.andThen(Effect.sync(() => process.exit(${WORKER_EXIT_CODE})))));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.standardError).toContain(
+        `[main] error WorkerExited: its worker exited on its own with code ${WORKER_EXIT_CODE}`,
+      );
+      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const ended = (trace?.spans ?? []).filter(
+        (span) => span.name.startsWith("span ") && span.thread === "worker",
+      );
+      expect(new Set(ended.map((span) => span.name)).size).toBe(SPANS_BEFORE_EXIT_COUNT);
+      expect(
+        trace?.text.split("\n").filter((line) => line.includes('"resourceSpans"')).length,
+      ).toBeLessThan(SPANS_BEFORE_EXIT_COUNT);
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const loggedAttributes = Task.make(
+  "a logged line's record writes a non-finite annotation as OTLP/JSON does and one attribute per log span label",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const main = Task.make("main", Effect.log("measured").pipe(Effect.annotateLogs({ ratio: Infinity }), Effect.withLogSpan("phase"), Effect.withLogSpan("phase")));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      const text = (yield* readTraceDirectory(project, ran)).files
+        .map((file) => file.text)
+        .join("\n");
+      expect(text).toContain('{"key":"ratio","value":{"doubleValue":"Infinity"}}');
+      expect(countOccurrences(text, '"key":"effect.log_span.phase"')).toBe(1);
     }),
   ),
   { timeout: "1 minute", cleanup: "5 seconds" },

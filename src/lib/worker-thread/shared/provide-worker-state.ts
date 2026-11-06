@@ -124,10 +124,26 @@ const connectToMainThread = Effect.gen(function* () {
   const reportToMainThreadNow = (event: typeof TaskEvent.Type) => {
     runInWorkerScope(reportToMainThread(event));
   };
+  const recordTraceSpanNow = (spanJson: string) => {
+    runInWorkerScope(
+      mainThread
+        .RecordTraceSpan({ spanJson }, { discard: true })
+        .pipe(
+          dieOnInvariantFailure("worker protocol", "trace spans reach the main thread"),
+          completeOnceSent(reportScope),
+        ),
+    );
+  };
   yield* Deferred.succeed(standardErrorLinesToTheMainThreadDeferred, (logLevel, text) =>
     reportToMainThread(TaskEvent.cases.StandardErrorLineRequested.make({ logLevel, text })),
   );
-  return { ...decodedWorkerData, mainThread, reportToMainThread, reportToMainThreadNow };
+  return {
+    ...decodedWorkerData,
+    mainThread,
+    reportToMainThread,
+    reportToMainThreadNow,
+    recordTraceSpanNow,
+  };
 });
 
 const makeWorkerState = Effect.gen(function* () {
