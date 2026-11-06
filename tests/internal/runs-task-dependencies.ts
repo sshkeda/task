@@ -28,6 +28,37 @@ if (import.meta.main) Task.main(main);`,
   { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
+export const moduleExports = Task.make(
+  "a value or served value made of a module's exports reaches the task that yields it",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "settings.ts": `export const host = "localhost";
+export const port = 4000;`,
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+import * as settings from "./settings.ts";
+export const config = Task.make("config", Effect.succeed(settings));
+export const server = Task.make("server", Effect.gen(function* () {
+  return yield* Task.serve({ url: \`http://\${settings.host}:\${settings.port}\`, settings });
+}));
+export const main = Task.make("main", Effect.gen(function* () {
+  const { host, port } = yield* config;
+  const { url, settings: served } = yield* server;
+  yield* Effect.log(\`config \${host}:\${port}, served \${url} on \${served.port}\`);
+}));
+if (import.meta.main) Task.main(main);`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(ran.standardError).toContain(
+        "[main] config localhost:4000, served http://localhost:4000 on 4000\n",
+      );
+    }),
+  ),
+  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
 export const once = Task.make(
   "a task yielded by several tasks runs once per run",
   Effect.scoped(

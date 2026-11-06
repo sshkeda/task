@@ -1,4 +1,4 @@
-import { Array as Arrays, Effect, Formatter, Option, Redacted, Schema } from "effect";
+import { Array as Arrays, Effect, Formatter, Option, Redacted, Result, Schema } from "effect";
 
 import {
   holdsRedactedTaskResultKey,
@@ -25,6 +25,14 @@ const isJsonLeaf = Schema.is(
 );
 
 const isRedactedString = Schema.is(Schema.Redacted(Schema.String));
+
+const isDataCloneError = Schema.is(Schema.Struct({ name: Schema.Literal("DataCloneError") }));
+
+const holdsUncloneableObject = (json: Schema.Json) =>
+  Result.match(
+    Result.try(() => structuredClone(json)),
+    { onSuccess: () => false, onFailure: isDataCloneError },
+  );
 
 const decodeTaskResultPart = Schema.decodeUnknownEffect(TaskResultPart, REPORT_INPUT);
 
@@ -100,12 +108,14 @@ export const decodeTaskResultJson = (
       Effect.asSome,
       Effect.catchTag("SchemaError", () => Effect.succeedNone),
     );
-    const jsonWithoutReservedKey = Option.filter(json, (candidate) => {
+    const cloneableJsonWithoutReservedKey = Option.filter(json, (candidate) => {
       const isBranch = candidate !== null && typeof candidate === "object";
-      return !isBranch || !holdsRedactedTaskResultKey(candidate);
+      return (
+        !isBranch || (!holdsRedactedTaskResultKey(candidate) && !holdsUncloneableObject(candidate))
+      );
     });
-    if (Option.isSome(jsonWithoutReservedKey)) {
-      return jsonWithoutReservedKey.value;
+    if (Option.isSome(cloneableJsonWithoutReservedKey)) {
+      return cloneableJsonWithoutReservedKey.value;
     }
     return yield* encodeTaskResultParts(
       (valuePath, valueDescription) =>
