@@ -9,7 +9,8 @@ export {
   REPORTED_FAILURE_FIELDS,
   SettledTasksFailed,
   TaskError,
-  TaskNotMadeAtTopLevel,
-  TaskResultNotJson,
+  TaskMadeByAnotherCopy,
+  TaskNotMadeWhileLoading,
+  TaskOutputInvalid,
   TaskWaitsOnItself,
 } from "./internal/errors.ts";

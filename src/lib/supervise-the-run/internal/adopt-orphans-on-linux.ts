@@ -2,6 +2,7 @@ import { dlopen, FFIType } from "bun:ffi";
 
 import { Effect, Stream } from "effect";
 
+import { isCommandInTerminal } from "../../../shared/run-in-terminal.ts";
 import { listenToSignals } from "../../../shared/stop-signals.ts";
 
 const C_LIBRARY_PATH = "libc.so.6";
@@ -39,7 +40,11 @@ const reapExitedOrphans = (
   const information = new Uint8Array(SIGINFO_BYTES);
   const peeked = symbols.waitid(P_ALL, 0, information, WEXITED | WNOHANG | WNOWAIT);
   const processId = new DataView(information.buffer).getInt32(SIGINFO_PROCESS_ID_OFFSET, true);
-  const isExitedOrphan = peeked === 0 && processId !== 0 && processId !== runProcessId;
+  const isExitedOrphan =
+    peeked === 0 &&
+    processId !== 0 &&
+    processId !== runProcessId &&
+    !isCommandInTerminal(processId);
   if (isExitedOrphan) {
     symbols.waitpid(processId, null, 0);
     reapExitedOrphans(symbols, runProcessId);

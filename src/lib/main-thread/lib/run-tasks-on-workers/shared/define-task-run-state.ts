@@ -13,7 +13,7 @@ import type {
   TaskBodyFailed,
   TaskCleanupFailed,
 } from "../../../../../shared/task-errors.ts";
-import type { findTasksReachableFromRootTaskFile } from "../../../shared/find-tasks-reachable-from-root-task-file.ts";
+import type { findTasksMadeByRootTaskFile } from "../../../shared/find-tasks-made-by-root-task-file.ts";
 import { makeStopwatch } from "./make-stopwatch.ts";
 import { makeRootTaskStandardInput } from "./share-standard-input-with-root-task.ts";
 
@@ -35,7 +35,6 @@ export const makeTaskRun = (initial: {
   readonly stepBeforeBody: string | null;
 }) => ({
   ...initial,
-  logMessages: new Array<string>(),
   awaitedTaskNames: new Array<string>(),
   requestFibersByDependencyRequestId: new Map<number, Fiber.Fiber<unknown, unknown>>(),
   bodyRequestedTaskNames: new Set<string>(),
@@ -48,6 +47,8 @@ export const makeTaskRun = (initial: {
   bodyStartedAtMillisecondsDeferred: Deferred.makeUnsafe<number>(),
   bodyCleanupStartedDeferred: Deferred.makeUnsafe<void>(),
   bodyFailedBeforeCleanupDeferred: Deferred.makeUnsafe<void>(),
+  stopRequestedAtMillisecondsDeferred: Deferred.makeUnsafe<number>(),
+  cleanupLimitPassedDeferred: Deferred.makeUnsafe<void>(),
   bodyFinishedDeferred: Deferred.makeUnsafe<void>(),
 });
 
@@ -91,6 +92,7 @@ export const countWorkerLoad = (
   occupyingTaskCount: unfinishedTaskRunsOnWorker.filter((taskRun) => isOccupyingWorker(taskRun))
     .length,
   servingTaskCount: unfinishedTaskRunsOnWorker.filter((taskRun) => isServing(taskRun)).length,
+  unfinishedTaskCount: unfinishedTaskRunsOnWorker.length,
 });
 
 export const formatTaskRunStatusForTrace = (status: typeof TaskRunStatus.Type) =>
@@ -115,9 +117,8 @@ const requireAssignedWorkerId = (taskName: string, status: typeof TaskRunStatus.
 };
 
 export const makeTaskRunsState = Effect.gen(function* () {
-  const discoveredTasksByName: Effect.Success<
-    ReturnType<typeof findTasksReachableFromRootTaskFile>
-  > = new Map();
+  const discoveredTasksByName: Effect.Success<ReturnType<typeof findTasksMadeByRootTaskFile>> =
+    new Map();
   const taskNamesWhoseFailureReachedAnAwaitingTask = new Set<string>();
   const taskRunsByName = new Map<string, ReturnType<typeof makeTaskRun>>();
   const taskRunsSeenByCallers: ReadonlyMap<
@@ -125,13 +126,7 @@ export const makeTaskRunsState = Effect.gen(function* () {
     ReturnType<typeof withReadOnlyStatus>
   > = taskRunsByName;
   const taskNamesAssignedToWorker = new Map<number, Set<string>>();
-  const bodyBusyClocksByWorkerId = new Map<
-    number,
-    {
-      readonly busy: ReturnType<typeof makeStopwatch>;
-      readonly taskNamesRunningOccupyingBodies: Set<string>;
-    }
-  >();
+  const workerLoad = { changed: Deferred.makeUnsafe<void>() };
   return {
     discoveredTasksByName,
     taskNamesWhoseFailureReachedAnAwaitingTask,
@@ -181,7 +176,10 @@ export const makeTaskRunsState = Effect.gen(function* () {
       }
       return countWorkerLoad(unfinishedTaskRuns);
     },
+    awaitNextWorkerLoadChange: () => Deferred.await(workerLoad.changed),
     refreshBodyClocks: (taskName: string, nowMilliseconds: number) => {
+      Deferred.doneUnsafe(workerLoad.changed, Exit.void);
+      workerLoad.changed = Deferred.makeUnsafe();
       const taskRun = taskRunsByName.get(taskName);
       if (taskRun === undefined) {
         return;
@@ -190,29 +188,6 @@ export const makeTaskRunsState = Effect.gen(function* () {
         taskRun.requestFibersByDependencyRequestId.size > 0,
         nowMilliseconds,
       );
-      const workerId = findAssignedWorkerId(taskRun.status);
-      if (workerId === null) {
-        return;
-      }
-      const busyClock = bodyBusyClocksByWorkerId.get(workerId) ?? {
-        busy: makeStopwatch(),
-        taskNamesRunningOccupyingBodies: new Set<string>(),
-      };
-      bodyBusyClocksByWorkerId.set(workerId, busyClock);
-      const isRunningOccupyingBody =
-        Deferred.isDoneUnsafe(taskRun.bodyStartedAtMillisecondsDeferred) &&
-        isUnfinishedOnWorker(taskRun, workerId) &&
-        isOccupyingWorker(taskRun);
-      if (isRunningOccupyingBody) {
-        busyClock.taskNamesRunningOccupyingBodies.add(taskName);
-      } else {
-        busyClock.taskNamesRunningOccupyingBodies.delete(taskName);
-      }
-      busyClock.busy.update(busyClock.taskNamesRunningOccupyingBodies.size > 0, nowMilliseconds);
-    },
-    readWorkerBodyBusyMilliseconds: (workerId: number, nowMilliseconds: number) => {
-      const busyClock = bodyBusyClocksByWorkerId.get(workerId);
-      return busyClock === undefined ? 0 : busyClock.busy.readMilliseconds(nowMilliseconds);
     },
     markServing: (taskName: string) => {
       const taskRun = taskRunsByName.get(taskName);

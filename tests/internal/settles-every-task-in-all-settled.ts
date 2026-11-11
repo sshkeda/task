@@ -3,10 +3,12 @@ import { expect } from "bun:test";
 import { Task } from "@sshkeda/task";
 import { Effect } from "effect";
 
+import { exists } from "../shared/access-files.ts";
 import { countOccurrences } from "../shared/count-occurrences.ts";
 import { EXIT_CODE_AFTER_SIGINT } from "../shared/exit-codes-after-stop-signals.ts";
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
 import {
   TASK_ENVIRONMENT_VARIABLE_PREFIX,
@@ -41,21 +43,20 @@ const fourSiblingsProject = (groupFunctionName: "all" | "allSettled") =>
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const one = Task.make("one", Effect.gen(function* () {
+export const one = Task.make({ name: "one", run: Effect.gen(function* () {
   yield* waitForRelease("release-one");
   yield* Effect.log("one finished after the failures");
-}));
-export const two = Task.make("two", Effect.fail(new TaskError({ message: "two broke" })));
-export const three = Task.make("three", Effect.gen(function* () {
+}) });
+export const two = Task.make({ name: "two", run: Effect.fail(new TaskError({ message: "two broke" })) });
+export const three = Task.make({ name: "three", run: Effect.gen(function* () {
   yield* waitForRelease("release-three");
   yield* Effect.log("three finished after the failures");
-}));
-export const four = Task.make("four", Effect.fail(new TaskError({ message: "four broke" })));
-export const main = Task.make("main", Task.${groupFunctionName}([one, { two, three }, four]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export const four = Task.make({ name: "four", run: Effect.fail(new TaskError({ message: "four broke" })) });
+export default Task.make({ name: "main", run: Task.${groupFunctionName}([one, { two, three }, four]) });`,
   });
 
-export const everySiblingReports = Task.make(
+export const everySiblingReports = makeTest(
   "allSettled runs every sibling to completion, prints each failure and fails with a count",
   Effect.scoped(
     Effect.gen(function* () {
@@ -80,20 +81,18 @@ export const everySiblingReports = Task.make(
       expect(exited.standardError).toMatch(/^failed: two, four \(2 of 5 tasks\), [\d.]+s$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const passingGroup = Task.make(
+export const passingGroup = makeTest(
   "allSettled whose tasks all pass passes",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const one = Task.make("one", Effect.succeed(1));
-export const two = Task.make("two", Effect.log("two ran"));
-export const main = Task.make("main", Task.allSettled([{ one, two }, one]));
-if (import.meta.main) Task.main(main);`,
+export const one = Task.make({ name: "one", run: Effect.succeed(1) });
+export const two = Task.make({ name: "two", run: Effect.log("two ran") });
+export default Task.make({ name: "main", run: Task.allSettled([{ one, two }, one]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
@@ -101,10 +100,71 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toMatch(/^passed: 3 tasks, [\d.]+s$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failFastAll = Task.make(
+export const records = makeTest(
+  "all and allSettled run every task in a record of tasks",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const source = `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const one = Task.make({ name: "one", run: Effect.log("one ran") });
+export const two = Task.make({ name: "two", run: Effect.log("two ran") });
+export const together = Task.make({ name: "together", run: Task.all({ one, two }) });
+export const settled = Task.make({ name: "settled", run: Task.allSettled({ one, two }) });
+const byName: Readonly<Record<string, Task.Task>> = { one, two };
+export const named = Task.make({ name: "named", run: Task.all(byName) });
+export default Task.make({ name: "main", run: Task.all([together, settled, named]) });`;
+      yield* typeCheckSource(source);
+      const project = yield* makeProject({ "main.ts": source });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode).toBe(0);
+      expect(ran.standardError).toContain("[one] one ran");
+      expect(ran.standardError).toContain("[two] two ran");
+      expect(ran.standardError).toMatch(/^passed: 6 tasks, [\d.]+s$/mu);
+    }),
+  ),
+);
+
+export const notTaskLists = makeTest(
+  "all and allSettled given something other than a list or record of tasks fail the calling task with TaskListNotGiven at the call, and no listed task starts",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const a = Task.make({ name: "a", run: Effect.promise(() => Bun.write("a-started", "")) });
+export const together = Task.make({ name: "together", run: Task.all("name", [a]) });
+export const settled = Task.make({ name: "settled", run: Task.allSettled(a) });
+export const holes = Task.make({ name: "holes", run: Task.all([a, 5]) });
+export const nothing = Task.make({ name: "nothing", run: Task.allSettled(undefined) });
+export default Task.make({ name: "main", run: Task.allSettled([together, settled, holes, nothing]) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.standardError).toContain(
+        '[together] main.ts:4:65: error TaskListNotGiven: Task.all() was called with "name", which is not a list or record of tasks\n',
+      );
+      expect(ran.standardError).toContain(
+        '[settled] main.ts:5:63: error TaskListNotGiven: Task.allSettled() was called with task "a", which is not a list or record of tasks\n',
+      );
+      expect(ran.standardError).toContain(
+        "[holes] main.ts:6:59: error TaskListNotGiven: Task.all() was called with an array, which is not a list or record of tasks\n",
+      );
+      expect(ran.standardError).toContain(
+        "[nothing] main.ts:7:63: error TaskListNotGiven: Task.allSettled() was called with undefined, which is not a list or record of tasks\n",
+      );
+      expect(ran.standardError).toContain(
+        "[main] error SettledTasksFailed: 4 of 4 tasks failed: together, settled, holes, nothing\n",
+      );
+      expect(ran.standardError).not.toContain("[a] started");
+      expect(ran.standardOutput).toBe("");
+      expect(ran.exitCode).toBe(1);
+      expect(yield* exists(`${project.directory}/a-started`)).toBe(false);
+    }),
+  ),
+);
+
+export const failFastAll = makeTest(
   "all still ends the run at the first failure and reports the tasks it stopped",
   Effect.scoped(
     Effect.gen(function* () {
@@ -127,10 +187,9 @@ export const failFastAll = Task.make(
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const interrupt = Task.make(
+export const interrupt = makeTest(
   "Ctrl-C during allSettled stops every task and exits 130",
   Effect.scoped(
     Effect.gen(function* () {
@@ -139,15 +198,14 @@ export const interrupt = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const broken = Task.make("broken", Effect.gen(function* () {
+export const broken = Task.make({ name: "broken", run: Effect.gen(function* () {
   yield* waitForRelease("left-waiting");
   yield* waitForRelease("right-waiting");
   return yield* Effect.fail(new TaskError({ message: "broken broke" }));
-}));
-export const left = Task.make("left", blockUntilStopped("left"));
-export const right = Task.make("right", blockUntilStopped("right"));
-export const main = Task.make("main", Task.allSettled([broken, left, right]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export const left = Task.make({ name: "left", run: blockUntilStopped("left") });
+export const right = Task.make({ name: "right", run: blockUntilStopped("right") });
+export default Task.make({ name: "main", run: Task.allSettled([broken, left, right]) });`,
       });
       yield* makeFifos(project, ["left-waiting", "right-waiting"]);
       const command = yield* startTaskProcess(project, "main.ts");
@@ -168,10 +226,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const allSettledInsideAll = Task.make(
+export const allSettledInsideAll = makeTest(
   "allSettled inside all settles its own group, then all fails fast and stops the rest",
   Effect.scoped(
     Effect.gen(function* () {
@@ -180,15 +237,14 @@ export const allSettledInsideAll = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const build = Task.make("build", Effect.gen(function* () {
+export const build = Task.make({ name: "build", run: Effect.gen(function* () {
   yield* waitForRelease("blocked-waiting");
   return yield* Effect.fail(new TaskError({ message: "build broke" }));
-}));
-export const lint = Task.make("lint", waitForRelease("release-lint"));
-export const blocked = Task.make("blocked", blockUntilStopped("blocked"));
-export const checks = Task.make("checks", Task.allSettled([build, lint]));
-export const main = Task.make("main", Task.all([checks, blocked]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export const lint = Task.make({ name: "lint", run: waitForRelease("release-lint") });
+export const blocked = Task.make({ name: "blocked", run: blockUntilStopped("blocked") });
+export const checks = Task.make({ name: "checks", run: Task.allSettled([build, lint]) });
+export default Task.make({ name: "main", run: Task.all([checks, blocked]) });`,
       });
       yield* makeFifos(project, ["release-lint", "blocked-waiting"]);
       const command = yield* startTaskProcess(project, "main.ts");
@@ -209,10 +265,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const allInsideAllSettled = Task.make(
+export const allInsideAllSettled = makeTest(
   "all inside allSettled fails its own task at the first failure while the other siblings run to completion, and the trace records each state",
   Effect.scoped(
     Effect.gen(function* () {
@@ -221,18 +276,17 @@ export const allInsideAllSettled = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const build = Task.make("build", Effect.gen(function* () {
+export const build = Task.make({ name: "build", run: Effect.gen(function* () {
   yield* waitForRelease("blocked-waiting");
   return yield* Effect.fail(new TaskError({ message: "build broke" }));
-}));
-export const blocked = Task.make("blocked", blockUntilStopped("blocked"));
-export const pipeline = Task.make("pipeline", Effect.gen(function* () {
+}) });
+export const blocked = Task.make({ name: "blocked", run: blockUntilStopped("blocked") });
+export const pipeline = Task.make({ name: "pipeline", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("pipeline stopped"));
   yield* Task.all([build, blocked]);
-}));
-export const lint = Task.make("lint", waitForRelease("release-lint"));
-export const main = Task.make("main", Task.allSettled([pipeline, lint]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export const lint = Task.make({ name: "lint", run: waitForRelease("release-lint") });
+export default Task.make({ name: "main", run: Task.allSettled([pipeline, lint]) });`,
       });
       yield* makeFifos(project, ["release-lint", "blocked-waiting"]);
       const command = yield* startTaskProcess(project, "main.ts");
@@ -271,10 +325,9 @@ if (import.meta.main) Task.main(main);`,
       });
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const awaitedFailFastElsewhere = Task.make(
+export const awaitedFailFastElsewhere = makeTest(
   "a failed task that a task outside allSettled also yields fails that task, and the failure reaches the root",
   Effect.scoped(
     Effect.gen(function* () {
@@ -283,19 +336,18 @@ export const awaitedFailFastElsewhere = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const flaky = Task.make("flaky", Effect.gen(function* () {
+export const flaky = Task.make({ name: "flaky", run: Effect.gen(function* () {
   yield* waitForRelease("blocked-waiting");
   yield* waitForRelease("release-flaky");
   return yield* Effect.fail(new TaskError({ message: "flaky broke" }));
-}));
-export const blocked = Task.make("blocked", blockUntilStopped("blocked"));
-export const consumer = Task.make("consumer", Effect.gen(function* () {
+}) });
+export const blocked = Task.make({ name: "blocked", run: blockUntilStopped("blocked") });
+export const consumer = Task.make({ name: "consumer", run: Effect.gen(function* () {
   yield* Effect.log("consumer waiting");
   yield* flaky;
-}));
-export const checks = Task.make("checks", Task.allSettled([flaky, blocked]));
-export const main = Task.make("main", Task.all([checks, consumer]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export const checks = Task.make({ name: "checks", run: Task.allSettled([flaky, blocked]) });
+export default Task.make({ name: "main", run: Task.all([checks, consumer]) });`,
       });
       yield* makeFifos(project, ["blocked-waiting", "release-flaky"]);
       const command = yield* startTaskProcess(project, "main.ts");
@@ -314,10 +366,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const awaitedFailFastInsideGroup = Task.make(
+export const awaitedFailFastInsideGroup = makeTest(
   "a sibling that yields a failed sibling fails with a reason naming it, and the group counts both",
   Effect.scoped(
     Effect.gen(function* () {
@@ -326,15 +377,14 @@ export const awaitedFailFastInsideGroup = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const flaky = Task.make("flaky", Effect.fail(new TaskError({ message: "flaky broke" })));
-export const consumer = Task.make("consumer", Effect.gen(function* () {
+export const flaky = Task.make({ name: "flaky", run: Effect.fail(new TaskError({ message: "flaky broke" })) });
+export const consumer = Task.make({ name: "consumer", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("consumer stopped"));
   yield* flaky;
   yield* Effect.log("consumer continued");
-}));
-export const lint = Task.make("lint", waitForRelease("release-lint"));
-export const main = Task.make("main", Task.allSettled([flaky, consumer, lint]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export const lint = Task.make({ name: "lint", run: waitForRelease("release-lint") });
+export default Task.make({ name: "main", run: Task.allSettled([flaky, consumer, lint]) });`,
       });
       yield* makeFifos(project, ["release-lint"]);
       const command = yield* startTaskProcess(project, "main.ts");
@@ -353,10 +403,9 @@ if (import.meta.main) Task.main(main);`,
       expect(exited.standardError).toMatch(/^failed: flaky \(1 of 4 tasks\), [\d.]+s$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const timedOut = Task.make(
+export const timedOut = makeTest(
   "a task that times out inside allSettled is stopped, its siblings finish, and allSettled fails with it",
   Effect.scoped(
     Effect.gen(function* () {
@@ -365,14 +414,13 @@ export const timedOut = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const broken = Task.make("broken", Effect.fail(new TaskError({ message: "broken broke" })));
-export const slow = Task.make("slow", blockUntilStopped("slow"), { timeout: "300 millis", cleanup: "5 seconds" });
-export const later = Task.make("later", Effect.gen(function* () {
+export const broken = Task.make({ name: "broken", run: Effect.fail(new TaskError({ message: "broken broke" })) });
+export const slow = Task.make({ name: "slow", run: blockUntilStopped("slow"), timeout: "300 millis", cleanup: "5 seconds" });
+export const later = Task.make({ name: "later", run: Effect.gen(function* () {
   yield* waitForRelease("release-later");
   yield* Effect.log("later finished after the timeout");
-}));
-export const main = Task.make("main", Task.allSettled([broken, slow, later]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export default Task.make({ name: "main", run: Task.allSettled([broken, slow, later]) });`,
       });
       yield* makeFifos(project, ["release-later"]);
       const command = yield* startTaskProcess(project, "main.ts");
@@ -390,24 +438,22 @@ if (import.meta.main) Task.main(main);`,
       expect(exited.standardError).toMatch(/^failed: broken, slow \(2 of 4 tasks\), [\d.]+s$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const timeoutReachesAllSettledBeforeCleanup = Task.make(
+export const timeoutReachesAllSettledBeforeCleanup = makeTest(
   "a task that times out inside allSettled fails it before the task's cleanup ends, so code that catches that failure runs even when the cleanup outlasts its limit",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const slow = Task.make("slow", Effect.gen(function* () {
+export const slow = Task.make({ name: "slow", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("cleanup started").pipe(Effect.andThen(Effect.never)));
   return yield* Effect.never;
-}), { timeout: "300 millis", cleanup: "2 seconds" });
-export const main = Task.make("main", Task.allSettled([slow]).pipe(
+}), timeout: "300 millis", cleanup: "2 seconds" });
+export default Task.make({ name: "main", run: Task.allSettled([slow]).pipe(
   Effect.catchTag("SettledTasksFailed", (failure) => Effect.log(\`main caught \${failure.failedTaskNames.join(", ")}\`)),
-));
-if (import.meta.main) Task.main(main);`,
+) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -415,42 +461,42 @@ if (import.meta.main) Task.main(main);`,
       expect(lines).toContain("[slow] error TaskTimedOut: timed out after 300ms");
       expect(lines.indexOf("[main] main caught slow")).toBeGreaterThan(-1);
       expect(lines.indexOf("[main] main caught slow")).toBeLessThan(
-        lines.indexOf("[slow] error TaskCleanupTimedOut: its cleanup did not finish within 2s"),
+        lines.indexOf(
+          "[slow] error TaskCleanupTimedOut: its cleanup did not finish within 2s, so the run stopped waiting for it",
+        ),
       );
       expect(ran.standardError).not.toContain(STOPPED_LINE);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const inferredTypes = Task.make(
+export const inferredTypes = makeTest(
   "allSettled infers its result and error types",
   Effect.scoped(
     Effect.gen(function* () {
       yield* typeCheckSource(`import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const a = Task.make("a", Effect.succeed(1));
-export const b = Task.make("b", Effect.void);
-export const main = Task.make("main", Task.allSettled([a, { b }]).pipe(
+export const a = Task.make({ name: "a", run: Effect.void });
+export const b = Task.make({ name: "b", run: Effect.void });
+export default Task.make({ name: "main", run: Task.allSettled([a, { b }]).pipe(
   Effect.catchTag("SettledTasksFailed", (failure) => Effect.log(failure.settledTaskCount, failure.failedTaskNames)),
   Effect.catchTag("TaskWaitsOnItself", (failure) => Effect.log(failure.message)),
   Effect.flatMap((result: void) => Effect.succeed(result)),
-));
-if (import.meta.main) Task.main(main);`);
+) });
+export const sameValueAsAll: Effect.Success<ReturnType<typeof Task.allSettled>> = undefined as unknown as Effect.Success<ReturnType<typeof Task.all>>;`);
       const failed = yield* failureAsValue(
         typeCheckSource(`import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const a = Task.make("a", Effect.succeed(1));
-export const main = Task.make("main", Task.allSettled([a]).pipe(Effect.catchTag("CommandFailed", () => Effect.void)));`),
+export const a = Task.make({ name: "a", run: Effect.void });
+export default Task.make({ name: "main", run: Task.allSettled([a]).pipe(Effect.catchTag("CommandFailed", () => Effect.void)) });`),
       );
       expect(failed.message).toContain("main.ts(4,");
       expect(failed.message).toContain('"CommandFailed"');
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const caughtDependencyFailure = Task.make(
+export const caughtDependencyFailure = makeTest(
   "a body that catches a failed dependency handles it, and the run passes with the failure counted",
   Effect.scoped(
     Effect.gen(function* () {
@@ -458,11 +504,10 @@ export const caughtDependencyFailure = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const broken = Task.make("broken", Effect.fail(new TaskError({ message: "broken broke" })));
-export const main = Task.make("main", broken.pipe(
+export const broken = Task.make({ name: "broken", run: Effect.fail(new TaskError({ message: "broken broke" })) });
+export default Task.make({ name: "main", run: broken.pipe(
   Effect.catchTag("AwaitedTaskFailed", (failure) => Effect.log(\`recovered from \${failure.awaitedTaskName}\`)),
-));
-if (import.meta.main) Task.main(main);`,
+) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
@@ -472,10 +517,9 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toMatch(/^passed: 2 tasks, 1 caught failure, [\d.]+s$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const caughtSettledTasksFailed = Task.make(
+export const caughtSettledTasksFailed = makeTest(
   "a caught SettledTasksFailed lets the run pass and reports every task still running as stopped",
   Effect.scoped(
     Effect.gen(function* () {
@@ -484,16 +528,15 @@ export const caughtSettledTasksFailed = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const broken = Task.make("broken", Effect.fail(new TaskError({ message: "broken broke" })));
-export const blocked = Task.make("blocked", blockUntilStopped("blocked"));
-export const starter = Task.make("starter", Effect.gen(function* () {
+export const broken = Task.make({ name: "broken", run: Effect.fail(new TaskError({ message: "broken broke" })) });
+export const blocked = Task.make({ name: "blocked", run: blockUntilStopped("blocked") });
+export const starter = Task.make({ name: "starter", run: Effect.gen(function* () {
   yield* Effect.forkChild(blocked);
   yield* waitForRelease("blocked-waiting");
-}));
-export const main = Task.make("main", Task.allSettled([broken, starter]).pipe(
+}) });
+export default Task.make({ name: "main", run: Task.allSettled([broken, starter]).pipe(
   Effect.catchTag("SettledTasksFailed", (failure) => Effect.log(\`handled \${failure.message}\`)),
-));
-if (import.meta.main) Task.main(main);`,
+) });`,
       });
       yield* makeFifos(project, ["blocked-waiting"]);
       const ran = yield* runTaskProcess(project, "main.ts");
@@ -508,10 +551,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const unawaitedFailure = Task.make(
+export const unawaitedFailure = makeTest(
   "a failure that no task awaited fails the run even when the root passes",
   Effect.scoped(
     Effect.gen(function* () {
@@ -520,17 +562,16 @@ export const unawaitedFailure = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const build = Task.make("build", Effect.fail(new TaskError({ message: "build broke" })));
-export const late = Task.make("late", Effect.gen(function* () {
+export const build = Task.make({ name: "build", run: Effect.fail(new TaskError({ message: "build broke" })) });
+export const late = Task.make({ name: "late", run: Effect.gen(function* () {
   yield* waitForRelease("release-late");
   return yield* Effect.fail(new TaskError({ message: "late broke" }));
-}));
-export const pipeline = Task.make("pipeline", Task.all([build, late]));
-export const lint = Task.make("lint", waitForRelease("release-lint"));
-export const main = Task.make("main", Task.allSettled([pipeline, lint]).pipe(
+}) });
+export const pipeline = Task.make({ name: "pipeline", run: Task.all([build, late]) });
+export const lint = Task.make({ name: "lint", run: waitForRelease("release-lint") });
+export default Task.make({ name: "main", run: Task.allSettled([pipeline, lint]).pipe(
   Effect.catchTag("SettledTasksFailed", (failure) => Effect.log(\`handled \${failure.message}\`)),
-));
-if (import.meta.main) Task.main(main);`,
+) });`,
       });
       yield* makeFifos(project, ["release-late", "release-lint"]);
       const command = yield* startTaskProcess(project, "main.ts");
@@ -547,10 +588,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const settledInBody = Task.make(
+export const settledInBody = makeTest(
   "allSettled in a body settles every task and fails the body with the count",
   Effect.scoped(
     Effect.gen(function* () {
@@ -558,13 +598,12 @@ export const settledInBody = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const ok = Task.make("ok", Effect.log("ok ran"));
-export const broken = Task.make("broken", Effect.fail(new TaskError({ message: "broken broke" })));
-export const main = Task.make("main", Effect.gen(function* () {
+export const ok = Task.make({ name: "ok", run: Effect.log("ok ran") });
+export const broken = Task.make({ name: "broken", run: Effect.fail(new TaskError({ message: "broken broke" })) });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* Task.allSettled([ok, broken]);
   yield* Effect.log("main body ran");
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -577,23 +616,21 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toMatch(/^failed: broken \(1 of 3 tasks\), [\d.]+s$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const servedMember = Task.make(
+export const servedMember = makeTest(
   "a serving task inside allSettled settles once it serves and stays up until the run ends",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const server = Task.make("server", Effect.gen(function* () {
+export const server = Task.make({ name: "server", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("server stopped"));
   return yield* Task.serve("up");
-}), { cleanup: "5 seconds" });
-export const ok = Task.make("ok", Effect.log("ok ran"));
-export const main = Task.make("main", Task.allSettled([server, ok]));
-if (import.meta.main) Task.main(main);`,
+}), cleanup: "5 seconds" });
+export const ok = Task.make({ name: "ok", run: Effect.log("ok ran") });
+export default Task.make({ name: "main", run: Task.allSettled([server, ok]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
@@ -604,10 +641,9 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toMatch(/^passed: 3 tasks, [\d.]+s$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const abandonedRequest = Task.make(
+export const abandonedRequest = makeTest(
   "a dependency the awaiting body stopped waiting for fails the run when it fails later",
   Effect.scoped(
     Effect.gen(function* () {
@@ -616,17 +652,16 @@ export const abandonedRequest = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const dependency = Task.make("dependency", Effect.gen(function* () {
+export const dependency = Task.make({ name: "dependency", run: Effect.gen(function* () {
   yield* shell("echo > dependency-started");
   yield* waitForRelease("release-dependency");
   return yield* Effect.fail(new TaskError({ message: "dependency broke" }));
-}));
-export const main = Task.make("main", Effect.gen(function* () {
+}) });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* dependency.pipe(Effect.raceFirst(waitForRelease("dependency-started")));
   yield* Effect.log("main stopped waiting");
   yield* waitForRelease("release-main");
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       yield* makeFifos(project, ["dependency-started", "release-dependency", "release-main"]);
       const command = yield* startTaskProcess(project, "main.ts");
@@ -642,10 +677,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const promptFailFast = Task.make(
+export const promptFailFast = makeTest(
   "a failure reaches the root before the failing body's finalizers finish, so all stops the siblings at once",
   Effect.scoped(
     Effect.gen(function* () {
@@ -654,17 +688,16 @@ export const promptFailFast = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const broken = Task.make("broken", Effect.gen(function* () {
+export const broken = Task.make({ name: "broken", run: Effect.gen(function* () {
   yield* waitForRelease("sibling-waiting");
   return yield* Effect.fail(new TaskError({ message: "broken broke" }));
-}));
-export const middle = Task.make("middle", Effect.gen(function* () {
+}) });
+export const middle = Task.make({ name: "middle", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => waitForRelease("release-middle-finalizer").pipe(Effect.andThen(Effect.log("middle finalizer finished"))));
   yield* broken;
-}));
-export const sibling = Task.make("sibling", blockUntilStopped("sibling"));
-export const main = Task.make("main", Task.all([middle, sibling]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export const sibling = Task.make({ name: "sibling", run: blockUntilStopped("sibling") });
+export default Task.make({ name: "main", run: Task.all([middle, sibling]) });`,
       });
       yield* makeFifos(project, ["sibling-waiting", "release-middle-finalizer"]);
       const command = yield* startTaskProcess(project, "main.ts");
@@ -683,7 +716,6 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const INTERRUPT_OFFSET_COUNT = 16;
@@ -700,7 +732,7 @@ const describeInterruptOffset = (interruptOffsetMilliseconds: number) =>
     ? `before-${-interruptOffsetMilliseconds}`
     : `after-${interruptOffsetMilliseconds}`;
 
-export const abandonedRequestSweep = Task.make(
+export const abandonedRequestSweep = makeTest(
   "a dependency failure that races the awaiting body giving up on it never lets the run pass",
   Effect.scoped(
     Effect.gen(function* () {
@@ -722,7 +754,7 @@ export const abandonedRequestSweep = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const dependency = Task.make("dependency", Effect.callback<void>((resume) => {
+export const dependency = Task.make({ name: "dependency", run: Effect.callback<void>((resume) => {
   const raceChannel = new BroadcastChannel("race-${offsetName}");
   raceChannel.onmessage = (event) => {
     if (event.data === "main joined") raceChannel.postMessage("dependency joined");
@@ -732,8 +764,8 @@ export const dependency = Task.make("dependency", Effect.callback<void>((resume)
     }
   };
   raceChannel.postMessage("dependency joined");
-}).pipe(Effect.andThen(Effect.fail(new TaskError({ message: "dependency broke" })))));
-export const main = Task.make("main", Effect.gen(function* () {
+}).pipe(Effect.andThen(Effect.fail(new TaskError({ message: "dependency broke" })))) });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   const raceChannel = new BroadcastChannel("race-${offsetName}");
   const dependencyJoined = new Promise((resolve) => {
     raceChannel.onmessage = (event) => {
@@ -750,8 +782,7 @@ export const main = Task.make("main", Effect.gen(function* () {
   if (Exit.isSuccess(requestExit)) {
     return yield* requestExit.value;
   }
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
             ];
           }),
         ),
@@ -786,7 +817,7 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "2 minutes", cleanup: "5 seconds" },
+  "2 minutes",
 );
 
 const brokenTaskWithFailingCleanup = (cleanupEffect: string, mainBody: string) =>
@@ -794,17 +825,16 @@ const brokenTaskWithFailingCleanup = (cleanupEffect: string, mainBody: string) =
     "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const broken = Task.make("broken", Effect.gen(function* () {
+export const broken = Task.make({ name: "broken", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => ${cleanupEffect});
   return yield* Effect.fail(new TaskError({ message: "broken broke" }));
-}));
-export const main = Task.make("main", ${mainBody});
-if (import.meta.main) Task.main(main);`,
+}) });
+export default Task.make({ name: "main", run: ${mainBody} });`,
   });
 
 const CATCHING_MAIN_BODY = `broken.pipe(Effect.catchTag("AwaitedTaskFailed", () => Effect.log("main caught it")))`;
 
-export const cleanupDefectAfterCaughtFailure = Task.make(
+export const cleanupDefectAfterCaughtFailure = makeTest(
   "a cleanup that dies after the body failed fails the run even when the failure was caught",
   Effect.scoped(
     Effect.gen(function* () {
@@ -823,10 +853,31 @@ export const cleanupDefectAfterCaughtFailure = Task.make(
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const workerExitDuringCleanupAfterCaughtFailure = Task.make(
+export const cleanupDefectAfterReturn = makeTest(
+  "a cleanup that dies after the body returned fails the task as a cleanup failure, not a body failure",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.die(new Error("cleanup broke")));
+  return 1;
+}) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode).toBe(1);
+      expect(ran.standardError).toMatch(
+        /^\[main\] \S+: error TaskCleanupFailed: its cleanup failed with cleanup broke$/mu,
+      );
+      expect(ran.standardError).not.toContain("TaskBodyFailed");
+    }),
+  ),
+);
+
+export const workerExitDuringCleanupAfterCaughtFailure = makeTest(
   "a worker that exits during cleanup after the body failed fails the run even when the failure was caught",
   Effect.scoped(
     Effect.gen(function* () {
@@ -842,10 +893,9 @@ export const workerExitDuringCleanupAfterCaughtFailure = Task.make(
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const cleanupDefectAfterUncaughtFailure = Task.make(
+export const cleanupDefectAfterUncaughtFailure = makeTest(
   "a cleanup that dies after an uncaught body failure prints both errors",
   Effect.scoped(
     Effect.gen(function* () {
@@ -864,10 +914,9 @@ export const cleanupDefectAfterUncaughtFailure = Task.make(
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const timeoutCoversCleanupAfterFailure = Task.make(
+export const timeoutCoversCleanupAfterFailure = makeTest(
   "a timeout that runs out while a failed task's finalizer hangs reports that task as timed out, and the task that caught its failure is stopped",
   Effect.scoped(
     Effect.gen(function* () {
@@ -876,15 +925,14 @@ export const timeoutCoversCleanupAfterFailure = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 ${SHELL_WAITING_FOR_RELEASE}
-export const broken = Task.make("broken", Effect.gen(function* () {
+export const broken = Task.make({ name: "broken", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("cleanup started").pipe(Effect.andThen(Effect.never)));
   return yield* Effect.fail(new TaskError({ message: "broken broke" }));
-}), { timeout: "300 millis", cleanup: "300 millis" });
-export const main = Task.make("main", Effect.gen(function* () {
+}), timeout: "300 millis", cleanup: "300 millis" });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* broken.pipe(Effect.catchTag("AwaitedTaskFailed", () => Effect.log("main caught it")));
   yield* waitForRelease("release-main");
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       yield* makeFifos(project, ["release-main"]);
       const ran = yield* runTaskProcess(project, "main.ts", {
@@ -897,10 +945,9 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toContain(`[main] ${STOPPED_LINE}`);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const workerExitDuringCleanupAfterUncaughtFailure = Task.make(
+export const workerExitDuringCleanupAfterUncaughtFailure = makeTest(
   "a worker that exits during cleanup after an uncaught body failure prints the worker exit",
   Effect.scoped(
     Effect.gen(function* () {
@@ -916,5 +963,4 @@ export const workerExitDuringCleanupAfterUncaughtFailure = Task.make(
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

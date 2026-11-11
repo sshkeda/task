@@ -8,109 +8,110 @@ import { encodeJson } from "../shared/encode-json.ts";
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { REPOSITORY_DIRECTORY } from "../shared/find-repository-directory.ts";
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
+import { runTaskProcess } from "../shared/run-task-processes.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
-const TASK_RESULT_TYPE = "Tree<string | number | boolean | Redacted<string> | null>";
-
-const MISTYPED_OPTIONS_SOURCE = `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export const misspelled = Task.make("misspelled", Effect.void, { timout: "1 minute" });
-export const cached = Task.make("cached", Effect.void, { cache: true });
-export const inputs = Task.make("inputs", Effect.void, { inputs: ["src/**"] });
-export const outputs = Task.make("outputs", Effect.void, { outputs: ["dist/**"] });
-export const env = Task.make("env", Effect.void, { env: ["FOO"] });
-if (import.meta.main) Task.main(misspelled);`;
-
-const REMOVED_EXPORTS_SOURCE = `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-import { run, runCommand, task } from "@sshkeda/task";
-export const removed = [Task.files, Task.git, Task.imports, Task.location, Task.untracked, Task.Inputs];
-export const main = Task.make("main", Effect.void);
-if (import.meta.main) Task.main(main);`;
-
-const positionOf = (source: string, prefix: string, name: string) => {
-  const lines = source.split("\n");
-  const lineIndex = lines.findIndex((line) => line.includes(`${prefix}${name}`));
-  const columnIndex = (lines[lineIndex]?.indexOf(`${prefix}${name}`) ?? 0) + prefix.length;
-  return `${lineIndex + 1},${columnIndex + 1}`;
-};
-
-export const orders = Task.make(
-  "task options compile in any order, together or alone",
+export const orders = makeTest(
+  "a task definition compiles with its output, timeout and cleanup in any order, together or alone",
   Effect.scoped(
-    typeCheckSource(`import { Effect } from "effect";
+    typeCheckSource(`import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
-export const a = Task.make("a", Effect.succeed(1), { timeout: "1 minute", cleanup: "5 seconds" });
-export const b = Task.make("b", Effect.succeed(2), { cleanup: "5 seconds", timeout: "1 minute" });
-export const c = Task.make("c", Effect.succeed(3), { cleanup: "5 seconds" });
-export const d = Task.make("d", Effect.succeed(4), {});
-export const e = Task.make("e", Effect.succeed(5), { timeout: 60_000, cleanup: 5_000 });
-export const f = Task.make("f", Effect.succeed(6), { timeout: "1 minute" });
-export const g = Task.make("g", Effect.succeed(7));
-export const server = Task.make("server", Task.serve({ port: 1 }), { timeout: "1 minute", cleanup: "5 seconds" });
-export const user = Task.make("user", Effect.gen(function* () { return (yield* server).port + (yield* d) + (yield* e); }));
-export const cycle: Task.Task<number> = Task.make("cycle", Effect.gen(function* () { return (yield* user) + 1; }));
-export const main = Task.make("main", Effect.all([a, b, c, d, e, f, g, server, user, cycle]));
-if (import.meta.main) Task.main(main);`),
+export const a = Task.make({ name: "a", output: Schema.Finite, run: Effect.succeed(1), timeout: "1 minute", cleanup: "5 seconds" });
+export const b = Task.make({ cleanup: "5 seconds", timeout: "1 minute", run: Effect.succeed(2), output: Schema.Finite, name: "b" });
+export const c = Task.make({ name: "c", run: Effect.void, cleanup: "5 seconds" });
+export const d = Task.make({ name: "d", output: Schema.Finite, run: Effect.succeed(4) });
+export const e = Task.make({ name: "e", output: Schema.Finite, run: Effect.succeed(5), timeout: 60_000, cleanup: 5_000 });
+export const f = Task.make({ name: "f", run: Effect.void, timeout: "1 minute" });
+export const server = Task.make({ name: "server", output: Schema.Struct({ port: Schema.Finite }), run: Task.serve({ port: 1 }), timeout: "1 minute", cleanup: "5 seconds" });
+export const user = Task.make({ name: "user", output: Schema.Finite, run: Effect.gen(function* () { return (yield* server).port + (yield* d) + (yield* e); }) });
+export const cycle: Task.Task<number> = Task.make({ name: "cycle", output: Schema.Finite, run: Effect.gen(function* () { return (yield* user) + 1; }) });
+export default Task.make({ name: "main", run: Effect.all([a, b, c, d, e, f, server, user, cycle], { discard: true }) });`),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const optionRequirements = Task.make(
+export const optionRequirements = makeTest(
   "durations do not change what a task's body requires",
   Effect.scoped(
-    typeCheckSource(`import { Effect } from "effect";
+    typeCheckSource(`import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
-export const timed = Task.make("timed", Effect.succeed(1), { timeout: "1 minute", cleanup: "5 seconds" });
+export const timed = Task.make({ name: "timed", output: Schema.Finite, run: Effect.succeed(1), timeout: "1 minute", cleanup: "5 seconds" });
 export const counted: Task.Task<number, never> = timed;
-if (import.meta.main) Task.main(timed);`),
+export default timed;`),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const mistypedOptions = Task.make(
-  "misspelled options and the removed cache, inputs, outputs and env options do not compile",
+export const undefinedOptions = makeTest(
+  "options that may be undefined compile under exactOptionalPropertyTypes",
+  Effect.scoped(
+    typeCheckSource(`import { Effect, Schema } from "effect";
+import type { Duration } from "effect";
+import { Task } from "@sshkeda/task";
+const settings: { readonly timeout?: Duration.Input; readonly directory?: string; readonly concurrency?: number } = {};
+export const listed = Task.make({ name: "listed", output: Schema.String, run: Effect.gen(function* () {
+  const text: string = yield* Task.exec("ls", [], { cwd: settings.directory, env: undefined, stdin: undefined });
+  return text;
+}), timeout: settings.timeout, cleanup: undefined });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  yield* Task.all([listed], { concurrency: settings.concurrency });
+  yield* Task.allSettled([listed], { concurrency: settings.concurrency });
+}) });`),
+  ),
+);
+
+export const mistypedDefinitions = makeTest(
+  "a task definition whose name is not a string, that has no run, or whose run is not an Effect does not compile",
   Effect.scoped(
     Effect.gen(function* () {
-      const failed = yield* failureAsValue(typeCheckSource(MISTYPED_OPTIONS_SOURCE));
-      expect(failed.message).toContain(
-        "main.ts(3,66): error TS2561: Object literal may only specify known properties, but 'timout' does not exist in type",
+      const failed = yield* failureAsValue(
+        typeCheckSource(`import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const numbered = Task.make({ name: 42, run: Effect.void });
+export const unrun = Task.make({ name: "unrun" });
+export const called = Task.make({ name: "called", run: () => Effect.void });
+export default numbered;`),
       );
-      for (const name of ["cache", "inputs", "outputs", "env"]) {
-        expect(failed.message).toContain(
-          `main.ts(${positionOf(MISTYPED_OPTIONS_SOURCE, "{ ", name)}): error TS2353: Object literal may only specify known properties, and '${name}' does not exist in type`,
-        );
-      }
+      expect(failed.message).toContain(
+        "main.ts(3,37): error TS2322: Type 'number' is not assignable to type 'string'.",
+      );
+      expect(failed.message).toContain("main.ts(4,32): error TS2741");
+      expect(failed.message).toContain("Property 'run' is missing in type '{ name: string; }'");
+      expect(failed.message).toContain("main.ts(5,56): error TS2322");
+      expect(failed.message).toContain(
+        "Type '() => Effect.Effect<void, never, never>' is not assignable to type 'Effect<void, never, never>'.",
+      );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const removedExports = Task.make(
-  "the exports removed in 1.0 do not compile",
+export const hiddenBody = makeTest(
+  "a task has no body property, so using its run without going through the task does not compile and finds nothing when the file runs",
   Effect.scoped(
     Effect.gen(function* () {
-      const failed = yield* failureAsValue(typeCheckSource(REMOVED_EXPORTS_SOURCE));
-      expect(failed.message).toContain(
-        `main.ts(3,10): error TS2305: Module '"@sshkeda/task"' has no exported member 'run'.`,
+      const failed = yield* failureAsValue(
+        typeCheckSource(`import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const build = Task.make({ name: "build", run: Effect.void });
+export default Task.make({ name: "main", run: build.body });`),
       );
-      expect(failed.message).toContain(
-        `main.ts(3,15): error TS2305: Module '"@sshkeda/task"' has no exported member 'runCommand'.`,
-      );
-      expect(failed.message).toContain(
-        `main.ts(3,27): error TS2724: '"@sshkeda/task"' has no exported member named 'task'.`,
-      );
-      for (const name of ["files", "git", "imports", "location", "untracked", "Inputs"]) {
-        expect(failed.message).toContain(
-          `main.ts(${positionOf(REMOVED_EXPORTS_SOURCE, "Task.", name)}): error TS2339: Property '${name}' does not exist on type`,
-        );
-      }
+      expect(failed.message).toContain("error TS2339: Property 'body' does not exist on type");
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const build = Task.make({ name: "build", run: Effect.void });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  yield* build;
+  yield* Effect.log(\`has body: \${"body" in build}\`);
+}) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(ran.standardError).toContain("[main] has body: false\n");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const untaggedFailures = Task.make(
+export const untaggedFailures = makeTest(
   "a body that can fail with an untagged value does not compile, and tagged failures compile",
   Effect.scoped(
     Effect.gen(function* () {
@@ -118,199 +119,192 @@ export const untaggedFailures = Task.make(
         typeCheckSource(`import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const untaggedBody = Task.make("untagged-body", Effect.fail(new Error("x")));
-export const tagged = Task.make("tagged", Effect.fail(new TaskError({ message: "x" })), { cleanup: "5 seconds" });
-if (import.meta.main) Task.main(tagged);`),
+export const untaggedBody = Task.make({ name: "untagged-body", run: Effect.fail(new Error("x")) });
+export const tagged = Task.make({ name: "tagged", run: Effect.fail(new TaskError({ message: "x" })), cleanup: "5 seconds" });
+export default tagged;`),
       );
-      expect(failed.message).toContain("main.ts(4,56): error TS2379");
+      expect(failed.message).toContain("main.ts(4,64): error TS2375");
       expect(failed.message).toContain(
         "Property '_tag' is missing in type 'Error' but required in type '{ readonly _tag: string; }'.",
       );
       expect(failed.message).not.toContain("main.ts(5,");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const commandsOutsideTasks = Task.make(
+export const unprovidedServices = makeTest(
+  "a body that needs a service task does not provide does not compile",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const failed = yield* failureAsValue(
+        typeCheckSource(`import { Context, Effect } from "effect";
+import { Task } from "@sshkeda/task";
+class Database extends Context.Service<Database, { readonly query: Effect.Effect<string> }>()("Database") {}
+export const queried = Task.make({ name: "queried", run: Effect.gen(function* () {
+  const database = yield* Database;
+  yield* Effect.log(yield* database.query);
+}) });
+export default queried;`),
+      );
+      expect(failed.message).toContain("main.ts(4,53): error TS2375");
+      expect(failed.message).toContain(
+        "Type 'Database' is not assignable to type 'ChildProcessSpawner | Digest | FileSystem | HttpClient | Path | Scope | SecureRandom | Serving | Stdio | Tasks | Terminal'.",
+      );
+    }),
+  ),
+);
+
+export const commandsOutsideTasks = makeTest(
   "Task.exec outside a task body does not compile, and inside a body or a helper a body calls it compiles",
   Effect.scoped(
     Effect.gen(function* () {
       const failed = yield* failureAsValue(
         typeCheckSource(`import * as BunServices from "@effect/platform-bun/BunServices";
-import { Effect } from "effect";
+import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
 const listFiles = (directory: string) => Task.exec("ls", [directory]);
-export const listed = Task.make("listed", Effect.gen(function* () { return yield* listFiles("."); }));
-export const echoed = Task.make("echoed", Task.exec("echo", ["hi"]).pipe(Effect.asVoid));
-export const main = Task.make("main", Task.allSettled([listed, echoed]));
-Effect.runPromise(Task.exec("echo", ["hi"]).pipe(Effect.provide(BunServices.layer)));
-if (import.meta.main) Task.main(main);`),
+export const listed = Task.make({ name: "listed", output: Schema.String, run: Effect.gen(function* () { return yield* listFiles("."); }) });
+export const echoed = Task.make({ name: "echoed", run: Effect.asVoid(Task.exec("echo", ["hi"])) });
+export default Task.make({ name: "main", run: Task.allSettled([listed, echoed]) });
+Effect.runPromise(Task.exec("echo", ["hi"]).pipe(Effect.provide(BunServices.layer)));`),
       );
       expect(failed.message).toContain("main.ts(8,19): error TS2379");
       expect(failed.message).toContain("Type 'Tasks' is not assignable to type 'never'.");
-      expect(failed.message).not.toMatch(/main\.ts\((?:[1-7]|9),/u);
+      expect(failed.message).not.toMatch(/main\.ts\([1-7],/u);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const modules = Task.make(
+export const modules = makeTest(
   "a module passed to Task.all() with an export that is not a task does not compile",
   Effect.scoped(
     Effect.gen(function* () {
       const failed = yield* failureAsValue(
         typeCheckSource(`import { Effect } from "effect";
 import * as taskLibrary from "@sshkeda/task";
-export const a = taskLibrary.Task.make("a", Effect.void);
-export const main = taskLibrary.Task.make("main", taskLibrary.Task.all([a, taskLibrary.Task]));
-if (import.meta.main) taskLibrary.Task.main(main);`),
+export const a = taskLibrary.Task.make({ name: "a", run: Effect.void });
+export default taskLibrary.Task.make({ name: "main", run: taskLibrary.Task.all([a, taskLibrary.Task]) });`),
       );
-      expect(failed.message).toContain("main.ts(4,76): error TS2322");
+      expect(failed.message).toContain("main.ts(4,84): error TS2322");
       expect(failed.message).toContain("is incompatible with index signature.");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const servedTypes = Task.make(
-  "a serving task's value has the type of what it serves",
+export const servedTypes = makeTest(
+  "a serving task's value has the type its output declares",
   Effect.scoped(
-    typeCheckSource(`import { Effect } from "effect";
+    typeCheckSource(`import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
-export const mock = Task.make("mock", Effect.gen(function* () { return yield* Task.serve({ port: 4010 }); }));
-export const vm = Task.make("vm", Effect.gen(function* () { return yield* Task.serve("water-test"); }), { timeout: "5 minutes", cleanup: "1 minute" });
-export const raced = Task.make("raced", Effect.raceFirst(Task.serve("up"), Effect.succeed("down")));
-export const main = Task.make("main", Effect.gen(function* () {
+export const mock = Task.make({ name: "mock", output: Schema.Struct({ port: Schema.Finite }), run: Effect.gen(function* () { return yield* Task.serve({ port: 4010 }); }) });
+export const vm = Task.make({ name: "vm", output: Schema.String, run: Effect.gen(function* () { return yield* Task.serve("water-test"); }), timeout: "5 minutes", cleanup: "1 minute" });
+export const raced = Task.make({ name: "raced", output: Schema.String, run: Effect.gen(function* () {
+  if (Math.random() > 0.5) { return yield* Task.serve("up"); }
+  return "down";
+}) });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   const port: number = (yield* mock).port;
   const name: string = yield* vm;
   const state: string = yield* raced;
   yield* Effect.log(port, name, state);
-}));
-if (import.meta.main) Task.main(main);`),
+}) });`),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const forgedServed = Task.make(
+export const forgedServed = makeTest(
   "a Served value cannot be constructed outside serve",
   Effect.scoped(
     Effect.gen(function* () {
       const failed = yield* failureAsValue(
         typeCheckSource(`import { Effect } from "effect";
 import { Served, Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.succeed(new Served(1)));
-if (import.meta.main) Task.main(main);`),
+export default Task.make({ name: "main", run: Effect.succeed(new Served(1)) });`),
       );
-      expect(failed.message).toContain("main.ts(3,54): error TS2673");
+      expect(failed.message).toContain("main.ts(3,62): error TS2673");
       expect(failed.message).toContain(
         "Constructor of class 'Served<Success>' is private and only accessible within the class declaration.",
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const mismatched = Task.make(
-  "a task that serves one value and returns another does not compile",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const failed = yield* failureAsValue(
-        typeCheckSource(`import { Effect } from "effect";
+const expectTypeErrors = (source: string, expectedTexts: readonly string[]) =>
+  Effect.gen(function* () {
+    const failed = yield* failureAsValue(
+      typeCheckSource(`import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.gen(function* () {
+${source}`),
+    );
+    for (const expectedText of expectedTexts) {
+      expect(failed.message).toContain(expectedText);
+    }
+  });
+
+export const outputMismatches = makeTest(
+  "a task whose body returns or serves a value its output does not declare does not compile, even when it serves one value and returns another",
+  Effect.scoped(
+    Effect.all(
+      [
+        expectTypeErrors(
+          `export default Task.make({ name: "serves-and-returns", output: Schema.String, run: Effect.gen(function* () {
   yield* Task.serve("ready");
   return 123;
-}));
-if (import.meta.main) Task.main(main);`),
-      );
-      expect(failed.message).toContain("main.ts(3,39): error TS2379");
-      expect(failed.message).toContain(
-        `Type 'number' is not assignable to type '"serves one value and returns another"'.`,
-      );
-    }),
+}) });`,
+          ["main.ts(3,79): error TS2375", "Type 'number' is not assignable to type 'string'."],
+        ),
+        expectTypeErrors(
+          `export default Task.make({ name: "serves-other", output: Schema.Struct({ port: Schema.Finite }), run: Task.serve(new Map([["port", 1234]])) });`,
+          [
+            "main.ts(3,98): error TS2375",
+            "Property 'port' is missing in type 'Served<Map<string, number>>' but required in type '{ readonly port: number; }'.",
+          ],
+        ),
+        expectTypeErrors(
+          `export default Task.make({ name: "returns-date", output: Schema.Struct({ at: Schema.String }), run: Effect.succeed({ at: new Date() }) });`,
+          ["main.ts(3,96): error TS2375", "Type 'Date' is not assignable to type 'string'."],
+        ),
+        expectTypeErrors(
+          `export default Task.make({ name: "missing", output: Schema.Struct({ found: Schema.Boolean, path: Schema.String }), run: Effect.succeed({ found: true }) });`,
+          [
+            "main.ts(3,116): error TS2375",
+            "Property 'path' is missing in type '{ found: boolean; }' but required in type '{ readonly found: boolean; readonly path: string; }'.",
+          ],
+        ),
+      ],
+      { concurrency: "unbounded", discard: true },
+    ),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const dated = Task.make(
-  "a task whose value holds something that is not JSON does not compile",
+export const nonSchemaOutputs = makeTest(
+  "a task whose output is not a schema does not compile",
   Effect.scoped(
     Effect.gen(function* () {
       const failed = yield* failureAsValue(
-        typeCheckSource(`import { Effect } from "effect";
+        typeCheckSource(`import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.succeed({ at: new Date() }));
-if (import.meta.main) Task.main(main);`),
+export const plainObject = Task.make({ name: "plain-object", output: { at: Schema.Date }, run: Effect.succeed({ at: new Date() }) });
+export const constructor = Task.make({ name: "constructor", output: Date, run: Effect.succeed(new Date()) });
+export const text = Task.make({ name: "text", output: "string", run: Effect.succeed("x") });
+export default plainObject;`),
       );
-      expect(failed.message).toContain("main.ts(3,39): error TS2379");
+      expect(failed.message).toContain("main.ts(3,72): error TS2353");
       expect(failed.message).toContain(
-        `Type 'Date' is not assignable to type '${TASK_RESULT_TYPE}'.`,
+        "Object literal may only specify known properties, and 'at' does not exist in type 'Codec<unknown, unknown, never, never>'.",
+      );
+      expect(failed.message).toContain("main.ts(4,61): error TS2740");
+      expect(failed.message).toContain(
+        `Type 'DateConstructor' is missing the following properties from type 'Codec<unknown, unknown, never, never>'`,
+      );
+      expect(failed.message).toContain("main.ts(5,47): error TS2322");
+      expect(failed.message).toContain(
+        "Type 'string' is not assignable to type 'Codec<unknown, unknown, never, never>'.",
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const holes = Task.make(
-  "a task whose value holds undefined does not compile",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const failed = yield* failureAsValue(
-        typeCheckSource(`import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.succeed({ found: true, path: undefined }));
-if (import.meta.main) Task.main(main);`),
-      );
-      expect(failed.message).toContain("main.ts(3,39): error TS2379");
-      expect(failed.message).toContain(
-        `Type 'undefined' is not assignable to type '${TASK_RESULT_TYPE}'.`,
-      );
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const voids = Task.make(
-  "a task whose value is a list of what void tasks gave does not compile",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const failed = yield* failureAsValue(
-        typeCheckSource(`import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export const a = Task.make("a", Effect.void);
-export const main = Task.make("main", Effect.all([a, a]));
-if (import.meta.main) Task.main(main);`),
-      );
-      expect(failed.message).toContain("main.ts(4,39): error TS2379");
-      expect(failed.message).toContain(
-        `Type '[void, void]' is not assignable to type 'string | number | boolean | readonly ${TASK_RESULT_TYPE}[]`,
-      );
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const servedMap = Task.make(
-  "a task that serves something that is not JSON does not compile",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const failed = yield* failureAsValue(
-        typeCheckSource(`import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Task.serve(new Map([["port", 1234]])));
-if (import.meta.main) Task.main(main);`),
-      );
-      expect(failed.message).toContain("main.ts(3,39): error TS2379");
-      expect(failed.message).toContain(
-        `Type 'Map<string, number>' is not assignable to type 'string | number | boolean | readonly ${TASK_RESULT_TYPE}[]`,
-      );
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const inferredDeclarations = Task.make(
+export const inferredDeclarations = makeTest(
   "a consumer package emits declarations for unannotated tasks and shared task options",
   Effect.scoped(
     Effect.gen(function* () {
@@ -327,23 +321,22 @@ export const inferredDeclarations = Task.make(
           },
           include: ["options.ts", "main.ts"],
         }),
-        "options.ts": `import { Effect } from "effect";
+        "options.ts": `import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
 export const sharedOptions = { timeout: "1 minute", cleanup: "5 seconds" } as const;
-export const generate = Task.make("generate", Effect.succeed(1), sharedOptions);`,
-        "main.ts": `import { Effect } from "effect";
+export const generate = Task.make({ name: "generate", output: Schema.Finite, run: Effect.succeed(1), ...sharedOptions });`,
+        "main.ts": `import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
 import { generate, sharedOptions } from "./options.ts";
-export const lint = Task.make("lint", Task.exec("echo", ["lint"]).pipe(Effect.asVoid));
-export const build = Task.make("build", Effect.gen(function* () { return (yield* generate) + 1; }), sharedOptions);
-export const server = Task.make("server", Task.serve({ port: 1 }));
-export const user = Task.make("user", Effect.gen(function* () { return (yield* server).port + (yield* build); }));
+export const lint = Task.make({ name: "lint", run: Effect.asVoid(Task.exec("echo", ["lint"])) });
+export const build = Task.make({ name: "build", output: Schema.Finite, run: Effect.gen(function* () { return (yield* generate) + 1; }), ...sharedOptions });
+export const server = Task.make({ name: "server", output: Schema.Struct({ port: Schema.Finite }), run: Task.serve({ port: 1 }) });
+export const user = Task.make({ name: "user", output: Schema.Finite, run: Effect.gen(function* () { return (yield* server).port + (yield* build); }) });
 export const together = Task.all([lint, build]);
 export const settled = Task.allSettled([lint, { build }]);
 export const served = Task.serve("up");
 export const command = Task.exec("echo", ["command"]);
-export const buildOptions = { timeout: "1 minute", cleanup: "5 seconds" } satisfies Parameters<typeof Task.make<unknown, never, never>>[2];
-export const main = Task.make("main", Task.all([lint, build, user]));`,
+export default Task.make({ name: "main", run: Task.all([lint, build, user]) });`,
       });
       yield* Task.exec(`${repository}/node_modules/.bin/tsc`, [
         "-p",
@@ -359,5 +352,4 @@ export const main = Task.make("main", Task.all([lint, build, user]));`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

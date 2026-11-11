@@ -1,6 +1,8 @@
-import { Array as Arrays, Cause, Clock, Option, References, Schema } from "effect";
+import { Array as Arrays, Cause, Clock, Option, References } from "effect";
 import type { Logger } from "effect";
 import { OtlpResource } from "effect/observability";
+
+import { encodeTraceJson } from "./encode-trace-json.ts";
 
 const NANOSECONDS_PER_MILLISECOND = 1_000_000n;
 
@@ -16,15 +18,6 @@ const SEVERITY_NUMBERS = {
   Fatal: 21,
   None: 0,
 } as const;
-
-const writeNonFiniteNumbersAsStrings = (_key: string, value: Schema.Json) => {
-  const isNonFiniteNumber = typeof value === "number" && !Number.isFinite(value);
-  return isNonFiniteNumber ? String(value) : value;
-};
-
-const encodeJson = Schema.encodeOption(
-  Schema.fromJsonString(Schema.Unknown, { replacer: writeNonFiniteNumbersAsStrings }),
-);
 
 const describeErrors = (errors: readonly Error[]) => {
   const [firstError] = errors;
@@ -67,5 +60,5 @@ export const makeTraceLogRecordJson = (options: Logger.Options<unknown>) => {
       ? {}
       : { traceId: span.traceId.padStart(TRACE_ID_LENGTH, "0"), spanId: span.spanId }),
   };
-  return Option.getOrUndefined(encodeJson(logRecord));
+  return Option.getOrUndefined(encodeTraceJson(logRecord));
 };

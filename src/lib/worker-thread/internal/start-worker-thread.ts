@@ -2,7 +2,8 @@ import { parentPort } from "node:worker_threads";
 
 import * as BunCrypto from "@effect/platform-bun/BunCrypto";
 import * as BunServices from "@effect/platform-bun/BunServices";
-import { Layer, Effect, Exit } from "effect";
+import * as BunStdio from "@effect/platform-bun/BunStdio";
+import { Layer, Effect, Exit, Stdio, Stream } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { OtlpExporter, OtlpSerialization } from "effect/observability";
 import { RpcServer } from "effect/rpc";
@@ -28,13 +29,23 @@ const workerThreadLayer = WorkerStateLive.pipe(
   ),
 );
 
+const endStandardOutput = Effect.flatMap(Stdio.Stdio, (stdio) =>
+  Stream.run(Stream.empty, stdio.stdout({ endOnDone: true })),
+).pipe(Effect.ignore);
+
 export const startWorkerThread = () => {
   if (parentPort !== null) {
     Effect.runFork(
       serveTheMainThread.pipe(
         Effect.provide(workerThreadLayer),
         Effect.scoped,
-        Effect.onExit((exit) => Effect.sync(() => process.exit(Exit.isSuccess(exit) ? 0 : 1))),
+        Effect.onExit((exit) =>
+          endStandardOutput.pipe(
+            Effect.andThen(Effect.sync(() => process.exit(Exit.isSuccess(exit) ? 0 : 1))),
+          ),
+        ),
+        Effect.provide(BunStdio.layer),
+        Effect.ignore,
       ),
     );
   }

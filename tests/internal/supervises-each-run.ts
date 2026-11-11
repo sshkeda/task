@@ -1,17 +1,19 @@
 import { expect } from "bun:test";
 
 import { Task } from "@sshkeda/task";
-import { Effect, FileSystem, Queue, Ref, Schedule, Schema, Stream } from "effect";
+import { Effect, Queue, Ref, Schedule, Schema, Stream } from "effect";
 
-import { read } from "../shared/access-files.ts";
+import { exists, read } from "../shared/access-files.ts";
 import {
   EXIT_CODE_AFTER_SIGHUP,
   EXIT_CODE_AFTER_SIGINT,
+  EXIT_CODE_AFTER_SIGTERM,
 } from "../shared/exit-codes-after-stop-signals.ts";
 import { failTestCleanup } from "../shared/fail-test-cleanup.ts";
 import { findKilledProcesses } from "../shared/find-killed-processes.ts";
 import { isProcessAlive } from "../shared/is-process-alive.ts";
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import {
   makeTaskProcessEnvironment,
   runTaskProcess,
@@ -20,29 +22,37 @@ import {
 
 const RUN_AND_SPAWNED_PROCESS_ID_COUNT = 2;
 
-const PROCESSES_STARTING_THE_WORKER = 2;
-
-const READABLE_DIRECTORY_MODE = 0o755;
-
 const ORPHAN_HOLDING_SPAWN_SYNC_OUTPUT = `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.sync(() => Bun.spawnSync(["sh", "-c", "(sleep 1000 2>/dev/null & echo orphan $! $$ >&2); exit 0"], { stderr: "inherit" })));
-if (import.meta.main) Task.main(main);`;
+export default Task.make({ name: "main", run: Effect.sync(() => Bun.spawnSync(["sh", "-c", "(sleep 1000 2>/dev/null & echo orphan $! $$ >&2); exit 0"], { stderr: "inherit" })) });`;
 
 const SPAWNING_SERVER = (label: string) => `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.sync(() => Bun.spawn(["sleep", "1000"]).pid).pipe(
+export default Task.make({ name: "main", run: Effect.sync(() => Bun.spawn(["sleep", "1000"]).pid).pipe(
   Effect.flatMap((processId) => Effect.log(\`run \${process.pid} ${label} \${processId}\`)),
   Effect.andThen(Effect.never),
-));
-if (import.meta.main) Task.main(main);`;
+) });`;
 
 const RUNNING_A_COMMAND = `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log(\`run \${process.pid}\`).pipe(
+export default Task.make({ name: "main", run: Effect.log(\`run \${process.pid}\`).pipe(
   Effect.andThen(Task.exec("sh", ["-c", "echo command $$; exec sleep 1000"])),
-));
-if (import.meta.main) Task.main(main);`;
+) });`;
+
+const RELEASING_IN_STEPS = `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const releaseStep = (step: number) => Effect.sleep("1200 millis").pipe(
+  Effect.andThen(Effect.promise(() => Bun.write(\`released-\${step}\`, ""))),
+);
+export default Task.make({ name: "main", cleanup: "30 seconds", run: Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.forEach([1, 2, 3, 4, 5], releaseStep, { discard: true }));
+  yield* Effect.log(\`run \${process.pid} supervised by \${process.ppid}\`);
+  yield* Task.exec("sh", ["-c", "echo command $$; exec sleep 1000"]);
+}) });`;
+
+const RELEASE_STEPS = ["1", "2", "3", "4", "5"] as const;
+
+const STOPPING_AFTER_A_HANGUP = "stopping, send SIGTERM or press ctrl-c to force";
 
 const SLOW_LOADING_SERVER = `console.error(\`loading \${process.pid}\`);
 await Bun.sleep(1000);
@@ -163,8 +173,8 @@ const startOnTerminal = (
     };
   });
 
-export const orphanHoldingSpawnSync = Task.make(
-  "a forced stop while Bun.spawnSync waits on an orphan its command left holding the output kills and reports that orphan, and the run exits 129",
+export const orphanHoldingSpawnSync = makeTest(
+  "a forced stop while Bun.spawnSync waits on an orphan its command left holding the output kills and reports that orphan, and the run exits 143",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({ "main.ts": ORPHAN_HOLDING_SPAWN_SYNC_OUTPUT });
@@ -174,18 +184,19 @@ export const orphanHoldingSpawnSync = Task.make(
       );
       yield* waitUntilEnded(shell);
       yield* command.sendSignal("HUP");
+      yield* command.waitForLine(STOPPING_AFTER_A_HANGUP);
+      yield* command.sendSignal("TERM");
       const exited = yield* command.waitForExit;
-      expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGHUP);
+      expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGTERM);
       expect(findKilledProcesses(exited.standardError).map((each) => each.processId)).toEqual([
         orphan,
       ]);
       expect(yield* isProcessAlive(orphan)).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const sameLauncher = Task.make(
+export const sameLauncher = makeTest(
   "a forced stop of one run leaves running another run and a sleep started by the same launcher in the same process group",
   Effect.scoped(
     Effect.gen(function* () {
@@ -216,7 +227,9 @@ await unrelated.exited;`,
       const [orphan] = yield* decodeProcessId(lines.get("orphan"));
       const [childB, commandB] = yield* decodeProcessIdPair(lines.get("[main] run"));
       yield* Effect.sync(() => process.kill(runA, "SIGHUP"));
-      yield* command.waitForLine("a exited 129");
+      yield* command.waitForLine(STOPPING_AFTER_A_HANGUP);
+      yield* Effect.sync(() => process.kill(runA, "SIGTERM"));
+      yield* command.waitForLine("a exited 143");
       expect(yield* isProcessAlive(orphan)).toBe(false);
       for (const survivor of [runB, childB, commandB, unrelated]) {
         expect(yield* isProcessAlive(survivor)).toBe(true);
@@ -233,10 +246,9 @@ await unrelated.exited;`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const terminalInterrupt = Task.make(
+export const terminalInterrupt = makeTest(
   "pressing Ctrl-C twice in a terminal while Bun.spawnSync waits on an orphan kills and reports that orphan, and the run exits 130",
   Effect.scoped(
     Effect.gen(function* () {
@@ -256,10 +268,9 @@ export const terminalInterrupt = Task.make(
       expect(yield* isProcessAlive(orphan)).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const terminalSuspend = Task.make(
+export const terminalSuspend = makeTest(
   "Ctrl-Z in a terminal stops the run and the processes it started, and fg resumes them",
   Effect.scoped(
     Effect.gen(function* () {
@@ -289,28 +300,90 @@ export const terminalSuspend = Task.make(
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const terminalClosed = Task.make(
-  "closing the terminal of a run ends its command, and the run exits 129 as after a SIGHUP",
+const expectEveryReleaseStep = (project: Effect.Success<ReturnType<typeof makeProject>>) =>
+  Effect.gen(function* () {
+    const released = yield* Effect.forEach(RELEASE_STEPS, (step) =>
+      exists(`${project.directory}/released-${step}`),
+    );
+    expect(released.every((isReleased) => isReleased)).toBe(true);
+  });
+
+export const terminalClosed = makeTest(
+  "closing the terminal of a run stops it like a first Ctrl-C, so every step of a 6s finalizer within its 30 seconds runs, its command ends, and the run exits 129 leaving no process alive",
   Effect.scoped(
     Effect.gen(function* () {
-      const project = yield* makeProject({ "main.ts": RUNNING_A_COMMAND });
+      const project = yield* makeProject({ "main.ts": RELEASING_IN_STEPS });
       const terminal = yield* startOnTerminal(project, [process.execPath, "main.ts"]);
+      const [run] = yield* decodeProcessId(
+        parseProcessIds(yield* terminal.waitFor(/\[main\] run \d+ supervised by \d+\r\n/u)),
+      );
       const [commandProcessId] = yield* decodeProcessId(
         parseProcessIds(yield* terminal.waitFor(/\[main\] command \d+\r\n/u)),
       );
-      yield* killWhenDone([commandProcessId]);
+      yield* killWhenDone([run, commandProcessId]);
       yield* terminal.close;
       expect(yield* terminal.exited).toBe(EXIT_CODE_AFTER_SIGHUP);
+      yield* expectEveryReleaseStep(project);
       yield* waitUntilEnded(commandProcessId);
+      yield* waitUntilEnded(run);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const pipedIntoCat = Task.make(
+export const terminalClosedUnderShell = makeTest(
+  "closing the terminal of an interactive bash that runs bun main.ts, which hangs the run up twice, once from the terminal and once from bash, still lets every step of a 6s finalizer within its 30 seconds run, and leaves no process alive",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({ "main.ts": RELEASING_IN_STEPS });
+      const terminal = yield* startOnTerminal(project, ["bash", "--norc", "-i"]);
+      yield* terminal.type(`"${process.execPath}" main.ts\n`);
+      const [run, supervisor] = yield* decodeProcessIdPair(
+        parseProcessIds(yield* terminal.waitFor(/\[main\] run \d+ supervised by \d+\r\n/u)),
+      );
+      const [commandProcessId] = yield* decodeProcessId(
+        parseProcessIds(yield* terminal.waitFor(/\[main\] command \d+\r\n/u)),
+      );
+      yield* killWhenDone([run, supervisor, commandProcessId]);
+      yield* terminal.close;
+      yield* terminal.exited;
+      yield* waitUntilEnded(run);
+      yield* waitUntilEnded(supervisor);
+      yield* waitUntilEnded(commandProcessId);
+      yield* expectEveryReleaseStep(project);
+    }),
+  ),
+);
+
+export const terminalClosedUnderPipe = makeTest(
+  "closing the terminal of bun main.ts 2>&1 | cat, which ends cat and the run's standard error with it, still lets every step of a 6s finalizer within its 30 seconds run, and leaves no process alive",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({ "main.ts": RELEASING_IN_STEPS });
+      const terminal = yield* startOnTerminal(project, [
+        "sh",
+        "-c",
+        `"${process.execPath}" main.ts 2>&1 | cat`,
+      ]);
+      const [run, supervisor] = yield* decodeProcessIdPair(
+        parseProcessIds(yield* terminal.waitFor(/\[main\] run \d+ supervised by \d+\r\n/u)),
+      );
+      const [commandProcessId] = yield* decodeProcessId(
+        parseProcessIds(yield* terminal.waitFor(/\[main\] command \d+\r\n/u)),
+      );
+      yield* killWhenDone([run, supervisor, commandProcessId]);
+      yield* terminal.close;
+      yield* terminal.exited;
+      yield* waitUntilEnded(run);
+      yield* waitUntilEnded(supervisor);
+      yield* waitUntilEnded(commandProcessId);
+      yield* expectEveryReleaseStep(project);
+    }),
+  ),
+);
+
+export const pipedIntoCat = makeTest(
   "a forced stop of bun main.ts | cat kills the run's orphan but not cat, which ends with the run's output",
   Effect.scoped(
     Effect.gen(function* () {
@@ -325,28 +398,28 @@ process.exitCode = await shell.exited;`,
       const [orphan, shell] = yield* decodeProcessIdPair(lines.get("orphan"));
       yield* waitUntilEnded(shell);
       yield* Effect.sync(() => process.kill(run, "SIGHUP"));
+      yield* command.waitForLine(STOPPING_AFTER_A_HANGUP);
+      yield* Effect.sync(() => process.kill(run, "SIGTERM"));
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(0);
-      expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("129");
-      expect(exited.standardError).toEndWith("StopRequested: received SIGHUP");
+      expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("143");
+      expect(exited.standardError).toEndWith("StopRequested: received SIGTERM");
       expect(findKilledProcesses(exited.standardError).map((each) => each.processId)).toEqual([
         orphan,
       ]);
       expect(yield* isProcessAlive(orphan)).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const exitSignal = Task.make(
+export const exitSignal = makeTest(
   "a run whose process is killed by a signal ends the process its launcher started with that signal",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.sync(() => process.kill(process.pid, "SIGUSR2")));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.sync(() => process.kill(process.pid, "SIGUSR2")) });`,
         "launch.ts": LAUNCHER(`"main.ts"`),
       });
       const exited = yield* startTaskProcess(project, "launch.ts").pipe(
@@ -356,10 +429,35 @@ if (import.meta.main) Task.main(main);`,
       expect(exited.standardError).toEndWith("exited null SIGUSR2");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const launcherKilled = Task.make(
+export const stuckLoadingTheRootFile = makeTest(
+  "a SIGTERM to a run stuck loading its root file ends the run instead of waiting for it to finish loading",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { existsSync, writeFileSync } from "node:fs";
+import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+if (existsSync("loaded")) {
+  console.error("stuck loading");
+  await new Promise(() => {});
+}
+writeFileSync("loaded", "");
+export default Task.make({ name: "main", run: Effect.void });`,
+        "launch.ts": LAUNCHER(`"main.ts"`),
+      });
+      const command = yield* startTaskProcess(project, "launch.ts");
+      const lines = yield* waitForEachLine(command, ["started", "stuck loading"]);
+      const [launched] = yield* decodeProcessId(lines.get("started"));
+      yield* Effect.sync(() => process.kill(launched, "SIGTERM"));
+      const exited = yield* command.waitForExit;
+      expect(exited.standardError).toEndWith("exited 143 null");
+    }),
+  ),
+);
+
+export const launcherKilled = makeTest(
   "SIGKILL to the process its launcher started ends the run and every process it started",
   Effect.scoped(
     Effect.gen(function* () {
@@ -378,10 +476,9 @@ export const launcherKilled = Task.make(
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const runProcessKilled = Task.make(
+export const runProcessKilled = makeTest(
   "SIGKILL to the run's process while a task's command runs makes the supervisor end that command",
   Effect.scoped(
     Effect.gen(function* () {
@@ -399,10 +496,9 @@ export const runProcessKilled = Task.make(
       yield* waitUntilEnded(commandProcess);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const supervisorKilled = Task.make(
+export const supervisorKilled = makeTest(
   "SIGKILL to the supervisor while a task's command runs ends the run's process and that command",
   Effect.scoped(
     Effect.gen(function* () {
@@ -416,10 +512,9 @@ export const supervisorKilled = Task.make(
       yield* waitUntilEnded(commandProcess);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const launcherKilledWhileLoading = Task.make(
+export const launcherKilledWhileLoading = makeTest(
   "SIGKILL to the process its launcher started, while the run is still loading its root file, ends the run before it starts",
   Effect.scoped(
     Effect.gen(function* () {
@@ -446,11 +541,10 @@ export const launcherKilledWhileLoading = Task.make(
       expect(exited.standardError).not.toContain("[main]");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const forcedStopWhileLoading = Task.make(
-  "SIGHUP while the run is still loading its root file ends the run with SIGHUP without waiting for the file to load",
+export const forcedStopWhileLoading = makeTest(
+  "SIGHUP while the run is still loading its root file stops the run with exit code 129 without waiting for the file to load",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -462,8 +556,7 @@ if (existsSync("loaded")) {
   await Bun.sleep(1_000_000);
 }
 writeFileSync("loaded", "");
-export const main = Task.make("main", Effect.log("ran"));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.log("ran") });`,
         "launch.ts": LAUNCHER(`"main.ts"`),
       });
       const command = yield* startTaskProcess(project, "launch.ts");
@@ -476,27 +569,25 @@ if (import.meta.main) Task.main(main);`,
       yield* killWhenDone([loading]);
       yield* Effect.sync(() => process.kill(launched, "SIGHUP"));
       const exited = yield* command.waitForExit;
-      expect(exited.standardError).toEndWith("exited null SIGHUP");
+      expect(exited.standardError).toEndWith("exited 129 null");
       expect(exited.standardError).not.toContain("[main]");
       yield* waitUntilEnded(loading);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const startedProcessEnvironment = Task.make(
+export const startedProcessEnvironment = makeTest(
   "a task sees the Bun arguments the run was started with, and a process it starts with Bun.spawn gets the run's environment",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.sync(() => {
+export default Task.make({ name: "main", run: Effect.sync(() => {
   console.error(\`arguments \${process.execArgv.join(" ")}.\`);
   const printed = Bun.spawnSync(["env"]).stdout.toString();
   console.error(printed.trim().split("\\n").map((variable) => \`environment \${variable}\`).join("\\n"));
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const exited = yield* runTaskProcess(project, "main.ts");
       expect(exited.exitCode).toBe(0);
@@ -513,18 +604,16 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const workingDirectoryFlag = Task.make(
+export const workingDirectoryFlag = makeTest(
   "a run started with bun --cwd and a path relative to where it started runs and passes",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "app/main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("ran"));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.log("ran") });`,
         "separate.ts": LAUNCHER(`"--cwd", "app", "main.ts"`),
         "joined.ts": LAUNCHER(`"--cwd=app", "main.ts"`),
         "titled.ts": LAUNCHER(`"--title", "--cwd", "--smol", "app/main.ts"`),
@@ -536,25 +625,23 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const nestedRun = Task.make(
+export const nestedRun = makeTest(
   "a run that a task starts with Bun.spawn and the run's own Bun arguments runs and passes",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.sync(() => {
+export default Task.make({ name: "main", run: Effect.sync(() => {
   const nested = Bun.spawnSync([process.execPath, ...process.execArgv, "nested.ts"], { stderr: "inherit" });
   console.error(\`nested exited \${nested.exitCode}\`);
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
         "nested.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const nested = Task.make("nested", Effect.log(\`ran \${process.pid}\`));
-if (import.meta.main) Task.main(nested);`,
+export const nested = Task.make({ name: "nested", run: Effect.log(\`ran \${process.pid}\`) });
+export default nested;`,
       });
       const exited = yield* runTaskProcess(project, "main.ts");
       expect(exited.exitCode).toBe(0);
@@ -562,29 +649,26 @@ if (import.meta.main) Task.main(nested);`,
       expect(exited.standardError).toContain("nested exited 0");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const nestedRunFromWorker = Task.make(
+export const nestedRunFromWorker = makeTest(
   "a run that a Worker of the root task file starts with the Worker's Bun arguments supervises itself",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.void);
 if (import.meta.main) {
   const worker = new Worker(new URL("./spawn.ts", import.meta.url));
   console.error(await new Promise((resolve) => { worker.onmessage = (event) => resolve(event.data); }));
   worker.terminate();
-  Task.main(main);
-}`,
+}
+export default Task.make({ name: "main", run: Effect.void });`,
         "spawn.ts": `const nested = Bun.spawnSync([process.execPath, ...process.execArgv, "nested.ts"], { stderr: "pipe" });
 postMessage(\`spawned by \${process.pid}: \${nested.stderr.toString().match(/\\[nested\\] ppid \\d+/)?.[0]}\`);`,
         "nested.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const nested = Task.make("nested", Effect.log(\`ppid \${process.ppid}\`));
-if (import.meta.main) Task.main(nested);`,
+export default Task.make({ name: "nested", run: Effect.log(\`ppid \${process.ppid}\`) });`,
       });
       const exited = yield* runTaskProcess(project, "main.ts");
       expect(exited.exitCode).toBe(0);
@@ -592,40 +676,11 @@ if (import.meta.main) Task.main(nested);`,
         .split("\n")
         .filter((line) => line.startsWith("spawned by "))
         .map((line) => parseProcessIds(line));
-      expect(spawned).toHaveLength(PROCESSES_STARTING_THE_WORKER);
+      expect(spawned).toHaveLength(1);
       for (const [spawner, nestedParent] of spawned) {
         expect(nestedParent).toBeNumber();
         expect(nestedParent).not.toBe(spawner);
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const rootTaskFileNotChecked = Task.make(
-  "a run whose root task file cannot be checked fails instead of running without a supervisor",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
-      const project = yield* makeProject({
-        "entry/main.ts": `import { chmodSync } from "node:fs";
-import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("ran"));
-chmodSync(import.meta.dir, 0o000);
-if (import.meta.main) Task.main(main);`,
-      });
-      yield* Effect.addFinalizer(() =>
-        fileSystem
-          .chmod(`${project.directory}/entry`, READABLE_DIRECTORY_MODE)
-          .pipe(failTestCleanup(`make ${project.directory}/entry readable again`)),
-      );
-      const exited = yield* runTaskProcess(project, "entry/main.ts");
-      expect(exited.exitCode, exited.standardError).toBe(1);
-      expect(exited.standardError).toContain(
-        `entry/main.ts: error RootTaskFileNotChecked: could not check whether the root task file exists because EACCES: permission denied, access '${project.directory}/entry/main.ts'`,
-      );
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

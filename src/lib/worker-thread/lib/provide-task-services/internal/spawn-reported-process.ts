@@ -1,4 +1,4 @@
-import { Duration, Effect, Deferred, Exit, PlatformError } from "effect";
+import { Effect, Deferred, Exit, PlatformError } from "effect";
 import { ChildProcessSpawner } from "effect/process";
 import type { ChildProcess } from "effect/process";
 
@@ -56,9 +56,10 @@ export const spawnReportedProcess = Effect.fn("spawnReportedProcess")(function* 
     );
   yield* spawnWithBun(
     command,
+    startMessage.taskName,
     refuseStandardInputOutsideRootTask(startMessage),
     startMessage.taskPackageDirectoryPath,
-    Duration.millis(startMessage.cleanupMilliseconds),
+    startMessage.cleanup,
     {
       onLeaderExited,
       killMembersLeftByLeader,
@@ -67,17 +68,18 @@ export const spawnReportedProcess = Effect.fn("spawnReportedProcess")(function* 
     Effect.tap((spawnedProcess) =>
       readProcessUnlessGone(startMessage.taskName, spawnedProcess.handle.pid).pipe(
         workerState.provideRuntimeServices,
-        Effect.mapError((readFailure) =>
-          PlatformError.systemError({
-            _tag: "Unknown",
-            module: "ChildProcess",
-            method: "spawn",
-            pathOrDescriptor: formatProgramNames(command),
-            description: readFailure.message,
-            cause: readFailure,
-          }),
-        ),
-        Effect.map((leader) => leader?.startTime ?? null),
+        Effect.mapBoth({
+          onSuccess: (leader) => leader?.startTime ?? null,
+          onFailure: (readFailure) =>
+            PlatformError.systemError({
+              _tag: "Unknown",
+              module: "ChildProcess",
+              method: "spawn",
+              pathOrDescriptor: formatProgramNames(command),
+              description: readFailure.message,
+              cause: readFailure,
+            }),
+        }),
         Effect.tap((leaderStartTime) =>
           Effect.sync(() => {
             const processId = spawnedProcess.handle.pid;

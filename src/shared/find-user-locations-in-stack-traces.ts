@@ -22,8 +22,8 @@ const parseStackFrames = (stack: string) =>
     return isFrameWithoutLocation ? [] : [{ filePath, lineAndColumn }];
   });
 
-export const readStackAbove = (frameAboveConstruction: (...parameters: never) => unknown) => {
-  const stackHolder: { stack?: string } = {};
+const readStackAbove = (frameAboveConstruction: (...parameters: never) => unknown) => {
+  const stackHolder = new Error();
   const previousStackTraceLimit = Error.stackTraceLimit;
   Error.stackTraceLimit = Number.POSITIVE_INFINITY;
   try {
@@ -51,6 +51,19 @@ const isUserFrame = (frame: { readonly filePath: string }) =>
 export const findUserLocationInStack = (stack: string): string | undefined => {
   const userFrame = parseStackFrames(stack).find((frame) => isUserFrame(frame));
   return userFrame === undefined ? undefined : `${userFrame.filePath}:${userFrame.lineAndColumn}`;
+};
+
+export const findCallingLocation = (): string | undefined => {
+  const stack = readStackAbove(findCallingLocation);
+  const callingFrame =
+    stack === undefined
+      ? undefined
+      : parseStackFrames(stack).find(
+          (frame) => !frame.filePath.startsWith(TASK_SOURCE_DIRECTORY_PATH),
+        );
+  return callingFrame === undefined
+    ? undefined
+    : `${callingFrame.filePath}:${callingFrame.lineAndColumn}`;
 };
 
 export const findConstructingLocation = (): string | undefined => {

@@ -1,15 +1,20 @@
-import { Context, Deferred, Effect, Exit, FiberSet } from "effect";
-import type { FileSystem, Schema } from "effect";
+import { Cause, Context, Deferred, Effect, Exit, FiberSet } from "effect";
+import type { FileSystem, Path, Schema } from "effect";
 
 import { printLine, printTaskLines } from "../../../../../shared/print-to-standard-error.ts";
+import type { TaskMadeInBody } from "../../../../../shared/rpc.ts";
 import type { TaskRequestFailure } from "../../../../../shared/task-errors.ts";
 import { TASK_PACKAGE } from "../../../../../shared/task-package.ts";
 import { failRunOnFailure, failTask } from "../../../shared/fail-run.ts";
-import { ServingTaskRequestsItself } from "../../../shared/main-thread-errors.ts";
+import {
+  ServingTaskRequestsItself,
+  TaskCleanupCutOff,
+} from "../../../shared/main-thread-errors.ts";
 import type { ProcessGroups } from "../../../shared/provide-process-groups.ts";
 import type { RunRootTaskConfig } from "../../../shared/provide-run-root-task-config.ts";
 import { StopState } from "../../../shared/provide-stop-state.ts";
 import type { WorkerEvent, WorkerPool } from "../../../shared/provide-worker-pool.ts";
+import { reportTaskFailure } from "../../../shared/report-task-failure.ts";
 import type { TraceFile } from "../../../shared/write-trace-file.ts";
 import {
   runRequestedTask,
@@ -21,7 +26,13 @@ import { handleWorkerEvent } from "./handle-worker-events.ts";
 
 export const makeTaskRuns = Effect.gen(function* () {
   const taskExecutionServices = yield* Effect.context<
-    FileSystem.FileSystem | ProcessGroups | RunRootTaskConfig | StopState | TraceFile | WorkerPool
+    | FileSystem.FileSystem
+    | Path.Path
+    | ProcessGroups
+    | RunRootTaskConfig
+    | StopState
+    | TraceFile
+    | WorkerPool
   >();
   const taskRunsState = yield* makeTaskRunsState;
   const resultDeferreds: Parameters<typeof runRequestedTask>[1] = new Map();
@@ -34,12 +45,16 @@ export const makeTaskRuns = Effect.gen(function* () {
   const requestDependencyTaskResult = (
     dependencyTaskName: string,
     requestingTaskName: string,
+    dependencyTaskFilePath: string | null,
+    dependencyTaskMadeInBody: typeof TaskMadeInBody.Type | null,
   ): Effect.Effect<Schema.Json | undefined, typeof TaskRequestFailure.Type> =>
     runRequestedDependencyTask(
       taskRunsState,
       resultDeferreds,
       dependencyTaskName,
       requestingTaskName,
+      dependencyTaskFilePath,
+      dependencyTaskMadeInBody,
     ).pipe(Effect.provide(taskExecutionServices));
   return {
     registerDiscoveredTasks: (
@@ -84,23 +99,40 @@ export const makeTaskRuns = Effect.gen(function* () {
         requestedTaskNames: taskRun.bodyRequestedTaskNames,
         stopped: Deferred.makeUnsafe<void>(),
       }));
-      const findTasksRequestedBy = (requester: (typeof unorderedStops)[number]) =>
-        unorderedStops.filter((stop) => requester.requestedTaskNames.has(stop.taskName));
-      const findServingTasksReachedBy = (requester: (typeof unorderedStops)[number]) => {
+      const stopsByTaskName = new Map(unorderedStops.map((stop) => [stop.taskName, stop]));
+      const requestersByStop = new Map(
+        unorderedStops.map((stop) => [stop, new Array<(typeof unorderedStops)[number]>()]),
+      );
+      for (const requester of unorderedStops) {
+        for (const taskName of requester.requestedTaskNames) {
+          const requested = stopsByTaskName.get(taskName);
+          if (requested !== undefined) {
+            requestersByStop.get(requested)?.push(requester);
+          }
+        }
+      }
+      const servingTasksReachedByStop = new Map(
+        unorderedStops.map((stop) => [stop, new Array<(typeof unorderedStops)[number]>()]),
+      );
+      for (const served of unorderedStops.filter((stop) => stop.isServing)) {
         const reached = new Set<(typeof unorderedStops)[number]>();
-        const reach = (stop: (typeof unorderedStops)[number]) => {
-          for (const requested of findTasksRequestedBy(stop)) {
-            if (!reached.has(requested)) {
-              reached.add(requested);
-              if (requested.isCompleted) {
-                reach(requested);
+        const toWalk = [served];
+        for (const stop of toWalk) {
+          for (const requester of requestersByStop.get(stop) ?? []) {
+            if (!reached.has(requester)) {
+              reached.add(requester);
+              if (requester !== served) {
+                servingTasksReachedByStop.get(requester)?.push(served);
+              }
+              if (requester.isCompleted) {
+                toWalk.push(requester);
               }
             }
           }
-        };
-        reach(requester);
-        return [...reached].filter((stop) => stop.isServing);
-      };
+        }
+      }
+      const findServingTasksReachedBy = (requester: (typeof unorderedStops)[number]) =>
+        servingTasksReachedByStop.get(requester) ?? [];
       const requestedBeforeRequesters = new Array<(typeof unorderedStops)[number]>();
       const visitedStops = new Set<(typeof unorderedStops)[number]>();
       const requestPath = new Array<(typeof unorderedStops)[number]>();
@@ -139,13 +171,26 @@ export const makeTaskRuns = Effect.gen(function* () {
         { discard: true },
       );
       const stops = requestedBeforeRequesters.toReversed();
+      const earlierStops = new Set<(typeof unorderedStops)[number]>();
+      const earlierRequestersByStop = new Map<
+        (typeof unorderedStops)[number],
+        (typeof unorderedStops)[number][]
+      >();
+      for (const requester of stops) {
+        earlierStops.add(requester);
+        for (const served of findServingTasksReachedBy(requester)) {
+          if (!earlierStops.has(served)) {
+            const earlierRequesters = earlierRequestersByStop.get(served) ?? [];
+            earlierRequesters.push(requester);
+            earlierRequestersByStop.set(served, earlierRequesters);
+          }
+        }
+      }
       yield* Effect.forEach(
         stops,
-        (stop, index) =>
+        (stop) =>
           Effect.forEach(
-            stops
-              .slice(0, index)
-              .filter((requester) => findServingTasksReachedBy(requester).includes(stop)),
+            earlierRequestersByStop.get(stop) ?? [],
             (requester) => Deferred.await(requester.stopped),
             { discard: true },
           ).pipe(
@@ -175,11 +220,33 @@ export const makeTaskRuns = Effect.gen(function* () {
         yield* printLine("Info", `${taskName} is serving`);
         yield* Deferred.await(taskRun.bodyFinishedDeferred);
       }),
+    findTaskNamesStillInBodyOrCleanup: Effect.sync(() =>
+      [...taskRunsByName]
+        .filter(([, taskRun]) => {
+          const isBodyUnfinished =
+            Deferred.isDoneUnsafe(taskRun.bodyStartedAtMillisecondsDeferred) &&
+            !Deferred.isDoneUnsafe(taskRun.bodyFinishedDeferred);
+          return isBodyUnfinished && !Deferred.isDoneUnsafe(taskRun.cleanupLimitPassedDeferred);
+        })
+        .map(([taskName]) => taskName),
+    ),
+    reportCleanupsCutOff: (taskNames: readonly string[]) =>
+      Effect.forEach(
+        taskNames,
+        (taskName) =>
+          markFailed(taskName).pipe(
+            Effect.andThen(
+              reportTaskFailure(taskName, Cause.fail(new TaskCleanupCutOff({ taskName }))),
+            ),
+          ),
+        { discard: true },
+      ).pipe(Effect.provide(taskExecutionServices)),
     markFailed,
     counts: Effect.sync(() => {
       const taskRuns = [...taskRunsByName];
       return {
         total: taskRunsByName.size,
+        taskNames: taskRuns.map(([taskName]) => taskName),
         failedTaskNames: [...discoveredTasksByName.keys()].filter((taskName) => {
           const taskRun = taskRunsByName.get(taskName);
           return (

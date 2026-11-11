@@ -7,21 +7,19 @@ import { formatCauseLines, formatFailureLines } from "../../../shared/format-err
 import { printLine } from "../../../shared/print-to-standard-error.ts";
 import { runtimeConfigProviderLayer } from "../../../shared/read-environment-config.ts";
 import type { STOP_SIGNALS } from "../../../shared/stop-signals.ts";
-import type { Task } from "../../task/index.ts";
-import { ModuleGraphLive } from "../lib/find-code-each-task-depends-on/index.ts";
 import { TaskRunsLive } from "../lib/run-tasks-on-workers/index.ts";
 import { DiscoveredTasksLive } from "../shared/provide-discovered-tasks.ts";
 import { ProcessGroupsLive } from "../shared/provide-process-groups.ts";
 import { RunRootTaskConfigLive } from "../shared/provide-run-root-task-config.ts";
 import { StopState } from "../shared/provide-stop-state.ts";
 import { WorkerPoolLive } from "../shared/provide-worker-pool.ts";
-import { runCalledTwiceLayer, stopRequestsLayer } from "./listen-for-stop-requests.ts";
+import { stopRequestsLayer } from "./listen-for-stop-requests.ts";
 import type { runRootTaskFiber } from "./run-root-task-fiber.ts";
 import { stopsAtFirstFailure } from "./stops-at-first-failure.ts";
 import { TraceFileLive, RuntimeTracingLive } from "./trace-the-run.ts";
 
 export const MainThreadLive = (
-  rootTask: Task,
+  runArgument: Parameters<typeof RunRootTaskConfigLive>[0],
   signals: Queue.Dequeue<(typeof STOP_SIGNALS)[number]>,
   supervisorProcessId: number | null,
 ) =>
@@ -32,7 +30,6 @@ export const MainThreadLive = (
         ProcessGroupsLive.pipe(
           Layer.provideMerge(RuntimeTracingLive),
           Layer.provideMerge(TraceFileLive),
-          Layer.provideMerge(ModuleGraphLive),
           Layer.provideMerge(
             Layer.mergeAll(
               FetchHttpClient.layer,
@@ -41,8 +38,7 @@ export const MainThreadLive = (
               OtlpSerialization.layerJson,
             ),
           ),
-          Layer.provideMerge(runCalledTwiceLayer),
-          Layer.provideMerge(RunRootTaskConfigLive(rootTask, supervisorProcessId)),
+          Layer.provideMerge(RunRootTaskConfigLive(runArgument, supervisorProcessId)),
         ),
       ),
     ),

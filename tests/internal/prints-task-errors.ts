@@ -1,6 +1,5 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
 import { Effect, FileSystem, Schema } from "effect";
 
 import { CommandFailed, PrintableError } from "../../src/lib/errors/index.ts";
@@ -9,10 +8,12 @@ import {
   formatFailureReasonLine,
 } from "../../src/shared/format-error-lines.ts";
 import { read } from "../shared/access-files.ts";
+import { countOccurrences } from "../shared/count-occurrences.ts";
 import { encodeJson } from "../shared/encode-json.ts";
 import { findMisprintedErrorLines } from "../shared/find-misprinted-error-lines.ts";
 import { REPOSITORY_DIRECTORY } from "../shared/find-repository-directory.ts";
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
 const FEWEST_EXPECTED_ERROR_CLASSES = 50;
@@ -33,7 +34,21 @@ const EMOJIS_KEPT_IN_THE_REASON_LINE = 195;
 
 const FAILED_COMMAND_EXIT_CODE = 3;
 
-export const failHard = Task.make(
+const COMMAND_OUTPUT_LINES_SHOWN = 20;
+
+const LONG_STANDARD_OUTPUT_LINES = 25;
+
+const LONG_STANDARD_ERROR_LINES = 22;
+
+const NUMBER_DIGITS = 2;
+
+const numberedLines = (prefix: string, first: number, last: number) =>
+  Array.from(
+    { length: last - first + 1 },
+    (_unused, index) => `${prefix} ${String(first + index).padStart(NUMBER_DIGITS, "0")}`,
+  );
+
+export const failHard = makeTest(
   "the first failure fails the run and the summary names it",
   Effect.scoped(
     Effect.gen(function* () {
@@ -41,17 +56,16 @@ export const failHard = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const slow = Task.make("slow", Effect.gen(function* () {
+export const slow = Task.make({ name: "slow", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("slow cleaned up"));
   yield* Effect.log("slow started");
   yield* Effect.never;
-}));
-export const bad = Task.make("bad", Effect.gen(function* () {
+}) });
+export const bad = Task.make({ name: "bad", run: Effect.gen(function* () {
   yield* slow.pipe(Effect.forkChild);
   return yield* Effect.fail(new TaskError({ message: "bad broke" }));
-}));
-export const main = Task.make("main", Effect.all([slow, bad], { concurrency: "unbounded", discard: true }));
-if (import.meta.main) Task.main(main);`,
+}) });
+export default Task.make({ name: "main", run: Effect.all([slow, bad], { concurrency: "unbounded", discard: true }) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -60,10 +74,9 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toMatch(/^failed: bad \(1 of 3 tasks\), 1 stopped, [\d.]+s$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const manyFailedTasks = Task.make(
+export const manyFailedTasks = makeTest(
   "the summary names the first three failed tasks in the order they were made and counts the rest",
   Effect.scoped(
     Effect.gen(function* () {
@@ -71,15 +84,14 @@ export const manyFailedTasks = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const lint = Task.make("lint", Effect.fail(new TaskError({ message: "lint broke" })));
-export const build = Task.make("build", Effect.fail(new TaskError({ message: "build broke" })));
-export const ok = Task.make("ok", Effect.void);
-export const types = Task.make("types", Effect.fail(new TaskError({ message: "types broke" })));
-export const docs = Task.make("docs", Effect.fail(new TaskError({ message: "docs broke" })));
-export const e2e = Task.make("e2e", Effect.fail(new TaskError({ message: "e2e broke" })));
-export const checks = Task.make("checks", Task.allSettled([e2e, docs, ok, types, build, lint]));
-export const main = Task.make("main", Task.allSettled([checks]));
-if (import.meta.main) Task.main(main);`,
+export const lint = Task.make({ name: "lint", run: Effect.fail(new TaskError({ message: "lint broke" })) });
+export const build = Task.make({ name: "build", run: Effect.fail(new TaskError({ message: "build broke" })) });
+export const ok = Task.make({ name: "ok", run: Effect.void });
+export const types = Task.make({ name: "types", run: Effect.fail(new TaskError({ message: "types broke" })) });
+export const docs = Task.make({ name: "docs", run: Effect.fail(new TaskError({ message: "docs broke" })) });
+export const e2e = Task.make({ name: "e2e", run: Effect.fail(new TaskError({ message: "e2e broke" })) });
+export const checks = Task.make({ name: "checks", run: Task.allSettled([e2e, docs, ok, types, build, lint]) });
+export default Task.make({ name: "main", run: Task.allSettled([checks]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -94,10 +106,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const errorOutput = Task.make(
+export const errorOutput = makeTest(
   "a TaskError failure or defect prints once with its tag and the user line that made it, and the trace keeps the stack",
   Effect.scoped(
     Effect.gen(function* () {
@@ -107,8 +118,7 @@ export const errorOutput = Task.make(
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 const failure = Effect.${mode === "defect" ? "die" : "fail"}(new TaskError({ message: "dev is not running" }));
-export const main = Task.make("main", failure);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: failure });`,
         });
         const ran = yield* runTaskProcess(project, "main.ts");
         expect(ran.exitCode).toBe(1);
@@ -139,11 +149,10 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const namedErrors = Task.make(
-  "every named error a task fails with prints its message and tag without a stack, and the trace keeps the details",
+export const namedErrors = makeTest(
+  "every named error a task fails with prints its message and tag without a stack, or its fields when it has no message, and the trace keeps the details",
   Effect.scoped(
     Effect.gen(function* () {
       const failures = [
@@ -151,13 +160,13 @@ export const namedErrors = Task.make(
           failure: `Task.exec("sh", ["-c", "echo broken >&2; exit ${FAILED_COMMAND_EXIT_CODE}"])`,
           tag: "CommandFailed",
           exitCode: FAILED_COMMAND_EXIT_CODE,
-          errorLines: `[main] error CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}\n[main]   broken\n`,
+          errorLines: `[main] broken\n[main] error CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}\nfailed: main (1 of 1 task), `,
         },
         {
           failure: `Task.exec("sh", ["-c", "echo hint: printed by the command >&2; exit ${FAILED_COMMAND_EXIT_CODE}"])`,
           tag: "CommandFailed",
           exitCode: FAILED_COMMAND_EXIT_CODE,
-          errorLines: `[main] error CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}\n[main]   hint: printed by the command\n`,
+          errorLines: `[main] hint: printed by the command\n[main] error CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}\nfailed: main (1 of 1 task), `,
         },
         {
           failure:
@@ -172,6 +181,12 @@ export const namedErrors = Task.make(
           exitCode: 1,
           errorLines: ": error PortTaken: port 3000 is taken\n",
         },
+        {
+          failure: 'Effect.fail(new DeployRejected({ env: "staging", status: 409 }))',
+          tag: "DeployRejected",
+          exitCode: 1,
+          errorLines: ': error DeployRejected: {"env":"staging","status":409}\n',
+        },
       ];
       for (const expected of failures) {
         const project = yield* makeProject({
@@ -182,9 +197,9 @@ class PortTaken extends Data.TaggedError("PortTaken")<{ readonly port: number }>
   override get message() { return \`port \${this.port} is taken\`; }
   get hint() { return "stop the other server or pick another port"; }
 }
+class DeployRejected extends Data.TaggedError("DeployRejected")<{ readonly env: string; readonly status: number }> {}
 const failure = ${expected.failure};
-export const main = Task.make("main", failure);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: failure });`,
         });
         const ran = yield* runTaskProcess(project, "main.ts");
         expect(ran.exitCode).toBe(expected.exitCode);
@@ -205,10 +220,77 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failingInADependency = Task.make(
+export const carriageReturnsInErrors = makeTest(
+  "a failed command whose output moves back to the start of the line with a carriage return prints each part on its own line, in the last line of the run and under its error when SSHKEDA_TASK_LOG=error hid the output as it arrived",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "printf 'downloading 10%%\\\\rdownloading 100%%\\\\r\\\\n'; printf 'error: disk full\\\\r\\\\n' >&2; exit ${FAILED_COMMAND_EXIT_CODE}"]) });`,
+        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`\${process.execPath} main.ts 2>&1\`], { stdio: ["ignore", "inherit", "inherit"] });
+process.exitCode = await shell.exited;`,
+      });
+      const piped = yield* runTaskProcess(project, "piped.ts");
+      expect(piped.exitCode, piped.standardOutput).toBe(FAILED_COMMAND_EXIT_CODE);
+      expect(piped.standardOutput).toContain(
+        `[main] error CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}\nfailed: main (1 of 1 task), `,
+      );
+      expect(piped.standardOutput).toEndWith(
+        `\nCommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE} | downloading 10% | downloading 100% | error: disk full\n`,
+      );
+      const quiet = yield* runTaskProcess(project, "piped.ts", { SSHKEDA_TASK_LOG: "error" });
+      expect(quiet.exitCode, quiet.standardOutput).toBe(FAILED_COMMAND_EXIT_CODE);
+      expect(quiet.standardOutput).toBe(
+        `[main] error CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}\n[main]   downloading 10%\n[main]   downloading 100%\n[main]   error: disk full\n`,
+      );
+    }),
+  ),
+);
+
+export const longCommandOutput = makeTest(
+  "a failed command with long output traces only the last lines of each stream and says how many it left out, and prints the same under its error when SSHKEDA_TASK_LOG=error hid the output as it arrived",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "seq -f 'report line %02g' 1 ${LONG_STANDARD_OUTPUT_LINES}; seq -f 'warning %02g' 1 ${LONG_STANDARD_ERROR_LINES} >&2; exit ${FAILED_COMMAND_EXIT_CODE}"]) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(FAILED_COMMAND_EXIT_CODE);
+      const leftOutOutputLines = LONG_STANDARD_OUTPUT_LINES - COMMAND_OUTPUT_LINES_SHOWN;
+      const leftOutErrorLines = LONG_STANDARD_ERROR_LINES - COMMAND_OUTPUT_LINES_SHOWN;
+      const messageLines = [
+        `sh exited with code ${FAILED_COMMAND_EXIT_CODE}`,
+        `(${leftOutOutputLines} earlier lines of standard output not shown)`,
+        ...numberedLines("report line", leftOutOutputLines + 1, LONG_STANDARD_OUTPUT_LINES),
+        `(${leftOutErrorLines} earlier lines of standard error not shown)`,
+        ...numberedLines("warning", leftOutErrorLines + 1, LONG_STANDARD_ERROR_LINES),
+      ];
+      const [firstMessageLine, ...continuationLines] = messageLines;
+      expect(ran.standardError).toContain(
+        `[main] error CommandFailed: ${firstMessageLine}\nfailed: main (1 of 1 task), `,
+      );
+      const quiet = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_LOG: "error" });
+      expect(quiet.exitCode, quiet.standardError).toBe(FAILED_COMMAND_EXIT_CODE);
+      expect(quiet.standardError).toBe(
+        [
+          `[main] error CommandFailed: ${firstMessageLine}`,
+          ...continuationLines.map((line) => `[main]   ${line}`),
+        ].join("\n"),
+      );
+      const tracePath = yield* Effect.fromNullishOr(
+        /wrote the trace to (?<tracePath>.+)/u.exec(ran.standardError)?.[1],
+      );
+      const trace = yield* (yield* FileSystem.FileSystem).readFileString(tracePath);
+      expect(trace).toContain(messageLines.join(String.raw`\n`));
+      expect(countOccurrences(trace, "report line 01"), "only the logged line").toBe(1);
+    }),
+  ),
+);
+
+export const failingInADependency = makeTest(
   "a body that fails inside an installed package prints no location inside node_modules",
   Effect.scoped(
     Effect.gen(function* () {
@@ -216,8 +298,7 @@ export const failingInADependency = Task.make(
         "main.ts": `import { Effect, FileSystem } from "effect";
 import { Task } from "@sshkeda/task";
 const version = FileSystem.FileSystem.pipe(Effect.flatMap((fs) => fs.readFileString(".bun-version")));
-export const main = Task.make("main", version);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: version });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -227,10 +308,9 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).not.toContain("node_modules");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const sourceFileNamedNodeModules = Task.make(
+export const sourceFileNamedNodeModules = makeTest(
   "an error made in an extensionless source file named node_modules keeps its location in that file",
   Effect.scoped(
     Effect.gen(function* () {
@@ -241,8 +321,7 @@ export const makeError = () =>
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { makeError } from "./lib/node_modules";
-export const main = Task.make("main", Effect.suspend(() => Effect.fail(makeError())));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.suspend(() => Effect.fail(makeError())) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -251,10 +330,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const unsetConfigKey = Task.make(
+export const unsetConfigKey = makeTest(
   "an unset Config a task reads fails naming the key, and names the environment variable only when @sshkeda/task's environment config provider read it",
   Effect.scoped(
     Effect.gen(function* () {
@@ -273,8 +351,7 @@ export const unsetConfigKey = Task.make(
         const project = yield* makeProject({
           "main.ts": `import { Config, Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", ${config});
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: ${config} });`,
         });
         const ran = yield* runTaskProcess(project, "main.ts");
         expect(ran.exitCode).toBe(1);
@@ -284,21 +361,19 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const emptyValueForDefaultedConfig = Task.make(
+export const emptyValueForDefaultedConfig = makeTest(
   "an empty environment value is set, so a defaulted Config fails with Effect's ConfigError, which keeps the schema's allowed values, instead of using the default",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Config, Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* Effect.log("number " + (yield* Config.Int("TASK_TEST_NUMBER").pipe(Config.withDefault(3))));
   yield* Effect.log("mode " + (yield* Config.Literals(["dev", "prod"], "TASK_TEST_MODE").pipe(Config.withDefault("dev"))));
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const unset = yield* runTaskProcess(project, "main.ts");
       expect(unset.standardError).toContain("[main] number 3");
@@ -315,10 +390,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const configSetWithWrongShape = Task.make(
+export const configSetWithWrongShape = makeTest(
   "a Config whose key is set to a value of the wrong shape, or that a task's own ConfigProvider reads, is not reported as unset",
   Effect.scoped(
     Effect.gen(function* () {
@@ -329,8 +403,7 @@ export const configSetWithWrongShape = Task.make(
         const project = yield* makeProject({
           "main.ts": `import { Config, ConfigProvider, Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", ${config});
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: ${config} });`,
         });
         const ran = yield* runTaskProcess(project, "main.ts");
         expect(ran.exitCode).toBe(1);
@@ -339,10 +412,9 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const userErrorLocations = Task.make(
+export const userErrorLocations = makeTest(
   "a user error, tagged error or defect prints the user line that made it, and a module that throws on import prints its line",
   Effect.scoped(
     Effect.gen(function* () {
@@ -364,8 +436,7 @@ class Deploy extends Data.TaggedError("Deploy")<{ readonly reason: string }> {}
 class UserNotFound extends Data.TaggedError("UserNotFound")<{ readonly name: string }> {}
 class BucketMissing extends Data.TaggedError("BucketMissing")<{ readonly location: string }> {}
 class Wrapped extends Data.TaggedError("Wrapped")<{ readonly reportedErrors: ReadonlyArray<unknown> }> {}
-export const main = Task.make("main", ${failure});
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: ${failure} });`,
         });
         const ran = yield* runTaskProcess(project, "main.ts");
         expect(ran.exitCode).toBe(1);
@@ -377,13 +448,12 @@ if (import.meta.main) Task.main(main);`,
         "throws.ts": `import { isMainThread } from "node:worker_threads";
 import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const thrown = Task.make("thrown", Effect.void);
+export const thrown = Task.make({ name: "thrown", run: Effect.void });
 if (!isMainThread) throw new Error("module refused");`,
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { thrown } from "./throws.ts";
-export const main = Task.make("main", Effect.asVoid(thrown));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.asVoid(thrown) });`,
       });
       const importFailed = yield* runTaskProcess(throwing, "main.ts");
       expect(importFailed.exitCode).toBe(1);
@@ -392,10 +462,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failuresWithoutAName = Task.make(
+export const failuresWithoutAName = makeTest(
   "a thrown system error prints Node's text with its path, and a failure value without a message prints as JSON cut to 200 characters",
   Effect.scoped(
     Effect.gen(function* () {
@@ -403,11 +472,10 @@ export const failuresWithoutAName = Task.make(
         "main.ts": `import { readFileSync } from "node:fs";
 import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const read = Task.make("read", Effect.sync(() => readFileSync("content/contact.html", "utf8")));
-export const invalid = Task.make("invalid", Effect.fail({ service: "worker", field: "port", problem: "is not a port number" }));
-export const long = Task.make("long", Effect.fail({ values: Array.from({ length: 100 }, (_unused, index) => index) }));
-export const main = Task.make("main", Task.allSettled([read, invalid, long]));
-if (import.meta.main) Task.main(main);`,
+export const read = Task.make({ name: "read", run: Effect.sync(() => readFileSync("content/contact.html", "utf8")) });
+export const invalid = Task.make({ name: "invalid", run: Effect.fail({ service: "worker", field: "port", problem: "is not a port number" }) });
+export const long = Task.make({ name: "long", run: Effect.fail({ values: Array.from({ length: 100 }, (_unused, index) => index) }) });
+export default Task.make({ name: "main", run: Task.allSettled([read, invalid, long]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -426,10 +494,9 @@ if (import.meta.main) Task.main(main);`,
       expect(findMisprintedErrorLines(ran.standardError)).toEqual([]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const cyclicErrorCauses = Task.make(
+export const cyclicErrorCauses = makeTest(
   "an error whose cause contains a cycle keeps its original message and stack",
   Effect.scoped(
     Effect.gen(function* () {
@@ -437,12 +504,11 @@ export const cyclicErrorCauses = Task.make(
         const project = yield* makeProject({
           "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.sync(() => {
+export default Task.make({ name: "main", run: Effect.sync(() => {
   const failure = new Error("original cyclic failure");
   failure.cause = ${cause};
   throw failure;
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
         });
         const ran = yield* runTaskProcess(project, "main.ts");
         expect(ran.exitCode).toBe(1);
@@ -460,10 +526,9 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const deepErrorCauses = Task.make(
+export const deepErrorCauses = makeTest(
   "an error with a cause chain 20,000 deep is reported with every cause in the trace",
   Effect.scoped(
     Effect.gen(function* () {
@@ -472,8 +537,7 @@ export const deepErrorCauses = Task.make(
 import { Task } from "@sshkeda/task";
 let failure = new Error("deepest cause");
 for (let depth = 0; depth < 20_000; depth++) failure = new Error(\`cause \${depth}\`, { cause: failure });
-export const main = Task.make("main", Effect.fail(failure));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.fail(failure) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -490,10 +554,9 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).not.toContain("still stopping");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const deepPlainObjectCauses = Task.make(
+export const deepPlainObjectCauses = makeTest(
   "an error whose cause chain is 20,000 plain objects deep is reported with every cause in the trace",
   Effect.scoped(
     Effect.gen(function* () {
@@ -502,8 +565,7 @@ export const deepPlainObjectCauses = Task.make(
 import { Task } from "@sshkeda/task";
 let cause: object = { message: "deepest cause" };
 for (let depth = 0; depth < 20_000; depth++) cause = { message: \`cause \${depth}\`, cause };
-export const main = Task.make("main", Effect.fail(new Error("deploy failed", { cause })));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.fail(new Error("deploy failed", { cause })) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -516,10 +578,9 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).not.toContain("still stopping");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const thrownValuesWithoutMessages = Task.make(
+export const thrownValuesWithoutMessages = makeTest(
   "an empty thrown string or Error says that the thrown value has no message",
   Effect.scoped(
     Effect.gen(function* () {
@@ -527,8 +588,7 @@ export const thrownValuesWithoutMessages = Task.make(
         const project = yield* makeProject({
           "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.sync(() => { ${failure} }));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.sync(() => { ${failure} }) });`,
         });
         const ran = yield* runTaskProcess(project, "main.ts");
         expect(ran.exitCode).toBe(1);
@@ -539,10 +599,9 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const defectsWithoutSourceExcerpts = Task.make(
+export const defectsWithoutSourceExcerpts = makeTest(
   "a TypeError from the engine prints without the source excerpt it appends but keeps the value it names, and a thrown message is printed as written",
   Effect.scoped(
     Effect.gen(function* () {
@@ -550,12 +609,11 @@ export const defectsWithoutSourceExcerpts = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 const notAnEffect: any = [];
-export const piped = Task.make("piped", Effect.suspend(() => notAnEffect.pipe(
+export const piped = Task.make({ name: "piped", run: Effect.suspend(() => notAnEffect.pipe(
   Effect.asVoid,
-)));
-export const deploy = Task.make("deploy", Effect.sync(() => { throw new Error("upload rejected (In 'us-east-1': quota exceeded)"); }));
-export const main = Task.make("main", Task.allSettled([piped, deploy]));
-if (import.meta.main) Task.main(main);`,
+)) });
+export const deploy = Task.make({ name: "deploy", run: Effect.sync(() => { throw new Error("upload rejected (In 'us-east-1': quota exceeded)"); }) });
+export default Task.make({ name: "main", run: Task.allSettled([piped, deploy]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -566,10 +624,9 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toContain("upload rejected (In 'us-east-1': quota exceeded)");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const wrappedCauseKeepsOuterMessage = Task.make(
+export const wrappedCauseKeepsOuterMessage = makeTest(
   "a task's own error that wraps a TaskError as its cause is printed with its own message, tag and user line, without a detecting line",
   Effect.scoped(
     Effect.gen(function* () {
@@ -580,25 +637,120 @@ import { TaskError } from "@sshkeda/task/errors";
 class DeployFailed extends Data.TaggedError("DeployFailed")<{ readonly cause: TaskError }> {
   override get message() { return "deploy failed"; }
 }
-export const main = Task.make("main", Effect.fail(new DeployFailed({
+export default Task.make({ name: "main", run: Effect.fail(new DeployFailed({
   cause: new TaskError({ message: "inner failure" }),
-})));
-if (import.meta.main) Task.main(main);`,
+})) });`,
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode, result.standardError).toBe(1);
       expect(result.standardError).toMatch(
         /^\[main\] main\.ts:7:\d+: error DeployFailed: deploy failed$/mu,
       );
-      expect(result.standardError).not.toContain("inner failure");
+      expect(result.standardError).toMatch(/^\[main\] {3}caused by TaskError: inner failure$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
+);
+
+export const failureCausesArePrinted = makeTest(
+  "a failure from Effect.tryPromise without a catch prints the error it caught, such as a refused connection",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const server = Bun.serve({ port: 0, fetch: () => new Response() });
+const closedPort = server.port;
+await server.stop(true);
+export default Task.make({ name: "main", run: Effect.tryPromise(() => fetch(\`http://127.0.0.1:\${closedPort}\`)) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode).toBe(1);
+      expect(ran.standardError).toMatch(
+        /^\[main\] error UnknownError: An error occurred in Effect\.tryPromise\n\[main\] {3}caused by TypeError: ECONNREFUSED: Unable to connect\. Is the computer able to access the url\?$/mu,
+      );
+      expect(ran.standardError).toMatch(
+        /^UnknownError: An error occurred in Effect\.tryPromise \| caused by TypeError: ECONNREFUSED: Unable to connect\. Is the computer able to access the url\?$/mu,
+      );
+    }),
+  ),
+);
+
+export const innerErrorsArePrinted = makeTest(
+  "a failure from Promise.any prints each error it rejected with, up to five",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const fetchFromMirrors = () => Promise.any(["a", "b", "c", "d", "e", "f", "g"].map(async (mirror) => {
+  throw new TypeError(\`mirror \${mirror} is down\`);
+}));
+export default Task.make({ name: "main", run: Effect.tryPromise(fetchFromMirrors) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toContain(
+        [
+          "[main] error UnknownError: An error occurred in Effect.tryPromise",
+          "[main]   caused by AggregateError",
+          "[main]     TypeError: mirror a is down",
+          "[main]     TypeError: mirror b is down",
+          "[main]     TypeError: mirror c is down",
+          "[main]     TypeError: mirror d is down",
+          "[main]     TypeError: mirror e is down",
+          "[main]     and 2 more\n",
+        ].join("\n"),
+      );
+    }),
+  ),
+);
+
+export const errorsFieldOfOtherErrorsIsNotPrinted = makeTest(
+  "an error that is not an AggregateError prints no lines for an errors field it has",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Data, Effect } from "effect";
+import { Task } from "@sshkeda/task";
+class ConfigInvalid extends Data.TaggedError("ConfigInvalid")<{ readonly message: string; readonly errors: ReadonlyArray<string> }> {}
+export default Task.make({ name: "main", run: Effect.fail(new ConfigInvalid({ message: "config is invalid", errors: ["port must be a number"] })) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toMatch(
+        /^\[main\] main\.ts:4:\d+: error ConfigInvalid: config is invalid$/mu,
+      );
+      expect(ran.standardError).not.toContain("port must be a number");
+    }),
+  ),
+);
+
+export const causesInsideTheMessageArePrinted = makeTest(
+  "a cause whose message is only part of an earlier line, or is empty, is still printed",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Data, Effect } from "effect";
+import { Task } from "@sshkeda/task";
+class ConfigFailed extends Data.TaggedError("ConfigFailed")<{ readonly cause: unknown }> {
+  override get message() { return "could not read config file"; }
+}
+export default Task.make({ name: "main", run: Effect.fail(new ConfigFailed({
+  cause: new Error("file", { cause: new Error("") }),
+})) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toMatch(
+        /^\[main\] main\.ts:6:\d+: error ConfigFailed: could not read config file\n\[main\] {3}caused by Error: file\n\[main\] {3}caused by Error$/mu,
+      );
+    }),
+  ),
 );
 
 const USER_CONSTRUCTED_ERROR_CLASSES = new Set(["TaskError", "ReportedErrors"]);
 
-export const everyTaskErrorTagIsConstructedInSource = Task.make(
+export const everyTaskErrorTagIsConstructedInSource = makeTest(
   "every Task error class is tagged with its own name and constructed in src, so searching the shipped source for new <Tag>( finds where it is raised",
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
@@ -647,10 +799,9 @@ export const everyTaskErrorTagIsConstructedInSource = Task.make(
         ),
     ).toEqual([]);
   }),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const printedErrorFormatCheck = Task.make(
+export const printedErrorFormatCheck = makeTest(
   "the printed-error format check refuses a hint line under any error but CommandFailed, whose later lines are the command's output",
   Effect.sync(() => {
     expect(
@@ -660,6 +811,10 @@ export const printedErrorFormatCheck = Task.make(
       new CommandFailed({ command: "c", code: 1, standardOutput: "out", standardError: "err" })
         .message,
     ).toBe("c exited with code 1\nout\nerr");
+    expect(
+      new CommandFailed({ command: "c", code: 1, standardOutput: "out", standardError: "err" })
+        .messageBeforeOutput,
+    ).toBe("c exited with code 1");
     const commandFailure =
       "[main] error CommandFailed: sh exited with code 1\n[main]   out\n[main]   hint: printed by the command";
     for (const printed of [
@@ -674,10 +829,9 @@ export const printedErrorFormatCheck = Task.make(
     }
     expect(findMisprintedErrorLines(commandFailure)).toEqual([]);
   }),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const directoryWithSpace = Task.make(
+export const directoryWithSpace = makeTest(
   "errors from a project directory whose name has a space keep their locations, including ReportedErrors violations",
   Effect.scoped(
     Effect.gen(function* () {
@@ -686,13 +840,12 @@ export const directoryWithSpace = Task.make(
         "sp ace/main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { ReportedErrors } from "@sshkeda/task/errors";
-export const thrown = Task.make("thrown", Effect.fail(new Error("boom")));
-export const checked = Task.make("checked", Effect.fail(new ReportedErrors({ reportedErrors: [
+export const thrown = Task.make({ name: "thrown", run: Effect.fail(new Error("boom")) });
+export const checked = Task.make({ name: "checked", run: Effect.fail(new ReportedErrors({ reportedErrors: [
   { tag: "LintViolation", location: import.meta.dir + "/a b.ts:1:2", message: "first violation", hint: "use Effect FileSystem" },
   { tag: "OtherViolation", location: import.meta.dir + "/c d.ts:4:5", message: "second violation" },
-] })));
-export const main = Task.make("main", Task.allSettled([thrown, checked]));
-if (import.meta.main) Task.main(main);`,
+] })) });
+export default Task.make({ name: "main", run: Task.allSettled([thrown, checked]) });`,
       });
       const spacedDirectory = `${project.directory}/sp ace`;
       const ran = yield* runTaskProcess(project, "sp ace/main.ts", {}, spacedDirectory);
@@ -705,7 +858,6 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const runFailureReasonProject = (rootTaskBody: string) =>
@@ -714,11 +866,10 @@ const runFailureReasonProject = (rootTaskBody: string) =>
       "main.ts": `import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
 class EvidenceRejected extends Schema.TaggedError<EvidenceRejected>()("EvidenceRejected", { message: Schema.String }) {}
-export const checkArchive = Task.make("check-archive", Effect.fail(new EvidenceRejected({ message: "archive reference is required" })));
-export const checkB = Task.make("b", Effect.fail(new EvidenceRejected({ message: "b rejected the evidence" })));
-export const checkLater = Task.make("check-later", Effect.sleep("2 seconds").pipe(Effect.andThen(Effect.fail(new EvidenceRejected({ message: "later failure" })))));
-export const main = Task.make("main", ${rootTaskBody});
-if (import.meta.main) Task.main(main);`,
+export const checkArchive = Task.make({ name: "check-archive", run: Effect.fail(new EvidenceRejected({ message: "archive reference is required" })) });
+export const checkB = Task.make({ name: "b", run: Effect.fail(new EvidenceRejected({ message: "b rejected the evidence" })) });
+export const checkLater = Task.make({ name: "check-later", run: Effect.sleep("2 seconds").pipe(Effect.andThen(Effect.fail(new EvidenceRejected({ message: "later failure" })))) });
+export default Task.make({ name: "main", run: ${rootTaskBody} });`,
     });
     const ran = yield* runTaskProcess(project, "main.ts");
     const [traceLine, reasonLine] = ran.standardError
@@ -728,7 +879,7 @@ if (import.meta.main) Task.main(main);`,
     return { ...ran, traceLine, reasonLine };
   });
 
-export const failureReasonOfRootTask = Task.make(
+export const failureReasonOfRootTask = makeTest(
   "a failed run ends with a reason line Tag: message after the summary and the trace line",
   Effect.scoped(
     Effect.gen(function* () {
@@ -741,10 +892,9 @@ export const failureReasonOfRootTask = Task.make(
       expect(ran.reasonLine).toBe("EvidenceRejected: archive reference is required");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failureReasonOfAwaitedTask = Task.make(
+export const failureReasonOfAwaitedTask = makeTest(
   "the reason line names the original failure of the awaited task, not AwaitedTaskFailed wrapping it",
   Effect.scoped(
     Effect.gen(function* () {
@@ -757,10 +907,9 @@ export const failureReasonOfAwaitedTask = Task.make(
       expect(ran.reasonLine).toBe("EvidenceRejected: archive reference is required");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const awaitedFailureWithFinalizerFailure = Task.make(
+export const awaitedFailureWithFinalizerFailure = makeTest(
   "an awaited task failure and an independent finalizer failure in the same cause both print",
   Effect.scoped(
     Effect.gen(function* () {
@@ -768,12 +917,11 @@ export const awaitedFailureWithFinalizerFailure = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const dependency = Task.make("dependency", Effect.fail(new TaskError({ message: "dependency broke" })));
-export const main = Task.make("main", Effect.scoped(Effect.gen(function* () {
+export const dependency = Task.make({ name: "dependency", run: Effect.fail(new TaskError({ message: "dependency broke" })) });
+export default Task.make({ name: "main", run: Effect.scoped(Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.sync(() => { throw new Error("finalizer broke independently"); }));
   yield* dependency;
-})));
-if (import.meta.main) Task.main(main);`,
+})) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -784,10 +932,55 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failureReasonOfUncaughtFailure = Task.make(
+const countAwaitedFailureLinesWhenAFinalizerAwaitsItToo = (mainBody: string) =>
+  Effect.gen(function* () {
+    const project = yield* makeProject({
+      "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+import { TaskError } from "@sshkeda/task/errors";
+export const dependency = Task.make({ name: "dependency", run: Effect.fail(new TaskError({ message: "dependency broke" })) });
+export const main = Task.make({ name: "main", run: ${mainBody} });
+export default Task.make({ name: "root", run: Effect.andThen(main, Effect.void) });`,
+    });
+    const ran = yield* runTaskProcess(project, "main.ts");
+    expect(ran.exitCode).toBe(1);
+    return ran.standardError.match(/^\[main\] error AwaitedTaskFailed: dependency failed$/gmu)
+      ?.length;
+  });
+
+export const awaitedFailureAlsoAwaitedInAScopedFinalizer = makeTest(
+  "a failed task awaited by the body and by a finalizer of its own scope prints AwaitedTaskFailed once",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const count = yield* countAwaitedFailureLinesWhenAFinalizerAwaitsItToo(
+        `Effect.scoped(Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => dependency.pipe(Effect.catch((error) => Effect.die(error))));
+  yield* dependency;
+}))`,
+      );
+      expect(count).toBe(1);
+    }),
+  ),
+);
+
+export const awaitedFailureAlsoAwaitedInATaskScopeFinalizer = makeTest(
+  "a failed task awaited by the body and by a finalizer of the task scope prints AwaitedTaskFailed once",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const count = yield* countAwaitedFailureLinesWhenAFinalizerAwaitsItToo(
+        `Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => dependency.pipe(Effect.catch((error) => Effect.die(error))));
+  yield* dependency;
+})`,
+      );
+      expect(count).toBe(1);
+    }),
+  ),
+);
+
+export const failureReasonOfUncaughtFailure = makeTest(
   "the reason line names the failure that ended the run, not an earlier one an awaiting task caught",
   Effect.scoped(
     Effect.gen(function* () {
@@ -800,10 +993,9 @@ export const failureReasonOfUncaughtFailure = Task.make(
       expect(ran.reasonLine).toBe("EvidenceRejected: b rejected the evidence");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failureReasonOfMultiLineMessage = Task.make(
+export const failureReasonOfMultiLineMessage = makeTest(
   "the reason line joins the trimmed nonblank lines of a multi-line message with a pipe",
   Effect.scoped(
     Effect.gen(function* () {
@@ -815,10 +1007,9 @@ export const failureReasonOfMultiLineMessage = Task.make(
       expect(ran.reasonLine).toBe("EvidenceRejected: first line | second line | third line");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failureReasonOfCommand = Task.make(
+export const failureReasonOfCommand = makeTest(
   "the reason line of a failed command holds the command, its exit code and its output on one line",
   Effect.scoped(
     Effect.gen(function* () {
@@ -832,10 +1023,9 @@ export const failureReasonOfCommand = Task.make(
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failureReasonOfLongCommandOutput = Task.make(
+export const failureReasonOfLongCommandOutput = makeTest(
   "the reason line is cut to 200 characters with an ellipsis",
   Effect.scoped(
     Effect.gen(function* () {
@@ -850,10 +1040,9 @@ export const failureReasonOfLongCommandOutput = Task.make(
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failureReasonCutsBetweenCharacters = Task.make(
+export const failureReasonCutsBetweenCharacters = makeTest(
   "the reason line is cut between user-perceived characters, never inside an emoji",
   Effect.gen(function* () {
     const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
@@ -870,7 +1059,7 @@ export const failureReasonCutsBetweenCharacters = Task.make(
   }),
 );
 
-export const noFailureReasonOnSuccess = Task.make(
+export const noFailureReasonOnSuccess = makeTest(
   "a passing run prints no reason line and still ends with the trace line",
   Effect.scoped(
     Effect.gen(function* () {
@@ -879,5 +1068,4 @@ export const noFailureReasonOnSuccess = Task.make(
       expect(ran.reasonLine).toStartWith("wrote the trace to ");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

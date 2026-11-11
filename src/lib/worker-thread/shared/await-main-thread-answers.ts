@@ -5,7 +5,8 @@ import type { RpcClient, RpcClientError } from "effect/rpc";
 import type { ProcessIdentity } from "../../../shared/claim-processes-to-report.ts";
 import { dieOnInvariantFailure } from "../../../shared/invariant-errors.ts";
 import { TaskEvent } from "../../../shared/rpc.ts";
-import type { MainThreadRpcs, StandardInputRead } from "../../../shared/rpc.ts";
+import type { MainThreadRpcs, StandardInputRead, TaskMadeInBody } from "../../../shared/rpc.ts";
+import type { TerminalCommand } from "../../../shared/run-in-terminal.ts";
 import { isAwaitedTaskFailed } from "../../../shared/task-errors.ts";
 
 const dieUnlessAnswered = dieOnInvariantFailure(
@@ -47,20 +48,39 @@ export const makeMainThreadAnswers = Effect.fn("makeMainThreadAnswers")(function
           Effect.tap(() => Ref.set(unclaimedStandardInputRead, null)),
         ),
       ).pipe(oneStandardInputReadAtATime.withPermits(1)),
-    requestDependencyTaskResult: (dependencyTaskName: string, requestingTaskName: string) =>
-      mainThread.RequestTask({ taskName: requestingTaskName, dependencyTaskName }).pipe(
-        Effect.catchTag("RpcClientError", (error) => dieUnlessAnswered(Effect.fail(error))),
-        Effect.map((answered) => answered.value),
-        Effect.tapError((failure) =>
-          isAwaitedTaskFailed(failure)
-            ? reportToMainThread(
-                TaskEvent.cases.TaskFiberReceivedAwaitedFailure.make({
-                  taskName: requestingTaskName,
-                  awaitedTaskName: failure.awaitedTaskName,
-                }),
-              )
-            : Effect.void,
+    requestDependencyTaskResult: (
+      dependencyTaskName: string,
+      requestingTaskName: string,
+      dependencyTaskFilePath: string | null,
+      dependencyTaskMadeInBody: typeof TaskMadeInBody.Type | null,
+    ) =>
+      mainThread
+        .RequestTask({
+          taskName: requestingTaskName,
+          dependencyTaskName,
+          dependencyTaskFilePath,
+          dependencyTaskMadeInBody,
+        })
+        .pipe(
+          Effect.catchTag("RpcClientError", (error) => dieUnlessAnswered(Effect.fail(error))),
+          Effect.map((answered) => answered.value),
+          Effect.tapError((failure) =>
+            isAwaitedTaskFailed(failure)
+              ? reportToMainThread(
+                  TaskEvent.cases.TaskFiberReceivedAwaitedFailure.make({
+                    taskName: requestingTaskName,
+                    awaitedTaskName: failure.awaitedTaskName,
+                  }),
+                )
+              : Effect.void,
+          ),
         ),
+    runInTerminal: (command: typeof TerminalCommand.Type) =>
+      mainThread.RunInTerminal(command).pipe(
+        Effect.onInterrupt(() =>
+          mainThread.AwaitTerminalCommandExit({ id: command.id }).pipe(dieUnlessAnswered),
+        ),
+        dieUnlessAnswered,
       ),
     reportStartedProcessAndAwaitRecord: (
       taskName: string,

@@ -4,7 +4,8 @@ import {
   AwaitedTaskFailed,
   REPORTED_FAILURE_FIELDS,
   SettledTasksFailed,
-  TaskNotMadeAtTopLevel,
+  TaskMadeByAnotherCopy,
+  TaskNotMadeWhileLoading,
   TaskWaitsOnItself,
 } from "../lib/errors/index.ts";
 import { attributeFailures, joinMessages } from "./attribute-reported-failures.ts";
@@ -14,7 +15,6 @@ import {
   findLocationInFile,
   findUserLocationInStack,
 } from "./find-user-locations-in-stack-traces.ts";
-import { relativeToWorkingDirectory } from "./format-error-lines.ts";
 import { ErrorStack, describeCauseMessage } from "./report-errors.ts";
 import { TASK_PACKAGE } from "./task-package.ts";
 
@@ -117,56 +117,86 @@ export class Exited extends Schema.TaggedError<Exited>()("Exited", { code: Schem
   }
 }
 
-export class RunCalledTwice extends Schema.TaggedError<RunCalledTwice>()("RunCalledTwice", {
+export class DefaultExportNotRunnable extends Schema.TaggedError<DefaultExportNotRunnable>()(
+  "DefaultExportNotRunnable",
+  {
+    ...TASK_ERROR_FIELDS,
+    ...UNATTRIBUTED_FAILURE_FIELDS,
+    location: Schema.String,
+    defaultExport: Schema.Literals(["missing", "not a task", "unreadable list"]),
+    tasksInFile: Schema.NullOr(Schema.Literals(["makes", "exports"])),
+  },
+) {
+  public override get message() {
+    if (this.defaultExport === "unreadable list") {
+      return "its default export is a Task.all() or Task.allSettled() list whose options can't be read";
+    }
+    return this.defaultExport === "not a task"
+      ? `${this.tasksInFile} tasks, but its default export is neither a task nor a Task.all() or Task.allSettled() list`
+      : `${this.tasksInFile} tasks, but has no default export to run`;
+  }
+}
+
+export class RunArgumentsNotAccepted extends Schema.TaggedError<RunArgumentsNotAccepted>()(
+  "RunArgumentsNotAccepted",
+  {
+    ...TASK_ERROR_FIELDS,
+    ...UNATTRIBUTED_FAILURE_FIELDS,
+    givenArguments: Schema.NonEmptyArray(Schema.String),
+  },
+) {
+  public override get message() {
+    const isOneArgument = this.givenArguments.length === 1;
+    return `the ${isOneArgument ? "argument" : "arguments"} ${this.givenArguments.map((givenArgument) => `"${givenArgument}"`).join(" ")} ${isOneArgument ? "is" : "are"} not the name of one task to start`;
+  }
+}
+
+export class StartTaskNotMade extends Schema.TaggedError<StartTaskNotMade>()("StartTaskNotMade", {
   ...TASK_ERROR_FIELDS,
   ...UNATTRIBUTED_FAILURE_FIELDS,
-  runningRootTaskName: Schema.String,
-  runningRootTaskLocation: Schema.UndefinedOr(Schema.String),
-  laterRootTaskName: Schema.String,
+  startTaskName: Schema.String,
+}) {
+  public override get message() {
+    return `the argument "${this.startTaskName}" is not the name of a task made while the task files loaded`;
+  }
+}
+
+export class TaskNameNotString extends Schema.TaggedError<TaskNameNotString>()(
+  "TaskNameNotString",
+  { ...TASK_ERROR_FIELDS, location: Schema.String, nameText: Schema.String },
+) {
+  public override get message() {
+    return `calls Task.make() with the name ${this.nameText}, which is not a string`;
+  }
+}
+
+export class TaskDefinitionNotGiven extends Schema.TaggedError<TaskDefinitionNotGiven>()(
+  "TaskDefinitionNotGiven",
+  { ...TASK_ERROR_FIELDS, given: Schema.String, location: Schema.String },
+) {
+  public override get message() {
+    return `calls Task.make() with ${this.given}, which is not a task definition`;
+  }
+}
+
+export class TaskListNotGiven extends Schema.TaggedError<TaskListNotGiven>()("TaskListNotGiven", {
+  ...TASK_ERROR_FIELDS,
+  calledFunction: Schema.Literals(["Task.all", "Task.allSettled"]),
+  given: Schema.String,
   location: Schema.UndefinedOr(Schema.String).pipe(
     Schema.withConstructorDefault(Effect.sync(findConstructingLocation)),
   ),
 }) {
   public override get message() {
-    const startedAt =
-      this.runningRootTaskLocation === undefined
-        ? ""
-        : `, started at ${relativeToWorkingDirectory(this.runningRootTaskLocation)}`;
-    return `Task.main() was called again with "${this.laterRootTaskName}" while it runs "${this.runningRootTaskName}"${startedAt}`;
+    return `${this.calledFunction}() was called with ${this.given}, which is not a list or record of tasks`;
   }
 }
 
-export class RunCalledDuringImport extends Schema.TaggedError<RunCalledDuringImport>()(
-  "RunCalledDuringImport",
-  {
-    ...TASK_ERROR_FIELDS,
-    ...UNATTRIBUTED_FAILURE_FIELDS,
-    location: Schema.UndefinedOr(Schema.String).pipe(
-      Schema.withConstructorDefault(Effect.sync(findConstructingLocation)),
-    ),
-  },
-) {
-  public override get message() {
-    return "Task.main() ran while Task imported this file";
-  }
-}
-
-export class RunCalledInTaskBody extends Schema.TaggedError<RunCalledInTaskBody>()(
-  "RunCalledInTaskBody",
-  {
-    ...TASK_ERROR_FIELDS,
-    rootTaskName: Schema.String,
-    location: Schema.UndefinedOr(Schema.String).pipe(
-      Schema.withConstructorDefault(Effect.sync(findConstructingLocation)),
-    ),
-  },
-) {
-  public override get message() {
-    return `Task.main() was called with "${this.rootTaskName}" inside a task body`;
-  }
-}
-
-export const TaskRequestRefusal = Schema.Union([TaskWaitsOnItself, TaskNotMadeAtTopLevel]);
+export const TaskRequestRefusal = Schema.Union([
+  TaskWaitsOnItself,
+  TaskNotMadeWhileLoading,
+  TaskMadeByAnotherCopy,
+]);
 
 export const TaskRequestFailure = Schema.Union([AwaitedTaskFailed, TaskRequestRefusal]);
 
@@ -188,34 +218,26 @@ export const AwaitedTasksFailure = Schema.Union([AwaitedTaskFailed, SettledTasks
 
 export const isAwaitedTasksFailure = Schema.is(AwaitedTasksFailure);
 
-export class RootTaskFileNotChecked extends Schema.TaggedError<RootTaskFileNotChecked>()(
-  "RootTaskFileNotChecked",
-  {
-    ...TASK_ERROR_FIELDS,
-    ...UNATTRIBUTED_FAILURE_FIELDS,
-    filePath: Schema.String,
-    cause: Schema.Defect(),
-  },
-) {
-  public get location() {
-    return this.filePath;
-  }
-  public override get message() {
-    return `could not check whether the root task file exists because ${describeCauseMessage(this.cause)}`;
-  }
-}
-
 export class RunCalledInStandaloneExecutable extends Schema.TaggedError<RunCalledInStandaloneExecutable>()(
   "RunCalledInStandaloneExecutable",
   { ...TASK_ERROR_FIELDS, ...UNATTRIBUTED_FAILURE_FIELDS, rootTaskName: Schema.String },
 ) {
   public override get message() {
-    return `Task.main() was called with "${this.rootTaskName}" inside a bun build --compile binary, which holds only its bundle, not the task source files ${TASK_PACKAGE.name} scans and re-imports in worker threads`;
+    return `${TASK_PACKAGE.name} can't run "${this.rootTaskName}" inside a bun build --compile binary, which holds only its bundle, not the task source files it imports again to run tasks`;
   }
 }
 
 export class RunCalledInBunWatchMode extends Schema.TaggedError<RunCalledInBunWatchMode>()(
   "RunCalledInBunWatchMode",
+  { ...TASK_ERROR_FIELDS, ...UNATTRIBUTED_FAILURE_FIELDS, flag: Schema.String },
+) {
+  public override get message() {
+    return `${TASK_PACKAGE.name} doesn't run under bun ${this.flag}`;
+  }
+}
+
+export class RunCalledInBunEvaluation extends Schema.TaggedError<RunCalledInBunEvaluation>()(
+  "RunCalledInBunEvaluation",
   { ...TASK_ERROR_FIELDS, ...UNATTRIBUTED_FAILURE_FIELDS, flag: Schema.String },
 ) {
   public override get message() {

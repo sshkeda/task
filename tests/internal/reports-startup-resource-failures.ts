@@ -1,13 +1,13 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
 import { Effect } from "effect";
 
 import { findMisprintedErrorLines } from "../shared/find-misprinted-error-lines.ts";
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
-export const removedRootFile = Task.make(
+export const removedRootFile = makeTest(
   "a root task file removed before run fails startup with the original filename",
   Effect.scoped(
     Effect.gen(function* () {
@@ -15,11 +15,8 @@ export const removedRootFile = Task.make(
         "main.ts": `import { unlinkSync } from "node:fs";
 import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("body ran"));
-if (import.meta.main) {
-  unlinkSync(import.meta.filename);
-  Task.main(main);
-}`,
+unlinkSync(import.meta.filename);
+export default Task.make({ name: "main", run: Effect.log("body ran") });`,
       });
       const failedRun = yield* runTaskProcess(project, "main.ts");
       expect(failedRun.exitCode).toBe(1);
@@ -32,22 +29,18 @@ if (import.meta.main) {
       expect(failedRun.standardError).not.toContain("PlatformError");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const inaccessibleWorkingDirectory = Task.make(
+export const inaccessibleWorkingDirectory = makeTest(
   "a chdir failure after task discovery reports the package directory before any body starts",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("body ran"));
-if (import.meta.main) {
-  const changeWorkingDirectory = process.chdir;
-  process.chdir = (directory) => changeWorkingDirectory(directory + "/missing-directory");
-  Task.main(main);
-}`,
+const changeWorkingDirectory = process.chdir;
+process.chdir = (directory) => changeWorkingDirectory(directory + "/missing-directory");
+export default Task.make({ name: "main", run: Effect.log("body ran") });`,
       });
       const failedRun = yield* runTaskProcess(project, "main.ts");
       expect(failedRun.exitCode).toBe(1);
@@ -58,10 +51,9 @@ if (import.meta.main) {
       expect(failedRun.standardError).not.toContain("body ran");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const packageSearch = Task.make(
+export const packageSearch = makeTest(
   "a package manifest symlink loop fails the package search with its path and cause",
   Effect.scoped(
     Effect.gen(function* () {
@@ -69,13 +61,10 @@ export const packageSearch = Task.make(
         "main.ts": `import { unlinkSync, symlinkSync } from "node:fs";
 import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("body ran"));
-if (import.meta.main) {
-  const packageJsonFilePath = import.meta.dir + "/package.json";
-  unlinkSync(packageJsonFilePath);
-  symlinkSync(packageJsonFilePath, packageJsonFilePath);
-  Task.main(main);
-}`,
+const packageJsonFilePath = import.meta.dir + "/package.json";
+unlinkSync(packageJsonFilePath);
+symlinkSync(packageJsonFilePath, packageJsonFilePath);
+export default Task.make({ name: "main", run: Effect.log("body ran") });`,
       });
       const failedRun = yield* runTaskProcess(project, "main.ts");
       expect(failedRun.exitCode).toBe(1);
@@ -88,5 +77,4 @@ if (import.meta.main) {
       expect(failedRun.standardError).not.toContain("PlatformError");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

@@ -1,4 +1,15 @@
-import { Clock, Deferred, Effect, Exit, Fiber, FiberSet, Match, Option, Schema } from "effect";
+import {
+  Cause,
+  Clock,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  FiberSet,
+  Match,
+  Option,
+  Schema,
+} from "effect";
 
 import {
   dieOnInvariantFailure,
@@ -8,6 +19,7 @@ import { TASK_TRACE_LABEL_PREFIX } from "../../../../../shared/names-from-packag
 import { printLine, printTaskLines } from "../../../../../shared/print-to-standard-error.ts";
 import { WorkerExited } from "../../../../../shared/process-errors.ts";
 import { TaskFiberResult } from "../../../../../shared/rpc.ts";
+import type { TaskMadeInBody } from "../../../../../shared/rpc.ts";
 import {
   TaskCleanupFailed,
   ServedTaskFailed,
@@ -28,6 +40,8 @@ const sendDependencyResultToWorker = Effect.fn("sendDependencyResultToWorker")(f
   requestDependencyTaskResult: (
     dependencyTaskName: string,
     requestingTaskName: string,
+    dependencyTaskFilePath: string | null,
+    dependencyTaskMadeInBody: typeof TaskMadeInBody.Type | null,
   ) => Effect.Effect<Schema.Json | undefined, typeof TaskRequestFailure.Type>,
   messageFromWorker: typeof FromWorker.cases.TaskFiberRequestedTask.Type,
 ) {
@@ -38,11 +52,22 @@ const sendDependencyResultToWorker = Effect.fn("sendDependencyResultToWorker")(f
   const requestingTaskRun = yield* Effect.fromNullishOr(
     taskRunsState.runsByTaskName.get(messageFromWorker.taskName),
   ).pipe(dieOnInvariantFailure("task requests", "a task that requests another task has a run"));
+  const awaitRequesterCleanup = Effect.raceFirst(
+    Deferred.await(requestingTaskRun.bodyCleanupStartedDeferred),
+    Deferred.await(requestingTaskRun.bodyFailedBeforeCleanupDeferred),
+  );
   const answer = yield* requestDependencyTaskResult(
     messageFromWorker.dependencyTaskName,
     messageFromWorker.taskName,
+    messageFromWorker.dependencyTaskFilePath,
+    messageFromWorker.dependencyTaskMadeInBody,
   ).pipe(
     Effect.exit,
+    Effect.tap((dependencyExit) => {
+      const dependencyWasStopped =
+        Exit.isFailure(dependencyExit) && Cause.hasInterruptsOnly(dependencyExit.cause);
+      return dependencyWasStopped ? awaitRequesterCleanup : Effect.void;
+    }),
     Effect.raceFirst(
       Deferred.await(requestingTaskRun.bodyFinishedDeferred).pipe(Effect.andThen(Effect.interrupt)),
     ),
@@ -313,18 +338,25 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
           taskRunsState.markServing(served.taskName);
           Deferred.doneUnsafe(taskRun.bodyOutcomeDeferred, Exit.succeed(served));
         }),
-      TaskFiberEnded: (ended) => {
-        taskRun.logMessages = [...ended.logs];
-        return Effect.exit(bodyEnding(ended.taskName, ended.result)).pipe(
+      TaskFiberEnded: (ended) =>
+        Effect.exit(bodyEnding(ended.taskName, ended.result)).pipe(
           Effect.flatMap((ending) => endTask(taskRunsState, messageFromWorker.taskName, ending)),
-        );
-      },
+        ),
     }),
   );
   taskRunsState.refreshBodyClocks(messageFromWorker.taskName, yield* Clock.currentTimeMillis);
 });
 
-export const handleWorkerEvent = Effect.fn("handleWorkerEvent")(function* (
+const printLoggedLine = (line: typeof FromWorker.cases.StandardErrorLineRequested.Type) =>
+  Effect.gen(function* () {
+    const traceFile = yield* TraceFile;
+    if (line.traceLogRecordJson !== undefined) {
+      traceFile.writeWorkerLogRecord(line.traceLogRecordJson);
+    }
+    return yield* printLine(line.logLevel, line.text);
+  });
+
+const handleWorkerEventInSpan = Effect.fn("handleWorkerEvent")(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   requestDependencyTaskResult: Parameters<typeof sendDependencyResultToWorker>[1],
   workerEvent: typeof WorkerEvent.Type,
@@ -343,14 +375,11 @@ export const handleWorkerEvent = Effect.fn("handleWorkerEvent")(function* (
     );
   }
   const messageFromWorker = workerEvent.message;
-  const traceFile = yield* TraceFile;
   if (FromWorker.guards.StandardErrorLineRequested(messageFromWorker)) {
-    if (messageFromWorker.traceLogRecordJson !== undefined) {
-      traceFile.writeWorkerLogRecord(messageFromWorker.traceLogRecordJson);
-    }
-    return yield* printLine(messageFromWorker.logLevel, messageFromWorker.text);
+    return yield* printLoggedLine(messageFromWorker);
   }
   if (FromWorker.guards.TraceLogRecordRequested(messageFromWorker)) {
+    const traceFile = yield* TraceFile;
     traceFile.writeWorkerLogRecord(messageFromWorker.traceLogRecordJson);
     return;
   }
@@ -359,4 +388,26 @@ export const handleWorkerEvent = Effect.fn("handleWorkerEvent")(function* (
     [`${TASK_TRACE_LABEL_PREFIX}.task`]: messageFromWorker.taskName,
   });
   yield* onMessageAboutTask(taskRunsState, requestDependencyTaskResult, messageFromWorker);
+  if (FromWorker.guards.TaskFiberStarted(messageFromWorker)) {
+    yield* WorkerPool.use((workerPool) => workerPool.recordBodyStartHandled(workerEvent.workerId));
+  }
+  if (FromWorker.guards.TaskFiberEnded(messageFromWorker)) {
+    const workerLoad = taskRunsState.readWorkerLoad(workerEvent.workerId);
+    if (workerLoad.unfinishedTaskCount === 0) {
+      yield* WorkerPool.use((workerPool) => workerPool.discardIsolatedWorker(workerEvent.workerId));
+    }
+  }
 });
+
+export const handleWorkerEvent = (
+  taskRunsState: Effect.Success<typeof makeTaskRunsState>,
+  requestDependencyTaskResult: Parameters<typeof sendDependencyResultToWorker>[1],
+  workerEvent: typeof WorkerEvent.Type,
+) => {
+  const isStandardErrorLine =
+    WorkerEvent.guards.MessageReceived(workerEvent) &&
+    FromWorker.guards.StandardErrorLineRequested(workerEvent.message);
+  return isStandardErrorLine
+    ? printLoggedLine(workerEvent.message)
+    : handleWorkerEventInSpan(taskRunsState, requestDependencyTaskResult, workerEvent);
+};

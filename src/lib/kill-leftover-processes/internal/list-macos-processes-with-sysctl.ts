@@ -272,16 +272,17 @@ const readKernelProcessTable = (taskName: string | null) =>
           KERN_PROC,
           KERN_PROC_ALL,
         ]).pipe(
-          Effect.map((kernelProcesses) =>
-            kernelProcesses.map((kernelProcess) => ({
-              ...kernelProcess,
-              sessionId:
-                kernelProcess.processId === KERNEL_PROCESS_ID
-                  ? KERNEL_PROCESS_ID
-                  : symbols.getsid(kernelProcess.processId),
-            })),
-          ),
-          Effect.mapError((cause) => new ProcessTableNotRead({ taskName, cause })),
+          Effect.mapBoth({
+            onSuccess: (kernelProcesses) =>
+              kernelProcesses.map((kernelProcess) => ({
+                ...kernelProcess,
+                sessionId:
+                  kernelProcess.processId === KERNEL_PROCESS_ID
+                    ? KERNEL_PROCESS_ID
+                    : symbols.getsid(kernelProcess.processId),
+              })),
+            onFailure: (cause) => new ProcessTableNotRead({ taskName, cause }),
+          }),
         ),
       ),
     ),

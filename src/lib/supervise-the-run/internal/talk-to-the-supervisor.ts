@@ -4,6 +4,12 @@ import { Rpc, RpcClient, RpcGroup, RpcSerialization } from "effect/rpc";
 import type { RpcClientError } from "effect/rpc";
 import { Socket } from "effect/socket";
 
+import {
+  TerminalCommand,
+  TerminalCommandEnded,
+  TerminalCommandId,
+} from "../../../shared/run-in-terminal.ts";
+
 export const ProcessGroupShared = Schema.Struct({
   processGroupId: Schema.Int,
   startedGroup: Schema.NullOr(
@@ -18,6 +24,8 @@ export const ProcessGroupShared = Schema.Struct({
 export const SupervisorRpcs = RpcGroup.make(
   Rpc.make("ReportReady"),
   Rpc.make("ShareProcessGroup", { payload: ProcessGroupShared }),
+  Rpc.make("RunInTerminal", { payload: TerminalCommand, success: TerminalCommandEnded }),
+  Rpc.make("AwaitTerminalCommandExit", { payload: TerminalCommandId }),
 );
 
 export const provideSupervisorRpcSerialization = Effect.provideService(
@@ -51,3 +59,12 @@ export const callTheSupervisor = (
     Effect.flatMap(call),
     Effect.catchTag("RpcClientError", () => Effect.void),
   );
+
+export const runInTheSupervisorTerminal = (command: typeof TerminalCommand.Type) =>
+  Deferred.await(supervisorConnectionDeferred).pipe(
+    Effect.flatMap((supervisor) => supervisor.RunInTerminal(command)),
+    Effect.catchTag("RpcClientError", (error) => Effect.die(error)),
+  );
+
+export const awaitTheSupervisorTerminalCommandExit = (command: typeof TerminalCommandId.Type) =>
+  callTheSupervisor((supervisor) => supervisor.AwaitTerminalCommandExit(command));

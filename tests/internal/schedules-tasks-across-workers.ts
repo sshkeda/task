@@ -1,10 +1,9 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
-import { Effect, FileSystem, Schema } from "effect";
+import { Effect, FileSystem } from "effect";
 
-import { read } from "../shared/access-files.ts";
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
@@ -54,16 +53,15 @@ const WAIT_FOR_EVERY_TASK_STARTED = `const waitForEveryTaskStarted = (taskName: 
   resumeWhenEveryTaskStarted();
 });`;
 
-export const sameWorker = Task.make(
+export const sameWorker = makeTest(
   "with one worker, a body that yields another task lets that task run on the same worker",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
-        "main.ts": `import { Effect } from "effect";
+        "main.ts": `import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
-export const dependency = Task.make("dep", Effect.succeed(1));
-export const main = Task.make("main", Effect.gen(function* () { yield* Effect.log(\`got \${yield* dependency}\`); }));
-if (import.meta.main) Task.main(main);`,
+export const dependency = Task.make({ name: "dep", output: Schema.Finite, run: Effect.succeed(1) });
+export default Task.make({ name: "main", run: Effect.gen(function* () { yield* Effect.log(\`got \${yield* dependency}\`); }) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       expect(ran.exitCode).toBe(0);
@@ -76,7 +74,6 @@ if (import.meta.main) Task.main(main);`,
       ).toEqual(["dep on 0", "main on 0"]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const readStartedWorkers = (
@@ -87,27 +84,26 @@ const readStartedWorkers = (
     "sshkeda_task.workers.started",
   );
 
-export const fibers = Task.make(
+export const fibers = makeTest(
   "with one worker, tasks run as fibers side by side on it, and a task waiting on another lets that task run on the same worker",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
-        "main.ts": `import { Deferred, Effect } from "effect";
+        "main.ts": `import { Deferred, Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
 const slowStarted = Deferred.makeUnsafe<void>();
 const otherStarted = Deferred.makeUnsafe<void>();
-export const slow = Task.make("slow", Effect.gen(function* () {
+export const slow = Task.make({ name: "slow", output: Schema.String, run: Effect.gen(function* () {
   yield* Deferred.succeed(slowStarted, undefined);
   yield* Deferred.await(otherStarted);
   return "slow done";
-}));
-export const other = Task.make("other", Effect.gen(function* () {
+}) });
+export const other = Task.make({ name: "other", run: Effect.gen(function* () {
   yield* Deferred.succeed(otherStarted, undefined);
   yield* Deferred.await(slowStarted);
-}));
-export const waiting = Task.make("waiting", Effect.gen(function* () { yield* Effect.log(\`got \${yield* slow}\`); }));
-export const main = Task.make("main", Task.all([waiting, other]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export const waiting = Task.make({ name: "waiting", run: Effect.gen(function* () { yield* Effect.log(\`got \${yield* slow}\`); }) });
+export default Task.make({ name: "main", run: Task.all([waiting, other]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       expect(ran.exitCode).toBe(0);
@@ -132,18 +128,16 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const started = Task.make(
+export const started = makeTest(
   "workers start on first assignment and parallel tasks fill the configured worker limit, sharing the worker of a task that only waits on them",
   Effect.scoped(
     Effect.gen(function* () {
       const single = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.void);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.void });`,
       });
       const alone = yield* runTaskProcess(single, "main.ts");
       const [aloneTrace] = yield* readTraces(yield* readTraceDirectory(single, alone));
@@ -158,10 +152,9 @@ if (import.meta.main) Task.main(main);`,
           WAIT_FOR_EVERY_TASK_STARTED,
           ...names.map(
             (name) =>
-              `export const ${name} = Task.make("${name}", waitForEveryTaskStarted("${name}", ${names.length}));`,
+              `export const ${name} = Task.make({ name: "${name}", run: waitForEveryTaskStarted("${name}", ${names.length}) });`,
           ),
-          `export const main = Task.make("main", Task.all([${names.join(", ")}]));`,
-          "if (import.meta.main) Task.main(main);",
+          `export default Task.make({ name: "main", run: Task.all([${names.join(", ")}]) });`,
         ].join("\n"),
       };
       const capped = yield* makeProject(files);
@@ -180,19 +173,18 @@ if (import.meta.main) Task.main(main);`,
       expect(readStartedWorkers(roomyTrace)).toBe(names.length);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const readyWhileMainThreadBusy = Task.make(
+export const readyWhileMainThreadBusy = makeTest(
   "a worker that reports ready while the main thread is still busy starting it runs its task",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
-        "main.ts": `import { Worker } from "node:worker_threads";
+        "main.ts": `import { Worker, isMainThread } from "node:worker_threads";
 import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("ran"));
-if (import.meta.main) {
+export default Task.make({ name: "main", run: Effect.log("ran") });
+if (isMainThread) {
   const listen = Worker.prototype.on;
   const busyWorkers = new WeakSet();
   Worker.prototype.on = function (...listening) {
@@ -203,7 +195,6 @@ if (import.meta.main) {
     }
     return worker;
   };
-  Task.main(main);
 }`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", {
@@ -213,21 +204,19 @@ if (import.meta.main) {
       expect(ran.exitCode).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const unusedDefinitions = Task.make(
+export const unusedDefinitions = makeTest(
   "unused task definitions do not start workers",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const unusedFirst = Task.make("unused-first", Effect.die("must not run"));
-export const unusedSecond = Task.make("unused-second", Effect.die("must not run"));
-export const unusedThird = Task.make("unused-third", Effect.die("must not run"));
-export const main = Task.make("main", Effect.void);
-if (import.meta.main) Task.main(main);`,
+export const unusedFirst = Task.make({ name: "unused-first", run: Effect.die("must not run") });
+export const unusedSecond = Task.make({ name: "unused-second", run: Effect.die("must not run") });
+export const unusedThird = Task.make({ name: "unused-third", run: Effect.die("must not run") });
+export default Task.make({ name: "main", run: Effect.void });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "4" });
       expect(ran.exitCode).toBe(0);
@@ -236,10 +225,9 @@ if (import.meta.main) Task.main(main);`,
       expect(readBodies(trace).map((body) => body.name)).toEqual(["main"]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const nestedDependencies = Task.make(
+export const nestedDependencies = makeTest(
   "parallel and nested dependencies complete on one worker on every run",
   Effect.scoped(
     Effect.gen(function* () {
@@ -247,12 +235,11 @@ export const nestedDependencies = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 ${WAIT_FOR_EVERY_TASK_STARTED}
-export const first = Task.make("first", waitForEveryTaskStarted("first", 3));
-export const second = Task.make("second", waitForEveryTaskStarted("second", 3));
-export const third = Task.make("third", waitForEveryTaskStarted("third", 3));
-export const inner = Task.make("inner", Task.all([first, second, third]).pipe(Effect.andThen(Effect.log("inner finished after its dependencies"))));
-export const main = Task.make("main", inner);
-if (import.meta.main) Task.main(main);`,
+export const first = Task.make({ name: "first", run: waitForEveryTaskStarted("first", 3) });
+export const second = Task.make({ name: "second", run: waitForEveryTaskStarted("second", 3) });
+export const third = Task.make({ name: "third", run: waitForEveryTaskStarted("third", 3) });
+export const inner = Task.make({ name: "inner", run: Task.all([first, second, third]).pipe(Effect.andThen(Effect.log("inner finished after its dependencies"))) });
+export default Task.make({ name: "main", run: inner });`,
       });
       yield* Effect.forEach(
         Array.from({ length: REPEATED_RUN_COUNT }),
@@ -267,80 +254,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-const MARK_IMPORT = (file: string) => `import { appendFileSync } from "node:fs";
-import { isMainThread, threadId } from "node:worker_threads";
-if (!isMainThread) appendFileSync("imports", \`\${threadId} ${file}\\n\`);`;
-
-const MARK_RAN = (name: string) =>
-  `Effect.sync(() => appendFileSync("ran", \`\${threadId} ${name}\\n\`))`;
-
-export const ownFile = Task.make(
-  "a worker imports only the files of the tasks it runs and what those files import, not the other task files in the run",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const project = yield* makeProject({
-        "server.ts": `${MARK_IMPORT("server.ts")}
-import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export const server = Task.make("server", ${MARK_RAN("server")}.pipe(Effect.andThen(Task.serve("up"))));`,
-        "leaf.ts": `${MARK_IMPORT("leaf.ts")}
-import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export const leaf = Task.make("leaf", ${MARK_RAN("leaf")});`,
-        "main.ts": `${MARK_IMPORT("main.ts")}
-import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-import { server } from "./server.ts";
-import { leaf } from "./leaf.ts";
-export const main = Task.make("main", ${MARK_RAN("main")}.pipe(Effect.andThen(server), Effect.andThen(leaf)));
-if (import.meta.main) Task.main(main);`,
-      });
-      const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "2" });
-      expect(ran.exitCode).toBe(0);
-      const readLines = (file: string) =>
-        read(`${project.directory}/${file}`).pipe(
-          Effect.map((text) =>
-            text
-              .trim()
-              .split("\n")
-              .map((line) => line.split(" ")),
-          ),
-          Effect.flatMap(
-            Schema.decodeUnknownEffect(Schema.Array(Schema.Tuple([Schema.String, Schema.String]))),
-          ),
-        );
-      const imports = yield* readLines("imports");
-      const ranOn = yield* readLines("ran");
-      const filesImportedByTask = new Map([
-        ["main", ["leaf.ts", "main.ts", "server.ts"]],
-        ["server", ["server.ts"]],
-        ["leaf", ["leaf.ts"]],
-      ]);
-      for (const thread of new Set(ranOn.map(([ranThread]) => ranThread))) {
-        const expected = new Set(
-          ranOn.flatMap(([ranThread, name]) =>
-            ranThread === thread ? (filesImportedByTask.get(name) ?? []) : [],
-          ),
-        );
-        expect(
-          imports
-            .filter(([importThread]) => importThread === thread)
-            .map(([, file]) => file)
-            .toSorted((left, right) => left.localeCompare(right)),
-        ).toEqual([...expected].toSorted((left, right) => left.localeCompare(right)));
-      }
-      expect(
-        imports.filter(([thread]) => !ranOn.some(([ranThread]) => ranThread === thread)),
-      ).toEqual([]);
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const oneWorker = Task.make(
+export const oneWorker = makeTest(
   "trace files live under ~/.sshkeda-task, and SSHKEDA_TASK_WORKERS=1 runs every body on worker 0",
   Effect.scoped(
     Effect.gen(function* () {
@@ -353,10 +269,9 @@ export const oneWorker = Task.make(
           WAIT_FOR_EVERY_TASK_STARTED,
           ...names.map(
             (name) =>
-              `export const ${name} = Task.make("${name}", waitForEveryTaskStarted("${name}", ${names.length}));`,
+              `export const ${name} = Task.make({ name: "${name}", run: waitForEveryTaskStarted("${name}", ${names.length}) });`,
           ),
-          `export const main = Task.make("main", Task.all([${names.join(", ")}]));`,
-          "if (import.meta.main) Task.main(main);",
+          `export default Task.make({ name: "main", run: Task.all([${names.join(", ")}]) });`,
         ].join("\n"),
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
@@ -369,36 +284,31 @@ export const oneWorker = Task.make(
       expect(bodies.filter((body) => body.worker !== 0)).toEqual([]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const workerArguments = Task.make(
-  "workers see the run's command-line arguments, so a task module that reads process.argv at top level loads in its worker",
+export const workerArguments = makeTest(
+  "workers see the one task name a run was started with as their only command-line argument, so a task module that reads process.argv at top level loads in its worker",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { isMainThread } from "node:worker_threads";
 import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-const target = process.argv[2];
-if (target === undefined) throw new Error("usage: bun main.ts <target>");
-export const deploy = Task.make("deploy", Effect.log(\`deploying \${target} from \${isMainThread ? "main thread" : "worker"} with \${JSON.stringify(process.argv.slice(2))}\`));
-if (import.meta.main) Task.main(deploy);`,
+const startedWith = JSON.stringify(process.argv.slice(2));
+export const deploy = Task.make({ name: "deploy", run: Effect.log(\`deploying from \${isMainThread ? "main thread" : "worker"} with \${startedWith}\`) });
+export const verify = Task.make({ name: "verify", run: Effect.log(\`verifying with \${startedWith}\`) });
+export default Task.all([deploy, verify]);`,
       });
-      const ran = yield* runTaskProcess(project, "main.ts", {}, project.directory, [
-        "staging",
-        "--dry-run",
-      ]);
-      expect(ran.exitCode).toBe(0);
-      expect(ran.standardError).toContain(
-        '[deploy] deploying staging from worker with ["staging","--dry-run"]',
-      );
+      const ran = yield* runTaskProcess(project, "main.ts", {}, project.directory, ["deploy"]);
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(ran.standardError).toContain('[deploy] deploying from worker with ["deploy"]\n');
+      expect(ran.standardError).not.toContain("verifying");
+      expect(ran.standardError).toMatch(/^passed: 1 task, [\d.]+s$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const idleWorkerFirst = Task.make(
+export const idleWorkerFirst = makeTest(
   "a task goes to a started worker no task occupies before a new worker starts",
   Effect.scoped(
     Effect.gen(function* () {
@@ -406,14 +316,13 @@ export const idleWorkerFirst = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 ${WAIT_FOR_EVERY_TASK_STARTED}
-export const first = Task.make("first", waitForEveryTaskStarted("first", 2));
-export const second = Task.make("second", waitForEveryTaskStarted("second", 2));
-export const third = Task.make("third", Effect.void);
-export const main = Task.make("main", Effect.gen(function* () {
+export const first = Task.make({ name: "first", run: waitForEveryTaskStarted("first", 2) });
+export const second = Task.make({ name: "second", run: waitForEveryTaskStarted("second", 2) });
+export const third = Task.make({ name: "third", run: Effect.void });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* Task.all([first, second]);
   yield* third;
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "4" });
       expect(ran.exitCode).toBe(0);
@@ -429,28 +338,26 @@ if (import.meta.main) Task.main(main);`,
       expect(workersByTaskName.get("main")).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const SETUP_LIMIT_LONGER_THAN_A_WORKER_START = "5 seconds";
 
 const BUSY_MILLISECONDS_LONGER_THAN_THE_SETUP_LIMIT = 7000;
 
-export const waitingForBusyWorkerCountsTowardNoLimit = Task.make(
+export const waitingForBusyWorkerCountsTowardNoLimit = makeTest(
   "a task queued on a worker that other tasks occupy says so after 2s, naming the first task and a count of the rest, and that wait counts toward neither its timeout nor the setup limit",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const blocker = Task.make("blocker", Effect.sync(() => {
+export const blocker = Task.make({ name: "blocker", run: Effect.sync(() => {
   const end = Date.now() + ${BUSY_MILLISECONDS_LONGER_THAN_THE_SETUP_LIMIT};
   while (Date.now() < end) {}
-}));
-export const quick = Task.make("quick", Effect.log("quick ran"), { timeout: "1 second", cleanup: "1 second" });
-export const queued = Task.make("queued", Effect.log("queued ran"), { timeout: "1 second", cleanup: "1 second" });
-export const main = Task.make("main", Task.all([blocker, quick, queued]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export const quick = Task.make({ name: "quick", run: Effect.log("quick ran"), timeout: "1 second", cleanup: "1 second" });
+export const queued = Task.make({ name: "queued", run: Effect.log("queued ran"), timeout: "1 second", cleanup: "1 second" });
+export default Task.make({ name: "main", run: Task.all([blocker, quick, queued]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", {
         SSHKEDA_TASK_WORKERS: "1",
@@ -465,27 +372,161 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toContain("[queued] queued ran");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const dependencyWaitersLeaveWorkerFree = Task.make(
+const SETUP_LIMIT_SHORTER_THAN_THE_COMMANDS = "2 seconds";
+
+const MAXIMUM_SECONDS_BEFORE_THE_COMMANDS_END = 15;
+
+export const commandWaitsCountTowardSetupLimit = makeTest(
+  "a task whose module hangs while loading on a worker where other tasks wait on commands fails at the setup limit, since that wait leaves the worker free",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "sleepers.ts": `import { Task } from "@sshkeda/task";
+export const first = Task.make({ name: "first", run: Task.exec("sleep", ["20"]) });
+export const second = Task.make({ name: "second", run: Task.exec("sleep", ["20"]) });
+export const third = Task.make({ name: "third", run: Task.exec("sleep", ["20"]) });`,
+        "hang.ts": `import { existsSync, writeFileSync } from "node:fs";
+import { isMainThread } from "node:worker_threads";
+import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+if (!isMainThread) {
+  if (existsSync("loaded-in-a-worker")) {
+    await new Promise(() => {});
+  }
+  writeFileSync("loaded-in-a-worker", "");
+}
+export const hang = Task.make({ name: "hang", run: Effect.void });`,
+        "main.ts": `import { Effect, Fiber } from "effect";
+import { Task } from "@sshkeda/task";
+import { first, second, third } from "./sleepers.ts";
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  const sleepers = yield* Effect.forkChild(Task.all([first, second, third]));
+  yield* Effect.sleep("1 second");
+  const { hang } = yield* Effect.promise(() => import("./hang.ts"));
+  yield* hang;
+  yield* Fiber.join(sleepers);
+}) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts", {
+        SSHKEDA_TASK_WORKERS: "2",
+        SSHKEDA_TASK_SETUP_LIMIT: SETUP_LIMIT_SHORTER_THAN_THE_COMMANDS,
+      });
+      expect(ran.exitCode).toBe(1);
+      expect(ran.standardError).not.toContain("[hang] waiting for worker");
+      expect(ran.standardError).toContain(
+        `[hang] error TaskSetupTimedOut: setup timed out after 2s while loading ${project.directory}/main.ts`,
+      );
+      const { seconds } =
+        /^failed: hang \(1 of 5 tasks\), 4 stopped, (?<seconds>[\d.]+)s$/mu.exec(ran.standardError)
+          ?.groups ?? {};
+      expect(Number(seconds)).toBeLessThan(MAXIMUM_SECONDS_BEFORE_THE_COMMANDS_END);
+    }),
+  ),
+);
+
+export const loopWhileLoadingFailsAtSetupLimit = makeTest(
+  "a task whose module loops forever while loading on a worker where another task waits to start fails at the setup limit, since no started body holds that worker",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "sleepers.ts": `import { Task } from "@sshkeda/task";
+export const first = Task.make({ name: "first", run: Task.exec("sleep", ["20"]) });
+export const second = Task.make({ name: "second", run: Task.exec("sleep", ["20"]) });
+export const third = Task.make({ name: "third", run: Task.exec("sleep", ["20"]) });`,
+        "loops.ts": `import { existsSync, writeFileSync } from "node:fs";
+import { isMainThread } from "node:worker_threads";
+import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+if (!isMainThread) {
+  if (existsSync("loaded-in-a-worker")) {
+    while (true) {}
+  }
+  writeFileSync("loaded-in-a-worker", "");
+}
+export const loops = Task.make({ name: "loops", run: Effect.void });`,
+        "main.ts": `import { Task } from "@sshkeda/task";
+import { first, second, third } from "./sleepers.ts";
+import { loops } from "./loops.ts";
+export default Task.make({ name: "main", run: Task.all([first, second, third, loops]) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts", {
+        SSHKEDA_TASK_WORKERS: "2",
+        SSHKEDA_TASK_SETUP_LIMIT: SETUP_LIMIT_SHORTER_THAN_THE_COMMANDS,
+      });
+      expect(ran.exitCode).toBe(1);
+      expect(ran.standardError).toContain("error TaskSetupTimedOut: setup timed out after 2s");
+      const { seconds } =
+        /^failed: .+, (?<seconds>[\d.]+)s$/mu.exec(ran.standardError)?.groups ?? {};
+      expect(Number(seconds)).toBeLessThan(MAXIMUM_SECONDS_BEFORE_THE_COMMANDS_END);
+    }),
+  ),
+);
+
+export const blockedWhileLoadingLeavesSetupLimit = makeTest(
+  "a task whose module awaits while loading on a worker that another task's body then blocks says so, and that block counts toward neither its setup limit nor its notice",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "heavy.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const heavy = Task.make({ name: "heavy", run: Effect.promise(() => new Promise((resolve) => setTimeout(resolve, 500))).pipe(
+  Effect.andThen(Effect.sync(() => {
+    const end = Date.now() + ${BUSY_MILLISECONDS_LONGER_THAN_THE_SETUP_LIMIT};
+    while (Date.now() < end) {}
+  })),
+) });`,
+        "awaits.ts": `import { isMainThread } from "node:worker_threads";
+import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+if (!isMainThread) {
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+}
+export const awaits = Task.make({ name: "awaits", run: Effect.log("awaits ran") });`,
+        "main.ts": `import { Effect, Fiber } from "effect";
+import { Task } from "@sshkeda/task";
+import { heavy } from "./heavy.ts";
+export const first = Task.make({ name: "first", run: Task.exec("sleep", ["3"]) });
+export const second = Task.make({ name: "second", run: Task.exec("sleep", ["3"]) });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  const others = yield* Effect.forkChild(Task.all([first, heavy, second]));
+  const { awaits } = yield* Effect.promise(() => import("./awaits.ts"));
+  yield* awaits;
+  yield* Fiber.join(others);
+}) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts", {
+        SSHKEDA_TASK_WORKERS: "2",
+        SSHKEDA_TASK_SETUP_LIMIT: SETUP_LIMIT_LONGER_THAN_A_WORKER_START,
+      });
+      expect(ran.standardError).toContain(
+        '[awaits] waiting for worker 1, which is running "heavy"',
+      );
+      expect(ran.standardError).not.toContain("TimedOut");
+      expect(ran.standardError).toContain("[awaits] awaits ran");
+      expect(ran.exitCode).toBe(0);
+    }),
+  ),
+);
+
+export const dependencyWaitersLeaveWorkerFree = makeTest(
   "a worker whose tasks only wait on other tasks counts as free, so a new task goes there instead of to a blocked worker",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const blocker = Task.make("blocker", Effect.sync(() => {
+export const blocker = Task.make({ name: "blocker", run: Effect.sync(() => {
   const end = Date.now() + 4000;
   while (Date.now() < end) {}
-}));
-export const quick = Task.make("quick", Effect.log("quick ran"), { timeout: "2 seconds", cleanup: "1 second" });
-export const middle = Task.make("middle", Effect.gen(function* () {
+}) });
+export const quick = Task.make({ name: "quick", run: Effect.log("quick ran"), timeout: "2 seconds", cleanup: "1 second" });
+export const middle = Task.make({ name: "middle", run: Effect.gen(function* () {
   yield* Effect.sleep("300 millis");
   return yield* quick;
-}));
-export const main = Task.make("main", Task.all([blocker, middle]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export default Task.make({ name: "main", run: Task.all([blocker, middle]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "2" });
       expect(ran.standardError).not.toContain("TaskTimedOut");
@@ -493,20 +534,18 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toContain("[quick] quick ran");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const chainReusesWorker = Task.make(
+export const chainReusesWorker = makeTest(
   "in a chain where each task only waits on the next, every task runs on the first task's worker",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const third = Task.make("third", Effect.void);
-export const second = Task.make("second", Effect.asVoid(third));
-export const main = Task.make("main", Effect.asVoid(second));
-if (import.meta.main) Task.main(main);`,
+export const third = Task.make({ name: "third", run: Effect.void });
+export const second = Task.make({ name: "second", run: Effect.asVoid(third) });
+export default Task.make({ name: "main", run: Effect.asVoid(second) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "4" });
       expect(ran.exitCode).toBe(0);
@@ -519,23 +558,21 @@ if (import.meta.main) Task.main(main);`,
       ).toEqual(["main on 0", "second on 0", "third on 0"]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const servingWorkerSharedLast = Task.make(
+export const servingWorkerSharedLast = makeTest(
   "a new task starts an unused worker before sharing the worker of a serving task",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const server = Task.make("server", Task.serve("up"));
-export const after = Task.make("after", Effect.void);
-export const main = Task.make("main", Effect.gen(function* () {
+export const server = Task.make({ name: "server", run: Task.serve("up") });
+export const after = Task.make({ name: "after", run: Effect.void });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* server;
   yield* after;
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "4" });
       expect(ran.exitCode).toBe(0);
@@ -547,10 +584,9 @@ if (import.meta.main) Task.main(main);`,
       ).toEqual(["after on 1", "main on 0", "server on 0"]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const scale = Task.make(
+export const scale = makeTest(
   "2,000 tasks run cold on two workers",
   Effect.scoped(
     Effect.gen(function* () {
@@ -561,15 +597,14 @@ export const scale = Task.make(
           'import { Task } from "@sshkeda/task";',
           ...names.map(
             (name, index) =>
-              `export const ${name} = Task.make("${name}", Effect.succeed(${index}));`,
+              `export const ${name} = Task.make({ name: "${name}", run: Effect.succeed(${index}) });`,
           ),
-          `export const all = Task.make("all", Effect.all([${names.join(", ")}], { concurrency: "unbounded" }));`,
-          "if (import.meta.main) Task.main(all);",
+          `export default Task.make({ name: "all", run: Effect.all([${names.join(", ")}], { concurrency: "unbounded" }) });`,
         ].join("\n"),
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "2" });
       expect(ran.standardError).toMatch(/^passed: 2001 tasks, [\d.]+s$/mu);
     }),
   ),
-  { timeout: "2 minutes", cleanup: "5 seconds" },
+  "2 minutes",
 );

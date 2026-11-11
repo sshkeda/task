@@ -1,41 +1,39 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
 import { Effect, FileSystem } from "effect";
 
 import { findMisprintedErrorLines } from "../shared/find-misprinted-error-lines.ts";
 import { REPOSITORY_DIRECTORY } from "../shared/find-repository-directory.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeScratchDirectory } from "../shared/make-temporary-directories.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
-export const duplicate = Task.make(
+export const duplicate = makeTest(
   "two tasks with one name are refused",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const a = Task.make("same", Effect.void);
-export const b = Task.make("same", Effect.void);
-if (import.meta.main) Task.main(a);`,
+export default Task.make({ name: "same", run: Effect.void });
+export const b = Task.make({ name: "same", run: Effect.void });`,
       });
 
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        'main.ts:3: error TaskMadeMoreThanOnce: makes the task "same", which 2 Task.make() calls make\n',
+        'main.ts:3:21: error TaskMadeMoreThanOnce: makes the task "same", which 2 Task.make() calls make\n',
       );
       expect(ran.standardError).toContain(
-        'main.ts:4: error TaskMadeMoreThanOnce: makes the task "same", which 2 Task.make() calls make\n',
+        'main.ts:4:23: error TaskMadeMoreThanOnce: makes the task "same", which 2 Task.make() calls make\n',
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const importCycle = Task.make(
-  "task files that import each other are refused before anything runs, with one worker or many",
+export const importCycle = makeTest(
+  "task files that import each other run, with one worker or many",
   Effect.forEach(
     ["1", "4"],
     (workerCount) =>
@@ -45,47 +43,43 @@ export const importCycle = Task.make(
             "build.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { lint } from "./main.ts";
-export const build = Task.make("build", Effect.gen(function* () { yield* lint; yield* Effect.log("build ran"); }));`,
+export const build = Task.make({ name: "build", run: Effect.gen(function* () { yield* lint; yield* Effect.log("build ran"); }) });`,
             "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { build } from "./build.ts";
-export const lint = Task.make("lint", Effect.log("lint ran"));
-export const busy = Task.make("busy", Effect.sleep("1 second"));
-export const main = Task.make("main", Task.all([busy, build, lint]));
-if (import.meta.main) Task.main(main);`,
+export const lint = Task.make({ name: "lint", run: Effect.log("lint ran") });
+export const busy = Task.make({ name: "busy", run: Effect.sleep("1 second") });
+export default Task.make({ name: "main", run: Task.all([busy, build, lint]) });`,
           });
 
           const ran = yield* runTaskProcess(project, "main.ts", {
             SSHKEDA_TASK_WORKERS: workerCount,
           });
-          expect(ran.exitCode, `${workerCount}\n${ran.standardError}`).toBe(1);
-          expect(ran.standardError, workerCount).toContain(
-            "main.ts: error TaskFileImportsItself: imports build.ts, which imports main.ts; a worker imports only the file of the task it runs, so a task file in an import cycle would load in a different order there than when Task.main() loaded it\n",
-          );
-          expect(ran.standardError, workerCount).not.toContain("] started");
+          expect(ran.exitCode, `${workerCount}\n${ran.standardError}`).toBe(0);
+          expect(ran.standardError, workerCount).toContain("[lint] lint ran");
+          expect(ran.standardError, workerCount).toContain("[build] build ran");
         }),
       ),
     { concurrency: "unbounded", discard: true },
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const unexported = Task.make(
+export const unexported = makeTest(
   "tasks that are not exported run, including one made in a module that is only imported transitively",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "steps.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-const hiddenStep = Task.make("hidden-step", Effect.log("hidden step ran"));
+const hiddenStep = Task.make({ name: "hidden-step", run: Effect.log("hidden step ran") });
 export const steps = Task.all([hiddenStep]);`,
         "group.ts": `export { steps } from "./steps.ts";`,
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { steps } from "./group.ts";
-const helper = Task.make("helper", Effect.log("helper ran"));
-const hidden = Task.make("hidden", Effect.all([helper, steps], { discard: true }));
-if (import.meta.main) Task.main(hidden);`,
+const helper = Task.make({ name: "helper", run: Effect.log("helper ran") });
+const hidden = Task.make({ name: "hidden", run: Effect.all([helper, steps], { discard: true }) });
+export default hidden;`,
       });
 
       const ran = yield* runTaskProcess(project, "main.ts");
@@ -94,304 +88,354 @@ if (import.meta.main) Task.main(hidden);`,
       expect(ran.exitCode).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const duplicateWithoutExports = Task.make(
+export const duplicateWithoutExports = makeTest(
   "two unexported tasks with one name in different modules are refused",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "other.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-Task.make("same", Effect.void);`,
+Task.make({ name: "same", run: Effect.void });`,
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import "./other.ts";
-const same = Task.make("same", Effect.log("body ran"));
-if (import.meta.main) Task.main(same);`,
+const same = Task.make({ name: "same", run: Effect.log("body ran") });
+export default same;`,
       });
 
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        'other.ts:3: error TaskMadeMoreThanOnce: makes the task "same", which 2 Task.make() calls make\n',
+        'other.ts:3:6: error TaskMadeMoreThanOnce: makes the task "same", which 2 Task.make() calls make\n',
       );
       expect(ran.standardError).toContain(
-        'main.ts:4: error TaskMadeMoreThanOnce: makes the task "same", which 2 Task.make() calls make\n',
+        'main.ts:4:19: error TaskMadeMoreThanOnce: makes the task "same", which 2 Task.make() calls make\n',
       );
       expect(ran.standardError).not.toContain("body ran");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const nestedWithoutExports = Task.make(
-  "an unexported task made inside a function is refused",
+export const madeAnywhere = makeTest(
+  "tasks made in a function, a loop, a dynamically imported file or with a computed name run",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
-        "main.ts": `import { Effect } from "effect";
+        "checks.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
+export const makeChecks = (names: readonly string[]) =>
+  names.map((name) => Task.make({ name, run: Effect.log(\`\${name} ran\`) }));`,
+        "loaded.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const loaded = Task.make({ name: "loaded", run: Effect.log("loaded ran") });`,
+        "main.ts": `import { Effect } from "effect";
+import * as taskLibrary from "@sshkeda/task";
+import { makeChecks } from "./checks.ts";
+const where = "./loaded.ts";
+const { loaded } = await import(where);
 function make() {
-  return Task.make("inner", Effect.log("inner ran"));
+  return taskLibrary.Task.make({ name: "inner", run: Effect.log("inner ran") });
 }
-const inner = make();
-const main = Task.make("main", inner);
-if (import.meta.main) Task.main(main);`,
+export default taskLibrary.Task.make({ name: "main", run: taskLibrary.Task.all([make(), loaded, ...makeChecks(["lint", "test"])]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toMatch(
-        /^main\.ts:4: error TaskCalledBelowTopLevel: calls Task\.make\(\) below the top level of its module$/mu,
-      );
-      expect(ran.standardError).not.toContain("inner ran");
+      for (const line of [
+        "[inner] inner ran",
+        "[loaded] loaded ran",
+        "[lint] lint ran",
+        "[test] test ran",
+      ]) {
+        expect(ran.standardError).toContain(line);
+      }
+      expect(ran.exitCode, ran.standardError).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const nested = Task.make(
-  "a task made below the top level of its module is refused",
+export const madeTwiceByPackage = makeTest(
+  "a task that a package function makes twice is refused at each caller",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
-        "main.ts": `import { Effect } from "effect";
+        "node_modules/checks/package.json":
+          '{ "name": "checks", "type": "module", "exports": "./index.ts" }',
+        "node_modules/checks/index.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-const make = () => Task.make("inner", Effect.void);
-export const inner = make();
-export const main = Task.make("main", inner);
-if (import.meta.main) Task.main(main);`,
-      });
-      const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toMatch(
-        /^main\.ts:3: error TaskCalledBelowTopLevel: calls Task\.make\(\) below the top level of its module\nfailed: 0 tasks, [\d.]+s$/mu,
-      );
-      expect(ran.standardError).not.toContain("task refused to run");
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const computed = Task.make(
-  "a task whose name is not a literal is refused",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const project = yield* makeProject({
-        "main.ts": `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-const name = "main";
-export const main = Task.make(name, Effect.void);
-if (import.meta.main) Task.main(main);`,
+export const check = (rules: readonly string[]) => Task.make({ name: "check", run: Effect.log(rules.join(", ")) });`,
+        "main.ts": `import { Task } from "@sshkeda/task";
+import { check } from "checks";
+const first = check(["taste"]);
+const second = check(["taste", "team"]);
+export default first;`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        "main.ts:4: error TaskNameComputed: calls Task.make() with the name name, which is computed",
+        'main.ts:3:15: error TaskMadeMoreThanOnce: makes the task "check", which 2 Task.make() calls make\n',
       );
+      expect(ran.standardError).toContain(
+        'main.ts:4:16: error TaskMadeMoreThanOnce: makes the task "check", which 2 Task.make() calls make\n',
+      );
+      expect(ran.standardError).not.toContain("taste");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const empty = Task.make(
-  "a task whose name is empty is refused",
+export const badNames = makeTest(
+  "a task whose name is empty or not a string is refused",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("", Effect.void);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "", run: Effect.log("body ran") });
+export const numbered = Task.make({ name: 42, run: Effect.void });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        "main.ts:3: error TaskNameEmpty: calls Task.make() with an empty name",
+        "main.ts:3:21: error TaskNameEmpty: calls Task.make() with an empty name\n",
       );
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const dynamic = Task.make(
-  "an import of a computed path is refused, since the code key could not follow it",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const project = yield* makeProject({
-        "main.ts": `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-const where = "./other.ts";
-export const main = Task.make("main", Effect.promise(() => import(where)));
-if (import.meta.main) Task.main(main);`,
-      });
-      const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.standardError).toContain(
-        "error ModuleLoadedByComputedPath: calls import(where), which has no literal path",
+        "main.ts:4:30: error TaskNameNotString: calls Task.make() with the name 42, which is not a string\n",
       );
+      expect(ran.standardError).not.toContain("body ran");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const typeOnlyEmptyImports = Task.make(
-  "type-only imports and exports with empty specifier lists are not followed as side-effect imports",
+export const blank = makeTest(
+  "a task whose name is only whitespace is refused",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
-import type {} from "package-that-is-not-installed";
-export type {} from "another-package-that-is-not-installed";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("body ran"));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "  ", run: Effect.void });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.standardError).not.toContain("cannot resolve import");
-      expect(ran.standardError).toContain("[main] body ran");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toContain(
+        "main.ts:3:21: error TaskNameBlank: calls Task.make() with a name of only whitespace\n",
+      );
+    }),
+  ),
+);
+
+export const multiline = makeTest(
+  "a task whose name has a line break is refused, since it would break every line the task prints",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "build\\ntest", run: Effect.log("ran") });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toContain(
+        String.raw`main.ts:3:21: error TaskNameMultiline: calls Task.make() with the name "build\ntest", which has a line break`,
+      );
+      expect(ran.standardError).not.toContain("] ran");
+    }),
+  ),
+);
+
+export const madeInBody = makeTest(
+  "a task made inside another task's body runs when that body awaits it",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  yield* Task.make({ name: "late", run: Effect.log("late ran") });
+}) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.standardError).toContain("[late] late ran");
+      expect(ran.standardError).toMatch(/^passed: 2 tasks, [\d.]+s$/mu);
       expect(ran.exitCode).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const unfound = Task.make(
-  "missing dependencies name the requesting task and identify the missing task",
+const projectLoadingLateFile = (lateTaskOptions: string) =>
+  makeProject({
+    "late.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const late = Task.make({ name: "late", run: Effect.log("late ran")${lateTaskOptions} });`,
+    "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  const { late } = yield* Effect.promise(() => import("./late.ts"));
+  yield* late;
+}) });`,
+  });
+
+export const madeByLateImport = makeTest(
+  "a task in a file that a task body loads with import() runs when that body awaits it",
   Effect.scoped(
     Effect.gen(function* () {
-      const project = yield* makeProject({
-        "make.ts": 'import { Task } from "@sshkeda/task";\nexport const make = Task.make;\n',
-        "main.ts": `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-import { make } from "./make.ts";
-export const hidden = make("hidden", Effect.void);
-export const main = Task.make("main", hidden);
-if (import.meta.main) Task.main(main);`,
-      });
+      const project = yield* projectLoadingLateFile("");
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.standardError).toContain("[late] late ran");
+      expect(ran.standardError).toMatch(/^passed: 2 tasks, [\d.]+s$/mu);
+      expect(ran.exitCode).toBe(0);
+    }),
+  ),
+);
+
+export const brokenByLateImport = makeTest(
+  "a task with an invalid timeout in a file that a task body loads with import() is refused when that body awaits it",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* projectLoadingLateFile(", timeout: -1");
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        '[main] error TaskNotMadeAtTopLevel: the module scan found no top-level Task.make("hidden") call',
+        "late: error TaskTimeoutInvalid: has the timeout -1, which is not a duration above 0\n",
       );
-      expect(findMisprintedErrorLines(ran.standardError)).toEqual([]);
-      expect(ran.standardError).not.toContain("[hidden] error:");
-      expect(ran.standardError).not.toContain("TypeError");
+      expect(ran.standardError).not.toContain("late ran");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const copied = Task.make(
-  "a root task made again below the top level is refused along with the other refusals",
+export const sameNameInTwoLateFiles = makeTest(
+  "a second task with a name another file's task already ran under is refused when a body loads it with import() and awaits it, instead of being skipped",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "first.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const check = Task.make({ name: "check", run: Effect.log("first ran") });`,
+        "second.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const check = Task.make({ name: "check", run: Effect.log("second ran") });`,
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  const first = yield* Effect.promise(() => import("./first.ts"));
+  yield* first.check;
+  const second = yield* Effect.promise(() => import("./second.ts"));
+  yield* second.check;
+}) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toContain("[check] first ran\n");
+      expect(ran.standardError).toContain(
+        'first.ts:3:27: error TaskMadeMoreThanOnce: makes the task "check", which 2 Task.make() calls make\n',
+      );
+      expect(ran.standardError).toContain(
+        'second.ts:3:27: error TaskMadeMoreThanOnce: makes the task "check", which 2 Task.make() calls make\n',
+      );
+      expect(ran.standardError).not.toContain("second ran");
+      expect(ran.standardError).not.toMatch(/^passed: /mu);
+    }),
+  ),
+);
+
+export const sameNameInOneSettledList = makeTest(
+  "two tasks with one name from two files that an isolated task loads with import() and passes to Task.allSettled() are refused, instead of the list keeping only the last",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "first.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const check = Task.make({ name: "check", run: Effect.fail({ _tag: "FirstFailed" }) });`,
+        "second.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const check = Task.make({ name: "check", run: Effect.log("second ran") });`,
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", isolated: true, run: Effect.gen(function* () {
+  const first = yield* Effect.promise(() => import("./first.ts"));
+  const second = yield* Effect.promise(() => import("./second.ts"));
+  yield* Task.allSettled([first.check, second.check]);
+}) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toContain(
+        'error TaskMadeMoreThanOnce: makes the task "check", which 2 Task.make() calls make\n',
+      );
+      expect(ran.standardError).not.toMatch(/^passed: /mu);
+    }),
+  ),
+);
+
+export const definitionNotGiven = makeTest(
+  "Task.make() given a string where its definition belongs is refused with TaskDefinitionNotGiven at that call, naming what it was given, whether that task is the default export or one it uses",
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const defaultExport of [
+        'Task.make("check")',
+        'Task.make({ name: "main", run: Task.make("check") })',
+      ]) {
+        const project = yield* makeProject({
+          "main.ts": `import { Task } from "@sshkeda/task";
+export default ${defaultExport};`,
+        });
+        const ran = yield* runTaskProcess(project, "main.ts");
+        expect(ran.exitCode, ran.standardError).toBe(1);
+        expect(ran.standardError).toMatch(
+          /^main\.ts:2:\d+: error TaskDefinitionNotGiven: calls Task\.make\(\) with "check", which is not a task definition$/mu,
+        );
+        expect(ran.standardError).not.toContain("InternalInvariantBroken");
+        expect(ran.standardError).not.toMatch(/\] started$/mu);
+      }
+    }),
+  ),
+);
+
+export const defaultTaskNameNotString = makeTest(
+  "a default export whose task name is not a string is refused with TaskNameNotString at its Task.make() call, and no task starts",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-const where = "./other.ts";
-export const load = Task.make("load", Effect.promise(() => import(where)));
-export const main = Task.make("main", Effect.log("body ran"));
-if (import.meta.main) Task.main(Task.make("main", Effect.log("body ran"), { cleanup: "1 second" }));`,
+export default Task.make({ name: 42, run: Effect.log("body ran") });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.standardError).toBe(
+        "main.ts:3:21: error TaskNameNotString: calls Task.make() with the name 42, which is not a string",
+      );
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        "error ModuleLoadedByComputedPath: calls import(where), which has no literal path",
-      );
-      expect(ran.standardError).toContain(
-        "main.ts:6: error TaskCalledBelowTopLevel: calls Task.make() below the top level of its module\n",
-      );
-      expect(ran.standardError).toContain(
-        'main.ts: error TaskMadeAgainInThread: Task.make() made "main" 2 times in this thread, but this file has its only top-level Task.make() call\n',
-      );
-      expect(findMisprintedErrorLines(ran.standardError)).toEqual([]);
-      expect(ran.standardError).not.toContain("body ran");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const misspelledSharedOptions = Task.make(
-  "a misspelled option in a shared object and the removed cache options are refused instead of dropped",
+export const misspelledSharedOptions = makeTest(
+  "misspelled options in shared objects are refused instead of dropped",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 const shared = { timeout: "1 minute", cleanup: "5 seconds", cach: true } as const;
-const sharedCache = { cache: true, inputs: ["src/**"], outputs: ["dist/**"], env: ["FOO"] } as const;
-export const built = Task.make("built", Effect.log("built ran"), sharedCache);
-export const main = Task.make("main", Effect.log("body ran"), shared);
-if (import.meta.main) Task.main(main);`,
+const misspelledTwice = { timout: "1 minute", cleenup: "5 seconds" } as const;
+export const built = Task.make({ name: "built", run: Effect.log("built ran"), ...misspelledTwice });
+export default Task.make({ name: "main", run: Effect.log("body ran"), ...shared });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        'main.ts:6: error TaskOptionsUnknown: task "main" has the option cach outside the task options (timeout, cleanup)\n',
+        'main.ts:6:21: error TaskOptionsUnknown: task "main" has the option cach outside the task options (timeout, cleanup)\n',
       );
       expect(ran.standardError).toContain(
-        'main.ts:5: error TaskOptionsUnknown: task "built" has the options cache, inputs, outputs, env outside the task options (timeout, cleanup)\n',
+        'main.ts:5:27: error TaskOptionsUnknown: task "built" has the options timout, cleenup outside the task options (timeout, cleanup)\n',
       );
       expect(ran.standardError).not.toContain("body ran");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const defaultExported = Task.make(
-  "a task made by a top-level export default runs",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const project = yield* makeProject({
-        "dependency.ts": `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export default Task.make("dependency", Effect.log("dependency ran"));`,
-        "main.ts": `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-import dependency from "./dependency.ts";
-const main = Task.make("main", dependency);
-if (import.meta.main) Task.main(main);`,
-      });
-      const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.standardError).toContain("[dependency] dependency ran");
-      expect(ran.exitCode).toBe(0);
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const typedTopLevelTasks = Task.make(
-  "TypeScript assertions around a top-level task keep its declaration visible",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const project = yield* makeProject({
-        "definition.ts": `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export const satisfied = Task.make("satisfied", Effect.log("typed task ran")) satisfies Task.Task<void>;
-export const asserted = Task.make("asserted", Effect.log("typed task ran")) as Task.Task<void>;
-export const angled = <Task.Task<void>>Task.make("angled", Effect.log("typed task ran"));
-export const nonnull = Task.make("nonnull", Effect.log("typed task ran"))!;
-export const piped = (Task.make("piped", Effect.log("typed task ran")) satisfies Task.Task<void>).pipe(Effect.asVoid) satisfies Effect.Effect<void>;
-export default Task.make("default", Effect.log("typed task ran")) satisfies Task.Task<void>;`,
-        "main.ts": `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-import defaultTask, { satisfied, asserted, angled, nonnull, piped } from "./definition.ts";
-export const main = Task.make("root", Effect.all([satisfied, asserted, angled, nonnull, piped, defaultTask], { discard: true })) satisfies Task.Task<void>;
-if (import.meta.main) Task.main(main);`,
-      });
-      const ran = yield* runTaskProcess(project, "main.ts");
-      for (const name of ["satisfied", "asserted", "angled", "nonnull", "piped", "default"]) {
-        expect(ran.standardError).toContain(`[${name}] typed task ran`);
-      }
-      expect(ran.exitCode, ran.standardError).toBe(0);
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const secondTaskPackageCopy = Task.make(
-  "a task made with a second copy of the task package than the one calling Task.main() is refused",
+export const secondTaskPackageCopy = makeTest(
+  "a task made with a second copy of the task package than the one that starts the run is refused",
   Effect.scoped(
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -403,11 +447,10 @@ export const secondTaskPackageCopy = Task.make(
       const project = yield* makeProject({
         "library/tasks.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const other = Task.make("other", Effect.log("other ran"));`,
+export const other = Task.make({ name: "other", run: Effect.log("other ran") });`,
         "main.ts": `import { Task } from "@sshkeda/task";
 import { other } from "./library/tasks.ts";
-const main = Task.make("main", other);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: other });`,
       });
       yield* fileSystem.makeDirectory(`${project.directory}/library/node_modules/@sshkeda`, {
         recursive: true,
@@ -419,25 +462,23 @@ if (import.meta.main) Task.main(main);`,
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        'library/tasks.ts: error TaskNotMadeByImport: importing this file did not make task "other" in the copy of @sshkeda/task that calls Task.main()\n',
+        '[main] error TaskMadeByAnotherCopy: the task "other" was made by another copy of @sshkeda/task, so this copy can\'t run it\n',
       );
       expect(ran.standardError).not.toContain("other ran");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const piped = Task.make(
+export const piped = makeTest(
   "piping a task makes an ordinary Effect that awaits the task, while the task keeps its options",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-const main = Task.make("main", Effect.log("main ran"), { timeout: "1 minute", cleanup: "1 second" });
+const main = Task.make({ name: "main", run: Effect.log("main ran"), timeout: "1 minute", cleanup: "1 second" });
 const afterMain = main.pipe(Effect.andThen(Effect.log("after main")));
-const root = Task.make("root", afterMain);
-if (import.meta.main) Task.main(root);`,
+export default Task.make({ name: "root", run: afterMain });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.standardError).toContain("[main] main ran");
@@ -445,64 +486,35 @@ if (import.meta.main) Task.main(root);`,
       expect(ran.exitCode).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const grouped = Task.make(
+export const grouped = makeTest(
   "an exported Effect that is not a task runs as part of the task that uses it",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const a = Task.make("a", Effect.log("a ran"));
+export const a = Task.make({ name: "a", run: Effect.log("a ran") });
 export const tests = Effect.all([a], { discard: true });
-export const main = Task.make("main", tests);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: tests });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.standardError).toContain("[a] a ran");
       expect(ran.exitCode).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const namespaced = Task.make(
-  "a task made through a namespace import below the top level of its module is refused",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const project = yield* makeProject({
-        "main.ts": `import { Effect } from "effect";
-import * as taskLibrary from "@sshkeda/task";
-const make = () => taskLibrary.Task.make("inner", Effect.void);
-export const inner = make();
-export const main = taskLibrary.Task.make("main", inner);
-if (import.meta.main) taskLibrary.Task.main(main);`,
-      });
-      const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        "main.ts:3: error TaskCalledBelowTopLevel: calls Task.make() below the top level of its module",
-      );
-      expect(ran.standardError).not.toContain("not made by a top-level Task.make() call");
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const invalidRootDurations = Task.make(
+export const invalidRootDurations = makeTest(
   "invalid root task durations are collected as definition violations instead of throwing during import",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("body ran"), { timeout: "5 secnds", cleanup: "soon" });
-if (import.meta.main) {
-  console.error("definitions loaded");
-  Task.main(main);
-}`,
+export default Task.make({ name: "main", run: Effect.log("body ran"), timeout: "5 secnds", cleanup: "soon" });
+console.error("definitions loaded");`,
       });
       const failedRun = yield* runTaskProcess(project, "main.ts");
       expect(failedRun.exitCode).toBe(1);
@@ -514,55 +526,50 @@ if (import.meta.main) {
         `main: error TaskCleanupInvalid: has the cleanup 'soon', which is not a duration of 0 or more`,
       );
       expect(findMisprintedErrorLines(failedRun.standardError)).toEqual([]);
-      expect(failedRun.standardError).toMatch(/^failed: 0 tasks, [\d.]+s$/mu);
-      expect(failedRun.standardError).not.toContain("not made by a top-level Task.make() call");
+      expect(failedRun.standardError).toMatch(/^failed: 0 of 0 tasks, [\d.]+s$/mu);
       expect(failedRun.standardError).not.toContain("body ran");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const invalidImportedDuration = Task.make(
+export const invalidImportedDuration = makeTest(
   "an imported task with an invalid duration is refused before the root task starts",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "dependency.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const dependency = Task.make("dependency", Effect.void, { timeout: "invalid", cleanup: "1 second" });`,
+export const dependency = Task.make({ name: "dependency", run: Effect.void, timeout: "invalid", cleanup: "1 second" });`,
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { dependency } from "./dependency.ts";
-export const main = Task.make("main", Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* Effect.log("body ran");
   yield* dependency;
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const failedRun = yield* runTaskProcess(project, "main.ts");
       expect(failedRun.exitCode).toBe(1);
       expect(failedRun.standardError).toContain(
         `dependency: error TaskTimeoutInvalid: has the timeout 'invalid', which is not a duration above 0`,
       );
-      expect(failedRun.standardError).toMatch(/^failed: 0 tasks, [\d.]+s$/mu);
+      expect(failedRun.standardError).toMatch(/^failed: 0 of 0 tasks, [\d.]+s$/mu);
       expect(failedRun.standardError).not.toContain("body ran");
       expect(failedRun.standardError).not.toContain("[main] started");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const durationsOutOfRange = Task.make(
+export const durationsOutOfRange = makeTest(
   "a zero or negative timeout and a negative cleanup are refused as definition violations before any task starts",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const zero = Task.make("zero", Effect.log("zero ran"), { timeout: 0, cleanup: 0 });
-export const negative = Task.make("negative", Effect.log("negative ran"), { timeout: "-1 seconds", cleanup: -5 });
-export const main = Task.make("main", Task.all([zero, negative]));
-if (import.meta.main) Task.main(main);`,
+export const zero = Task.make({ name: "zero", run: Effect.log("zero ran"), timeout: 0, cleanup: 0 });
+export const negative = Task.make({ name: "negative", run: Effect.log("negative ran"), timeout: "-1 seconds", cleanup: -5 });
+export default Task.make({ name: "main", run: Task.all([zero, negative]) });`,
       });
       const failedRun = yield* runTaskProcess(project, "main.ts");
       expect(failedRun.exitCode).toBe(1);
@@ -575,91 +582,31 @@ if (import.meta.main) Task.main(main);`,
       }
       expect(failedRun.standardError).not.toContain("zero: error TaskCleanupInvalid");
       expect(findMisprintedErrorLines(failedRun.standardError)).toEqual([]);
-      expect(failedRun.standardError).toMatch(/^failed: 0 tasks, [\d.]+s$/mu);
+      expect(failedRun.standardError).toMatch(/^failed: 0 of 0 tasks, [\d.]+s$/mu);
       expect(failedRun.standardError).not.toContain(" ran\n");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const supportedDurationForms = Task.make(
-  "discovery accepts all supported duration forms and cleanup zero without changing task identity",
+export const supportedDurationForms = makeTest(
+  "discovery accepts all supported duration forms, cleanup zero and an infinite cleanup without changing task identity",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Duration, Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const milliseconds = Task.make("milliseconds", Effect.void, { timeout: 60000, cleanup: 0 });
-export const nanoseconds = Task.make("nanoseconds", Effect.void, { timeout: 60000000000n, cleanup: "0 millis" });
-export const tuple = Task.make("tuple", Effect.void, { timeout: [60, 0], cleanup: [0, 0] });
-export const object = Task.make("object", Effect.void, { timeout: { minutes: 1 }, cleanup: { seconds: 0 } });
-export const parsed = Task.make("parsed", Effect.void, { timeout: Duration.minutes(1), cleanup: Duration.zero });
-export const main = Task.make("main", Task.all([milliseconds, nanoseconds, tuple, object, parsed]), { timeout: "1 minute", cleanup: "5 seconds" });
-if (import.meta.main) Task.main(main);`,
+export const milliseconds = Task.make({ name: "milliseconds", run: Effect.void, timeout: 60000, cleanup: 0 });
+export const nanoseconds = Task.make({ name: "nanoseconds", run: Effect.void, timeout: 60000000000n, cleanup: "0 millis" });
+export const tuple = Task.make({ name: "tuple", run: Effect.void, timeout: [60, 0], cleanup: [0, 0] });
+export const object = Task.make({ name: "object", run: Effect.void, timeout: { minutes: 1 }, cleanup: { seconds: 0 } });
+export const parsed = Task.make({ name: "parsed", run: Effect.void, timeout: Duration.minutes(1), cleanup: Duration.zero });
+export const infinite = Task.make({ name: "infinite", run: Task.exec("true", []), timeout: Duration.infinity, cleanup: Duration.infinity });
+export default Task.make({ name: "main", run: Task.all([milliseconds, nanoseconds, tuple, object, parsed, infinite]), timeout: "1 minute", cleanup: "5 seconds" });`,
       });
       const successfulRun = yield* runTaskProcess(project, "main.ts");
       expect(successfulRun.exitCode).toBe(0);
-      expect(successfulRun.standardError).toMatch(/^passed: 6 tasks, [\d.]+s$/mu);
-      expect(successfulRun.standardError).not.toContain("invalid");
+      expect(successfulRun.standardError).toMatch(/^passed: 7 tasks, [\d.]+s$/mu);
+      expect(successfulRun.standardError).not.toMatch(/ error \w+: /u);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-const RUN_CALLED_TWICE_LINES =
-  'error RunCalledTwice: Task.main() was called again with "second" while it runs "first"';
-
-export const runCalledTwice = Task.make(
-  "a second Task.main() call in the same process is refused before either task starts, and exits 1",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const project = yield* makeProject({
-        "main.ts": `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export const first = Task.make("first", Effect.log("first ran"));
-export const second = Task.make("second", Effect.log("second ran"));
-if (import.meta.main) {
-  Task.main(first);
-  Task.main(second);
-}`,
-      });
-      const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        `main.ts:7:8: ${RUN_CALLED_TWICE_LINES}, started at main.ts:6:8`,
-      );
-      expect(ran.standardError).not.toContain("first ran");
-      expect(ran.standardError).not.toContain("second ran");
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const runCalledAgainWhileRunning = Task.make(
-  "a Task.main() call while a run is going stops that run, runs its finalizers and exits 1",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const project = yield* makeProject({
-        "main.ts": `import { Effect } from "effect";
-import { Task } from "@sshkeda/task";
-export const first = Task.make("first", Effect.gen(function* () {
-  yield* Effect.addFinalizer(() => Effect.log("first cleaned up"));
-  yield* Effect.sync(() => new BroadcastChannel("running").postMessage("running"));
-  yield* Effect.never;
-}));
-export const second = Task.make("second", Effect.log("second ran"));
-if (import.meta.main) {
-  Task.main(first);
-  new BroadcastChannel("running").onmessage = () => Task.main(second);
-}`,
-      });
-      const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain("[first] first cleaned up");
-      expect(ran.standardError).toMatch(/^failed: 1 task, 1 stopped, [\d.]+s$/mu);
-      expect(ran.standardError).toContain(RUN_CALLED_TWICE_LINES);
-      expect(ran.standardError).not.toContain("second ran");
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

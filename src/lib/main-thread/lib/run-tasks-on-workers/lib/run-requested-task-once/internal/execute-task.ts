@@ -19,15 +19,12 @@ import { dieOnInvariantFailure } from "../../../../../../../shared/invariant-err
 import { TASK_TRACE_LABEL_PREFIX } from "../../../../../../../shared/names-from-package-json.ts";
 import { printTaskLines } from "../../../../../../../shared/print-to-standard-error.ts";
 import { WorkerExited } from "../../../../../../../shared/process-errors.ts";
-import {
-  TaskBodyFailed,
-  TaskSetupTimedOut,
-  TaskTimedOut,
-} from "../../../../../../../shared/task-errors.ts";
+import { TaskSetupTimedOut, TaskTimedOut } from "../../../../../../../shared/task-errors.ts";
 import { failRun, failTask } from "../../../../../shared/fail-run.ts";
+import { RunRootTaskConfig } from "../../../../../shared/provide-run-root-task-config.ts";
 import { StopState } from "../../../../../shared/provide-stop-state.ts";
 import { FromWorker, WorkerPool } from "../../../../../shared/provide-worker-pool.ts";
-import { reportFailure, reportTaskFailure } from "../../../../../shared/report-task-failure.ts";
+import { reportTaskFailure } from "../../../../../shared/report-task-failure.ts";
 import {
   formatTaskRunStatusForTrace,
   findAssignedWorkerId,
@@ -105,6 +102,7 @@ export const executeTask = Effect.fn("executeTaskFiber")(
       dieOnInvariantFailure("task execution", "the requested task is registered and started"),
     );
 
+    const { rootTaskFilePath } = yield* RunRootTaskConfig;
     const span = yield* Effect.currentSpan.pipe(
       dieOnInvariantFailure("task execution", "the task has a tracing span"),
     );
@@ -114,7 +112,7 @@ export const executeTask = Effect.fn("executeTaskFiber")(
       discoveredTask.cleanupDuration,
     );
     const waitingForWorkerIdRef = yield* Ref.make<number | null>(null);
-    const describeStepBeforeBody = () => {
+    const describeStepBeforeBody = (isWorkerHeldByOtherTasks: boolean) => {
       const waitingForWorkerId = Ref.getUnsafe(waitingForWorkerIdRef);
       if (waitingForWorkerId === null) {
         return taskRun.stepBeforeBody;
@@ -127,11 +125,13 @@ export const executeTask = Effect.fn("executeTaskFiber")(
         waitingForWorkerId,
       ).filter((occupyingTaskName) => occupyingTaskName !== taskName);
       const [longestOccupyingTaskName, ...otherTaskNames] = occupyingTaskNames;
-      if (longestOccupyingTaskName !== undefined) {
+      const isWaitingOnAnOccupyingTask =
+        isWorkerHeldByOtherTasks && longestOccupyingTaskName !== undefined;
+      if (isWaitingOnAnOccupyingTask) {
         return formatWaitingForWorker(waitingForWorkerId, longestOccupyingTaskName, otherTaskNames);
       }
       return Deferred.isDoneUnsafe(taskRun.bodyLoadingDeferred)
-        ? `loading ${discoveredTask.filePath}`
+        ? `loading ${rootTaskFilePath}`
         : `waiting for worker ${waitingForWorkerId} to take it`;
     };
     const awaitBodyStart = Effect.gen(function* () {
@@ -139,21 +139,20 @@ export const executeTask = Effect.fn("executeTaskFiber")(
 
       const workerPool = yield* WorkerPool;
       taskRun.stepBeforeBody = "starting a worker";
-      const workerId = yield* workerPool
-        .selectWorkerIdForTask(taskRunsState.readWorkerLoad, (selectedWorkerId) =>
-          taskRunsState.recordWorkerAssignment(taskName, selectedWorkerId),
-        )
-        .pipe(
-          Effect.mapError(
-            (failure) => new TaskBodyFailed({ taskName, failures: reportFailure(failure) }),
-          ),
-        );
+      const workerId = yield* workerPool.selectWorkerIdForTask(
+        taskRunsState.readWorkerLoad,
+        (selectedWorkerId) => taskRunsState.recordWorkerAssignment(taskName, selectedWorkerId),
+        discoveredTask.madeOnWorkerId,
+        discoveredTask.isolated,
+        taskRunsState.awaitNextWorkerLoadChange,
+      );
       yield* setupClock.recordWorkerAssignment(workerId);
       yield* workerPool.startTaskFiber(workerId, {
         taskName,
+        rootTaskFilePath,
         taskFilePath: discoveredTask.filePath,
         taskPackageDirectoryPath: discoveredTask.packageJsonDirectoryPath,
-        cleanupMilliseconds: Duration.toMillis(discoveredTask.cleanupDuration),
+        cleanup: discoveredTask.cleanupDuration,
         traceId: span.traceId,
         spanId: span.spanId,
         standardInput: taskRunsState.rootTaskStandardInput.standardInput,
@@ -165,14 +164,19 @@ export const executeTask = Effect.fn("executeTaskFiber")(
       const startedBeforeNotice = yield* awaitBodyStarted.pipe(
         Effect.timeoutOption(STILL_BEFORE_BODY_NOTICE_AFTER),
       );
-      const stepAtNotice = describeStepBeforeBody();
+      const stepAtNotice = describeStepBeforeBody(
+        yield* setupClock.isWorkerHeldByOtherTasks(workerId),
+      );
       const isStillBeforeBodyAtNotice = Option.isNone(startedBeforeNotice) && stepAtNotice !== null;
       if (isStillBeforeBodyAtNotice) {
         yield* printTaskLines("Info", taskName, stepAtNotice);
       }
       yield* awaitBodyStarted;
     }).pipe((setup) =>
-      setupClock.limit(setup, () => describeStepBeforeBody() ?? "waiting for its body to start"),
+      setupClock.limit(
+        setup,
+        () => describeStepBeforeBody(false) ?? "waiting for its body to start",
+      ),
     );
     const timeoutDuration = discoveredTask.timeoutDuration;
     const awaitBodyOutcome = Effect.gen(function* () {

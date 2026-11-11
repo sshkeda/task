@@ -1,14 +1,14 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
 import { Effect } from "effect";
 
 import { encodeJson } from "../shared/encode-json.ts";
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { REPOSITORY_DIRECTORY } from "../shared/find-repository-directory.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
-export const invalidLifecycleStates = Task.make(
+export const invalidLifecycleStates = makeTest(
   "task lifecycle types reject missing workers, workers on states without one and caller state mutation",
   Effect.scoped(
     Effect.gen(function* () {
@@ -33,10 +33,9 @@ taskRuns.createRecord("created").status = { _tag: "Preparing" };`),
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const validLifecycleStates = Task.make(
+export const validLifecycleStates = makeTest(
   "task lifecycle types allow pre-worker failures and worker-owned completion states",
   Effect.scoped(
     Effect.gen(function* () {
@@ -58,5 +57,4 @@ export const states: ReadonlyArray<typeof TaskRunStatus.Type> = [
 ];`);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

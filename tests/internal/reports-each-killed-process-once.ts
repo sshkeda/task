@@ -19,6 +19,7 @@ import { TASK_TRACE_LABEL_PREFIX } from "../../src/shared/names-from-package-jso
 import { failTestCleanup } from "../shared/fail-test-cleanup.ts";
 import { exitAsValue } from "../shared/failure-as-value.ts";
 import { isProcessAlive } from "../shared/is-process-alive.ts";
+import { makeTest } from "../shared/make-tests.ts";
 
 const READABLE_PROCESS_ID = 300;
 
@@ -54,7 +55,7 @@ const killAsTaskCollectingReports = (
     return yield* Ref.get(reported);
   });
 
-export const claimedOnce = Task.make(
+export const claimedOnce = makeTest(
   "a run's record of reported kills grants each process, keyed by pid and start time, once",
   Effect.gen(function* () {
     const { claimProcessesToReport } = makeProcessReportClaimer();
@@ -66,10 +67,9 @@ export const claimedOnce = Task.make(
     ]);
     expect(yield* claimProcessesToReport([firstProcess, reusedProcessId])).toEqual([]);
   }),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const signaledAgainReportedOnce = Task.make(
+export const signaledAgainReportedOnce = makeTest(
   "a kill pass signals again a process an earlier pass of the run already reported, and does not report it a second time",
   Effect.scoped(
     Effect.gen(function* () {
@@ -80,10 +80,9 @@ export const signaledAgainReportedOnce = Task.make(
       expect(yield* isProcessAlive(leftover.processId)).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const interruptedPass = Task.make(
+export const interruptedPass = makeTest(
   "a kill pass interrupted before it signals records nothing, so the next pass kills the leftover and reports it",
   Effect.scoped(
     Effect.gen(function* () {
@@ -101,10 +100,9 @@ export const interruptedPass = Task.make(
       expect(yield* isProcessAlive(leftover.processId)).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const linuxStartTime = Task.make(
+export const linuxStartTime = makeTest(
   "a Linux /proc/<pid>/stat line yields the state, parent, group, session and field 22 start time, even when the command name holds parentheses and spaces",
   Effect.gen(function* () {
     expect(
@@ -123,7 +121,6 @@ export const linuxStartTime = Task.make(
       Exit.isFailure(yield* exitAsValue(decodeProcStatText("1234 (short) S 1 1234 1234 0\n"))),
     ).toBe(true);
   }),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const deniedWith = (code: string, filePath: string) =>
@@ -135,7 +132,7 @@ const deniedWith = (code: string, filePath: string) =>
     cause: Object.assign(new Error(`${code}: denied`), { code }),
   });
 
-export const linuxHiddenProcessesSkipped = Task.make(
+export const linuxHiddenProcessesSkipped = makeTest(
   "a /proc/<pid> that cannot be read, as under hidepid or another user's process, is skipped and traced instead of failing cleanup",
   Effect.gen(function* () {
     const deniedCodeOfFile = new Map([
@@ -174,5 +171,4 @@ export const linuxHiddenProcessesSkipped = Task.make(
         ?.attributes.get(`${TASK_TRACE_LABEL_PREFIX}.unreadableProcessIds`),
     ).toEqual([1, ACCESS_DENIED_PROCESS_ID]);
   }),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

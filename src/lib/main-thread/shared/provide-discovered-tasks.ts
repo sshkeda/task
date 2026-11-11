@@ -1,7 +1,10 @@
 import { Context, Effect, Layer, Schema } from "effect";
 
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
-import { findTasksReachableFromRootTaskFile } from "./find-tasks-reachable-from-root-task-file.ts";
+import {
+  findTasksMadeByRootTaskFile,
+  findUnexportedRootFileTaskNames,
+} from "./find-tasks-made-by-root-task-file.ts";
 import { BrokenTasksFound } from "./main-thread-errors.ts";
 import { StopState } from "./provide-stop-state.ts";
 
@@ -9,13 +12,18 @@ const isBrokenTasksFound = Schema.is(BrokenTasksFound);
 
 const discoverTasks = Effect.gen(function* () {
   const shutdown = yield* StopState;
-  const discovery = yield* findTasksReachableFromRootTaskFile().pipe(
+  const discovery = yield* findTasksMadeByRootTaskFile().pipe(
     Effect.catchTag("BrokenTasksFound", (brokenTasks) => Effect.succeed(brokenTasks)),
     Effect.raceFirst(shutdown.awaitFailure.pipe(Effect.as(null))),
   );
-  return isBrokenTasksFound(discovery)
-    ? { tasksByName: null, brokenTasks: discovery }
-    : { tasksByName: discovery, brokenTasks: null };
+  if (isBrokenTasksFound(discovery)) {
+    return { tasksByName: null, unexportedRootFileTaskNames: [], brokenTasks: discovery };
+  }
+  return {
+    tasksByName: discovery,
+    unexportedRootFileTaskNames: discovery === null ? [] : yield* findUnexportedRootFileTaskNames(),
+    brokenTasks: null,
+  };
 });
 
 export class DiscoveredTasks extends Context.Service<

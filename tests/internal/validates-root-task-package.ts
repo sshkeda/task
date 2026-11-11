@@ -1,24 +1,21 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
-import { Effect, FileSystem } from "effect";
+import { Effect, FileSystem, Path } from "effect";
 
-import packageJson from "../../package.json" with { type: "json" };
 import { encodeJson } from "../shared/encode-json.ts";
 import { findMisprintedErrorLines } from "../shared/find-misprinted-error-lines.ts";
-import { REPOSITORY_DIRECTORY } from "../shared/find-repository-directory.ts";
 import { makeProject, makeStandaloneDirectory } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
-export const missingPackageJson = Task.make(
+export const missingPackageJson = makeTest(
   "a root task without a package.json above it is refused with its path",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeStandaloneDirectory({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("body ran"));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.log("body ran") });`,
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode).toBe(1);
@@ -30,23 +27,21 @@ if (import.meta.main) Task.main(main);`,
       expect(result.standardError).not.toContain("[main] started");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const sibling = Task.make(
+export const sibling = makeTest(
   "a task in a named package requests a task in a sibling file",
   Effect.scoped(
     Effect.gen(function* () {
       const directory = yield* makeStandaloneDirectory({
         "package.json": yield* encodeJson({ name: "project", type: "module" }),
-        "base.ts": `import { Effect } from "effect";
+        "base.ts": `import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
-export const base = Task.make("base", Effect.succeed("from base"));`,
+export const base = Task.make({ name: "base", output: Schema.String, run: Effect.succeed("from base") });`,
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { base } from "./base.ts";
-export const main = Task.make("main", Effect.gen(function* () { yield* Effect.log(yield* base); }));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.gen(function* () { yield* Effect.log(yield* base); }) });`,
       });
       const result = yield* runTaskProcess(directory, "main.ts");
       expect(result.standardError).toContain("[main] from base");
@@ -54,18 +49,16 @@ if (import.meta.main) Task.main(main);`,
       expect(result.exitCode).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const withoutLockfile = Task.make(
+export const withoutLockfile = makeTest(
   "a project with a package.json but no bun.lock runs from a task file in a subdirectory",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "tasks/main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log(process.cwd()));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.log(process.cwd()) });`,
       });
       yield* FileSystem.FileSystem.use((fileSystem) =>
         fileSystem.remove(`${project.directory}/bun.lock`),
@@ -75,16 +68,35 @@ if (import.meta.main) Task.main(main);`,
       expect(result.exitCode).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const invalidPackageName = Task.make(
-  "a root package with a missing or invalid name is refused with its manifest path and the decoding error",
+export const namelessRootPackage = makeTest(
+  "a root package without a name runs and writes its trace under the package's folder name",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const project = yield* makeProject({
+        "package.json": yield* encodeJson({ private: true, type: "module" }),
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.log("body ran") });`,
+      });
+      const result = yield* runTaskProcess(project, "main.ts");
+      expect(result.exitCode, result.standardError).toBe(0);
+      expect(result.standardError).toContain("[main] body ran");
+      expect(result.standardError).toContain(
+        `wrote the trace to ${project.home}/.sshkeda-task/traces/${path.basename(project.directory)}/`,
+      );
+    }),
+  ),
+);
+
+export const invalidPackageName = makeTest(
+  "a root package with an invalid name is refused with its manifest path and the decoding error",
   Effect.scoped(
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       for (const [manifest, expectedLine] of [
-        [{}, 'package.json: error PackageJsonWithoutName: has no "name"'],
         [
           { name: "" },
           'package.json: error PackageJsonNameBlank: has the "name" "", which is blank',
@@ -109,8 +121,7 @@ export const invalidPackageName = Task.make(
           "package.json": yield* encodeJson(manifest),
           "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("body ran"));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.log("body ran") });`,
         });
         const result = yield* runTaskProcess(project, "main.ts");
         expect(result.exitCode).toBe(1);
@@ -125,8 +136,7 @@ if (import.meta.main) Task.main(main);`,
         "package.json": yield* encodeJson({ name: "@scope/project", type: "module" }),
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("body ran"));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.log("body ran") });`,
       });
       const scopedResult = yield* runTaskProcess(scoped, "main.ts");
       expect(scopedResult.exitCode, scopedResult.standardError).toBe(0);
@@ -135,10 +145,9 @@ if (import.meta.main) Task.main(main);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const missingImportedPackageJson = Task.make(
+export const missingImportedPackageJson = makeTest(
   "a named root refuses an imported task file without an enclosing package.json",
   Effect.scoped(
     Effect.gen(function* () {
@@ -146,11 +155,10 @@ export const missingImportedPackageJson = Task.make(
         "app/package.json": yield* encodeJson({ name: "project", type: "module" }),
         "loose.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const loose = Task.make("loose", Effect.log("LOOSE BODY RAN"));`,
+export const loose = Task.make({ name: "loose", run: Effect.log("LOOSE BODY RAN") });`,
         "app/main.ts": `import { Task } from "@sshkeda/task";
 import { loose } from "../loose.ts";
-export const main = Task.make("main", loose);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: loose });`,
       });
       const result = yield* runTaskProcess(project, "app/main.ts");
       expect(result.exitCode).toBe(1);
@@ -162,67 +170,26 @@ if (import.meta.main) Task.main(main);`,
       expect(result.standardError).not.toContain("[main] started");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const importedParentPackageJson = Task.make(
+export const importedParentPackageJson = makeTest(
   "an imported task file accepts a package.json in its own ancestor directory",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeStandaloneDirectory({
         "app/package.json": yield* encodeJson({ name: "project", type: "module" }),
         "shared/package.json": yield* encodeJson({ name: "shared", type: "module" }),
-        "shared/tasks/leaf.ts": `import { Effect } from "effect";
+        "shared/tasks/leaf.ts": `import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
-export const leaf = Task.make("leaf", Effect.succeed("shared value"));`,
+export const leaf = Task.make({ name: "leaf", output: Schema.String, run: Effect.succeed("shared value") });`,
         "app/main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { leaf } from "../shared/tasks/leaf.ts";
-export const main = Task.make("main", Effect.gen(function* () { yield* Effect.log(yield* leaf); }));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.gen(function* () { yield* Effect.log(yield* leaf); }) });`,
       });
       const result = yield* runTaskProcess(project, "app/main.ts");
       expect(result.exitCode).toBe(0);
       expect(result.standardError).toContain("[main] shared value");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-export const invalidLinkedPackageJson = Task.make(
-  "a bare import from a file outside any package, linked outside node_modules whose package.json is not JSON is refused with that manifest's path",
-  Effect.scoped(
-    Effect.gen(function* () {
-      const repository = yield* REPOSITORY_DIRECTORY;
-      const project = yield* makeStandaloneDirectory({
-        "tsconfig.json": yield* encodeJson({
-          compilerOptions: {
-            paths: {
-              [packageJson.name]: [`${repository}/src/index.ts`],
-              effect: [`${repository}/node_modules/effect/dist/index.js`],
-              "effect/*": [`${repository}/node_modules/effect/dist/*.js`],
-              linked: ["./linked/source/index.ts"],
-            },
-          },
-        }),
-        "linked/package.json": "{ not json",
-        "linked/source/index.ts": 'export const greeting = "linked";\n',
-        "helper.ts": 'export { greeting } from "linked";\n',
-        "app/package.json": yield* encodeJson({ name: "project", type: "module" }),
-        "app/main.ts": `import { Effect } from "effect";
-import { greeting } from "../helper.ts";
-import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log(greeting));
-if (import.meta.main) Task.main(main);`,
-      });
-      const result = yield* runTaskProcess(project, "app/main.ts");
-      expect(result.exitCode, result.standardError).toBe(1);
-      expect(result.standardError).toContain(
-        'linked/package.json: error PackageJsonNotJson: is not JSON because JSONC Parse error: Expected string but found "not"',
-      );
-      expect(findMisprintedErrorLines(result.standardError)).toEqual([]);
-      expect(result.standardError).not.toContain("[main] linked");
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

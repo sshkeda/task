@@ -17,12 +17,13 @@ import { failTestCleanup } from "../shared/fail-test-cleanup.ts";
 import { findKilledProcesses } from "../shared/find-killed-processes.ts";
 import { isProcessAlive } from "../shared/is-process-alive.ts";
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 
 const SHELL_AND_SLEEP_PROCESS_COUNT = 2;
 
-export const hung = Task.make(
+export const hung = makeTest(
   "a task that starts a command and hangs is stopped by its timeout, which runs its finalizers and stops the command's whole tree",
   Effect.scoped(
     Effect.gen(function* () {
@@ -30,12 +31,12 @@ export const hung = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { ChildProcess } from "effect/process";
-export const hang = Task.make("hang", Effect.gen(function* () {
+export const hang = Task.make({ name: "hang", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("cleaned up"));
   const child = yield* ChildProcess.make("sh", ["-c", "sleep 1000 & echo $$ $! > pids; wait"]);
   yield* child.exitCode;
-}), { timeout: "5 seconds", cleanup: "5 seconds" });
-if (import.meta.main) Task.main(hang);`,
+}), timeout: "5 seconds", cleanup: "5 seconds" });
+export default hang;`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.standardError).toContain("[hang] cleaned up");
@@ -48,7 +49,6 @@ if (import.meta.main) Task.main(hang);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const LEAKING_SHELL_COMMAND =
@@ -56,11 +56,10 @@ const LEAKING_SHELL_COMMAND =
 
 const LEAKING_ROOT = `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.sync(() => Bun.spawn(["sh", "-c", "${LEAKING_SHELL_COMMAND}"], { stdout: "pipe" })).pipe(
+export default Task.make({ name: "main", run: Effect.sync(() => Bun.spawn(["sh", "-c", "${LEAKING_SHELL_COMMAND}"], { stdout: "pipe" })).pipe(
   Effect.flatMap((child) => Effect.promise(() => child.stdout.getReader().read()).pipe(Effect.as(child.pid))),
   Effect.flatMap((processId) => Effect.log(\`spawned \${processId}\`)),
-));
-if (import.meta.main) Task.main(main);`;
+) });`;
 
 const runUntilTheForkedChildIsSleep = (
   project: Effect.Success<ReturnType<typeof makeProject>>,
@@ -80,7 +79,7 @@ const runUntilTheForkedChildIsSleep = (
     return yield* command.waitForExit;
   });
 
-export const leaked = Task.make(
+export const leaked = makeTest(
   "a process left running at the end, started outside ChildProcess, is killed and reported with the processes it started",
   Effect.scoped(
     Effect.gen(function* () {
@@ -101,10 +100,9 @@ export const leaked = Task.make(
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const withoutPgrep = Task.make(
+export const withoutPgrep = makeTest(
   "a run finds, kills and reports leftover processes without pgrep or ps on PATH",
   Effect.scoped(
     Effect.gen(function* () {
@@ -134,21 +132,19 @@ export const withoutPgrep = Task.make(
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const churning = Task.make(
+export const churning = makeTest(
   "a leftover process whose children start and exit while task lists processes is still killed and reported, and the run passes",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.sync(() => Bun.spawn(["sh", "-c", "echo started; while true; do true & true & true & wait; done"], { stdout: "pipe" })).pipe(
+export default Task.make({ name: "main", run: Effect.sync(() => Bun.spawn(["sh", "-c", "echo started; while true; do true & true & true & wait; done"], { stdout: "pipe" })).pipe(
   Effect.flatMap((child) => Effect.promise(() => child.stdout.getReader().read()).pipe(Effect.as(child.pid))),
   Effect.flatMap((processId) => Effect.log(\`spawned \${processId}\`)),
-));
-if (import.meta.main) Task.main(main);`,
+) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
@@ -161,13 +157,12 @@ if (import.meta.main) Task.main(main);`,
       expect(yield* isProcessAlive(processId)).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const orphanCommand = (file: string) =>
   `ChildProcess.make("sh", ["-c", "trap '' TERM; sleep 1000 > /dev/null 2>&1 & until ps -o command= -p $! | grep -qx 'sleep 1000'; do :; done; echo $$ $(ps -o pgid= -p $$) $! $(ps -o pgid= -p $!) > ${file}"]).pipe(Effect.flatMap((child) => child.exitCode))`;
 
-export const orphaned = Task.make(
+export const orphaned = makeTest(
   "a grandchild that ignores SIGTERM, left in a task command's process group after the command exits, is found through that group, killed and reported with that task",
   Effect.scoped(
     Effect.gen(function* () {
@@ -175,9 +170,8 @@ export const orphaned = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { ChildProcess } from "effect/process";
-export const server = Task.make("server", ${orphanCommand("server-pids")}.pipe(Effect.andThen(Task.serve("up"))));
-export const main = Task.make("main", Effect.andThen(server, ${orphanCommand("main-pids")}));
-if (import.meta.main) Task.main(main);`,
+export const server = Task.make({ name: "server", run: ${orphanCommand("server-pids")}.pipe(Effect.andThen(Task.serve("up"))) });
+export default Task.make({ name: "main", run: Effect.andThen(server, ${orphanCommand("main-pids")}) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
@@ -210,12 +204,11 @@ if (import.meta.main) Task.main(main);`,
       ).toEqual(expected.toSorted((left, right) => left.by.localeCompare(right.by)));
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const FAKE_SECRET = "FAKE-SECRET-123";
 
-export const argumentsKeptPrivate = Task.make(
+export const argumentsKeptPrivate = makeTest(
   "a leftover process is reported and traced by its process id and program name, and no argument of it or of a command a task starts reaches the output or the state directory",
   Effect.scoped(
     Effect.gen(function* () {
@@ -224,8 +217,7 @@ export const argumentsKeptPrivate = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { ChildProcess } from "effect/process";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", ChildProcess.make("sh", ["-c", "trap '' TERM; perl -e 'sleep 300' -- --token=${FAKE_SECRET} > /dev/null 2>&1 & until ps -o comm= -p $! | grep -q perl; do :; done; echo $! > leftover-pid"]).pipe(Effect.flatMap((child) => child.exitCode)));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: ChildProcess.make("sh", ["-c", "trap '' TERM; perl -e 'sleep 300' -- --token=${FAKE_SECRET} > /dev/null 2>&1 & until ps -o comm= -p $! | grep -q perl; do :; done; echo $! > leftover-pid"]).pipe(Effect.flatMap((child) => child.exitCode)) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
@@ -253,10 +245,9 @@ if (import.meta.main) Task.main(main);`,
       }).toEqual({ standardOutput: false, standardError: false, filesHoldingSecret: [] });
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const endedTask = Task.make(
+export const endedTask = makeTest(
   "a process a task leaves running is killed and reported when that task ends, before the task that yielded it goes on",
   Effect.scoped(
     Effect.gen(function* () {
@@ -264,9 +255,8 @@ export const endedTask = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { ChildProcess } from "effect/process";
 import { Task } from "@sshkeda/task";
-export const leaver = Task.make("leaver", ChildProcess.make("sh", ["-c", "trap '' TERM; sleep 1000 > /dev/null 2>&1 & until ps -o command= -p $! | grep -qx 'sleep 1000'; do :; done; echo $! > leaver-pid"]).pipe(Effect.flatMap((child) => child.exitCode)));
-export const main = Task.make("main", Effect.andThen(leaver, Effect.log("after leaver")));
-if (import.meta.main) Task.main(main);`,
+export const leaver = Task.make({ name: "leaver", run: ChildProcess.make("sh", ["-c", "trap '' TERM; sleep 1000 > /dev/null 2>&1 & until ps -o command= -p $! | grep -qx 'sleep 1000'; do :; done; echo $! > leaver-pid"]).pipe(Effect.flatMap((child) => child.exitCode)) });
+export default Task.make({ name: "main", run: Effect.andThen(leaver, Effect.log("after leaver")) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
@@ -280,18 +270,41 @@ if (import.meta.main) Task.main(main);`,
       expect(yield* isProcessAlive(sleep)).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const escaped = Task.make(
+export const jobControl = makeTest(
+  "a process a task's command starts in its own process group with set -m is killed and reported with that task when the run ends",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Task.exec("bash", ["-c", "set -m; ${process.execPath} -e 'setInterval(() => {}, 1000)' > /dev/null 2>&1 & echo $! > job-pid"]) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      const job = (yield* read(`${project.directory}/job-pid`)).trim();
+      yield* Effect.addFinalizer(() =>
+        isProcessAlive(Number(job)).pipe(
+          Effect.flatMap((alive) => (alive ? Task.exec("kill", ["-KILL", job]) : Effect.void)),
+          failTestCleanup("kill leftover test process"),
+        ),
+      );
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(findKilledProcesses(ran.standardError), ran.standardError).toEqual([
+        { processId: Number(job), command: "bun", by: '"main"' },
+      ]);
+      expect(yield* isProcessAlive(Number(job))).toBe(false);
+    }),
+  ),
+);
+
+export const escaped = makeTest(
   "task never kills its own process group, so a grandchild of a Bun.spawn process whose parent exited is left running on macOS, while on Linux, where the supervisor adopts it, it is killed and reported",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.promise(() => Bun.spawn(["sh", "-c", "sleep 1000 > /dev/null 2>&1 & echo $! $PPID > pid"]).exited));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.promise(() => Bun.spawn(["sh", "-c", "sleep 1000 > /dev/null 2>&1 & echo $! $PPID > pid"]).exited) });`,
       });
       const command = yield* startTaskProcess(project, "main.ts");
       const ran = yield* command.waitForExit;
@@ -315,19 +328,17 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const nothingStarted = Task.make(
+export const nothingStarted = makeTest(
   "a run whose tasks start no process kills and reports nothing",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const server = Task.make("server", Task.serve("up"));
-export const main = Task.make("main", Effect.asVoid(server));
-if (import.meta.main) Task.main(main);`,
+export const server = Task.make({ name: "server", run: Task.serve("up") });
+export default Task.make({ name: "main", run: Effect.asVoid(server) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
@@ -339,10 +350,9 @@ if (import.meta.main) Task.main(main);`,
       ).toEqual([]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const foreign = Task.make(
+export const foreign = makeTest(
   "a process task did not start is never killed, even one running the same command as a leftover it kills",
   Effect.scoped(
     Effect.gen(function* () {
@@ -350,8 +360,7 @@ export const foreign = Task.make(
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.sync(() => Bun.spawn(["sleep", "1000"]).pid).pipe(Effect.flatMap((processId) => Effect.log(\`spawned \${processId}\`))));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.sync(() => Bun.spawn(["sleep", "1000"]).pid).pipe(Effect.flatMap((processId) => Effect.log(\`spawned \${processId}\`))) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
@@ -363,10 +372,9 @@ if (import.meta.main) Task.main(main);`,
       expect(yield* isProcessAlive(other.pid)).toBe(true);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const ownGroup = Task.make(
+export const ownGroup = makeTest(
   "each command a task starts leads its own process group",
   Effect.scoped(
     Effect.gen(function* () {
@@ -375,8 +383,7 @@ export const ownGroup = Task.make(
 import { ChildProcess } from "effect/process";
 import { Task } from "@sshkeda/task";
 const report = (file: string) => ChildProcess.make("sh", ["-c", \`echo $$ $(ps -o pgid= -p $$) > \${file}\`]).pipe(Effect.flatMap((child) => child.exitCode), Effect.scoped);
-export const main = Task.make("main", Effect.all([report("first"), report("second")], { concurrency: "unbounded" }));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.all([report("first"), report("second")], { concurrency: "unbounded" }) });`,
       });
       const command = yield* startTaskProcess(project, "main.ts");
       expect((yield* command.waitForExit).exitCode).toBe(0);
@@ -397,10 +404,9 @@ if (import.meta.main) Task.main(main);`,
       expect(groups[0]?.[1]).not.toBe(groups[1]?.[1]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const spawnedDuringWorkerExit = Task.make(
+export const spawnedDuringWorkerExit = makeTest(
   "a process a worker starts while the run waits for workers to exit is still killed and reported",
   Effect.scoped(
     Effect.gen(function* () {
@@ -408,15 +414,14 @@ export const spawnedDuringWorkerExit = Task.make(
         "main.ts": `import { appendFileSync } from "node:fs";
 import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* Effect.forkDetach(Effect.forever(Effect.sync(() => {
     Bun.spawnSync(["sleep", "0.7"]);
     const child = Bun.spawn(["sh", "-c", "trap '' TERM; exec sleep 1000"], { stdio: ["ignore", "ignore", "ignore"] });
     appendFileSync("pids", \`\${child.pid}\\n\`);
   })));
   yield* Effect.sleep("200 millis");
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       const processIds = (yield* read(`${project.directory}/pids`)).trim().split("\n");
@@ -439,7 +444,6 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const killTestProcessWhenDone = (processId: number) =>
@@ -487,7 +491,7 @@ const listedAsAnEarlierProcess = (processId: number, earlierStartTime: string) =
       ),
     )) satisfies typeof listProcesses;
 
-export const reusedProcessGroupId = Task.make(
+export const reusedProcessGroupId = makeTest(
   "a recorded process group ID that an unrelated group, whose leader has exited, now holds is never signaled, whether task saw its own leader exit or not",
   Effect.scoped(
     Effect.gen(function* () {
@@ -509,10 +513,9 @@ export const reusedProcessGroupId = Task.make(
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const reusedProcessId = Task.make(
+export const reusedProcessId = makeTest(
   "a process at a PID the process list showed for an earlier process task started is never signaled, by PID or by group",
   Effect.scoped(
     Effect.gen(function* () {
@@ -529,10 +532,9 @@ export const reusedProcessId = Task.make(
       expect(yield* isProcessAlive(sleep.pid)).toBe(true);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const reusedRunProcessId = Task.make(
+export const reusedRunProcessId = makeTest(
   "the supervisor never signals a process at a PID its process list showed for an earlier process or process group of the run",
   Effect.scoped(
     Effect.gen(function* () {
@@ -556,5 +558,4 @@ export const reusedRunProcessId = Task.make(
       expect(yield* isProcessAlive(sleep.pid)).toBe(true);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

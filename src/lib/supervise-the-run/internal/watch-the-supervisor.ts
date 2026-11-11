@@ -27,7 +27,10 @@ export const watchSupervisor = Effect.gen(function* () {
   yield* Ref.set(supervisorProcessId, process.ppid);
   const stdio = yield* Stdio.Stdio;
   const printFailure = (error: Parameters<typeof formatFailureLines>[0]) =>
-    Stream.make(`${formatFailureLines(error, null)}\n`).pipe(Stream.run(stdio.stderr()));
+    Stream.make(`${formatFailureLines(error, null)}\n`).pipe(
+      Stream.run(stdio.stderr()),
+      Effect.ignore,
+    );
   const runMarker = yield* adoptSupervisorRunMarker.pipe(
     Effect.catchTag(["ProcRunMarkerUnreadable", "SystemLibraryNotLoaded"], (error) =>
       printFailure(error).pipe(Effect.as(null)),

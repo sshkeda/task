@@ -59,12 +59,9 @@ export const TraceFileLive = Layer.effect(
       ":",
       "-",
     );
-    const traceFilePath = `${runRootTaskConfig.stateDirectoryPath}/traces/${runRootTaskConfig.rootTaskPackageJsonName}/${timestamp}-${runRootTaskConfig.runProcessId}.jsonl`;
-    const sweepOfOldTraces = yield* deleteTracesOlderThanRetention(traceFilePath).pipe(
-      Effect.catchTag("PlatformError", () => Effect.void),
-      Effect.forkScoped,
-    );
+    const traceFilePath = `${runRootTaskConfig.stateDirectoryPath}/traces/${runRootTaskConfig.traceDirectoryName}/${timestamp}-${runRootTaskConfig.runProcessId}.jsonl`;
     const made = yield* Ref.make<Effect.Success<ReturnType<typeof makeTraceFile>> | null>(null);
+    const sweepOfOldTraces = yield* Ref.make<Fiber.Fiber<void> | null>(null);
     yield* Effect.addFinalizer(() =>
       Ref.get(made).pipe(
         Effect.flatMap((madeTraceFile) =>
@@ -84,11 +81,27 @@ export const TraceFileLive = Layer.effect(
                 ),
               ),
         ),
-        Effect.andThen(Fiber.join(sweepOfOldTraces)),
+        Effect.andThen(
+          Effect.flatMap(Ref.get(sweepOfOldTraces), (sweep) =>
+            sweep === null ? Effect.void : Fiber.join(sweep),
+          ),
+        ),
       ),
     );
-    const traceFile = yield* makeTraceFile({ traceFilePath });
+    const traceFile = yield* makeTraceFile({
+      traceFilePath,
+      createdBelow: runRootTaskConfig.stateDirectoryPath,
+    });
     yield* Ref.set(made, traceFile);
+    if ((yield* traceFile.whyIncomplete) === null) {
+      yield* Ref.set(
+        sweepOfOldTraces,
+        yield* deleteTracesOlderThanRetention(traceFilePath).pipe(
+          Effect.catchTag("PlatformError", () => Effect.void),
+          Effect.forkScoped,
+        ),
+      );
+    }
     return traceFile;
   }),
 );

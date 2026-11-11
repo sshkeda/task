@@ -74,15 +74,6 @@ export class PackageJsonFieldInvalid extends Schema.TaggedError<PackageJsonField
   }
 }
 
-export class PackageJsonWithoutName extends Schema.TaggedError<PackageJsonWithoutName>()(
-  "PackageJsonWithoutName",
-  { ...TASK_ERROR_FIELDS, filePath: Schema.String },
-) {
-  public override get message() {
-    return `has no "name"`;
-  }
-}
-
 export class PackageJsonSearchFailed extends Schema.TaggedError<PackageJsonSearchFailed>()(
   "PackageJsonSearchFailed",
   { ...TASK_ERROR_FIELDS, filePath: Schema.String, cause: Schema.Defect() },

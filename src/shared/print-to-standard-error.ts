@@ -26,7 +26,7 @@ export class StandardErrorWriteFailed extends Schema.TaggedError<StandardErrorWr
 
 export const standardErrorWriteFailedDeferred = Deferred.makeUnsafe<StandardErrorWriteFailed>();
 
-export const standardErrorClosedDeferred = Deferred.makeUnsafe<void>();
+export const standardErrorClosedDeferred = Deferred.makeUnsafe<"pipe" | "terminal">();
 
 export const standardErrorLinesDeferred =
   Deferred.makeUnsafe<Queue.Queue<typeof StandardErrorLine.Type, Cause.Done>>();

@@ -29,7 +29,7 @@ export const nameConfigKeyNotSet = <Success, Failure, Services>(
           missingKeys.set(nameConfigKey(configPath), { readsRuntimeConfigProvider });
         }
       }),
-      Effect.mapError((failure): ConfigKeyNotSet | Failure => {
+      Effect.mapError((failure) => {
         if (!isConfigError(failure)) {
           return failure;
         }

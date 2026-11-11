@@ -7,6 +7,7 @@ import packageJson from "../../package.json" with { type: "json" };
 import { encodeJson } from "../shared/encode-json.ts";
 import { REPOSITORY_DIRECTORY } from "../shared/find-repository-directory.ts";
 import { makeScratchDirectory } from "../shared/make-temporary-directories.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { packPackageTarballInto } from "../shared/pack-package-tarball.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
@@ -33,20 +34,20 @@ const STRICT_COMPILER_OPTIONS = {
 
 const PACKAGE_FILES_LOADED_BY_PATH = [
   "src/lib/worker-thread/index.ts",
-  "src/lib/preload-rewritten-imports-into-each-worker/index.ts",
+  "src/lib/task/internal/start-the-run.ts",
   "src/lib/supervise-the-run/internal/start-watching-the-supervisor.ts",
 ].map((packageFile) => `node_modules/${packageJson.name}/${packageFile}`);
 
 const CONSUMER_SOURCE_FILES = {
-  "tasks.ts": `import { Effect } from "effect";
+  "tasks.ts": `import { Effect, Schema } from "effect";
 import { Task } from "@sshkeda/task";
 import { CommandFailed } from "@sshkeda/task/errors";
-const echoOptions: Parameters<typeof Task.make<unknown, never, never>>[2] = { timeout: "1 minute", cleanup: "5 seconds" };
-export const echoed = Task.make("echoed", Task.exec("echo", ["echoed"]), echoOptions);
-export const main = Task.make("main", Effect.gen(function* () {
+const echoOptions = { timeout: "1 minute", cleanup: "5 seconds" } as const;
+export const echoed = Task.make({ name: "echoed", output: Schema.String, run: Task.exec("echo", ["echoed"]), ...echoOptions });
+export const main = Task.make({ name: "main", run: Effect.gen(function* () {
   const printed = yield* echoed;
   yield* Effect.log(\`strict consumer saw \${printed.trim()}\`);
-}));
+}) });
 export const isCommandFailure = (failure: unknown): failure is CommandFailed =>
   failure instanceof CommandFailed;
 export const echoedText = (text: string) => Task.exec("echo", [text]);
@@ -59,11 +60,10 @@ export const echoedLineCount = (text: string) =>
   "refused.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 // @ts-expect-error
-export const cached = Task.make("cached", Effect.void, { cache: true });
+export const dated = Task.make({ name: "dated", output: Date, run: Effect.succeed(new Date()) });
 `,
-  "run.ts": `import { Task } from "@sshkeda/task";
-import { main } from "./tasks.ts";
-Task.main(main);
+  "run.ts": `import { main } from "./tasks.ts";
+export default main;
 `,
 } as const;
 
@@ -116,7 +116,7 @@ const CONSUMER_TSCONFIG_FILES = {
   },
 };
 
-export const strictConsumerUsesPackedTarball = Task.make(
+export const strictConsumerUsesPackedTarball = makeTest(
   "consumers with strict tsconfigs, a bun condition, only the ESNext lib or no target or module option type-check the packed TypeScript source without errors, emit declarations that name the package, and run tasks with Bun",
   Effect.scoped(
     Effect.gen(function* () {
@@ -181,5 +181,5 @@ export const strictConsumerUsesPackedTarball = Task.make(
       expect(ran.standardError).toContain("[main] strict consumer saw echoed");
     }),
   ),
-  { timeout: "2 minutes", cleanup: "5 seconds" },
+  "2 minutes",
 );

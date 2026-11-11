@@ -11,7 +11,6 @@ import {
   PackageJsonNotJson,
   PackageJsonNotObject,
   PackageJsonUnreadable,
-  PackageJsonWithoutName,
 } from "./package-json-errors.ts";
 
 const DependencyVersions = Schema.Record(Schema.String, Schema.String).annotate({
@@ -133,10 +132,8 @@ export const readPackageJson = (packageJsonDirectoryPath: string) => {
     Effect.flatMap(decodePackageJsonText(packageJsonFilePath)),
     Effect.flatMap(({ name, ...packageJson }) =>
       Effect.gen(function* () {
-        if (name === undefined) {
-          return yield* new PackageJsonWithoutName({ filePath: packageJsonFilePath });
-        }
-        if (!isPackageName(name)) {
+        const hasInvalidName = name !== undefined && !isPackageName(name);
+        if (hasInvalidName) {
           return yield* new PackageJsonNameInvalid({
             filePath: packageJsonFilePath,
             packageName: name,

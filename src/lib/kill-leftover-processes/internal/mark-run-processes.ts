@@ -10,7 +10,7 @@ import {
   availableParallelism,
   RUN_MARKERS_VARIABLE_NAME,
 } from "../../../shared/read-environment-config.ts";
-import { RunMarker } from "../../../shared/run-marker.ts";
+import { findTaskOfMarkedCommand, RunMarker } from "../../../shared/run-marker.ts";
 import { nullWhenProcessGoneOrHidden } from "./list-linux-processes-from-proc.ts";
 
 const MACOS_SYSTEM_LIBRARY_PATH = "/usr/lib/libSystem.B.dylib";
@@ -208,23 +208,23 @@ export const adoptSupervisorRunMarker = isMarkedPlatform
     )
   : Effect.succeed(null);
 
-const holdsToken = (environment: Uint8Array, token: string) => {
+const readMarkerTokens = (environment: Uint8Array, token: string) => {
   const variablePrefix = `${RUN_MARKERS_VARIABLE_NAME}=`;
   const mentionsToken = Buffer.from(
     environment.buffer,
     environment.byteOffset,
     environment.byteLength,
   ).includes(token, "latin1");
+  if (!mentionsToken) {
+    return null;
+  }
   return (
-    mentionsToken &&
     new TextDecoder("latin1")
       .decode(environment)
       .split("\0")
-      .some(
-        (entry) =>
-          entry.startsWith(variablePrefix) &&
-          entry.slice(variablePrefix.length).split(" ").includes(token),
-      )
+      .filter((entry) => entry.startsWith(variablePrefix))
+      .map((entry) => entry.slice(variablePrefix.length).split(" "))
+      .find((markerTokens) => markerTokens.includes(token)) ?? null
   );
 };
 
@@ -259,7 +259,7 @@ const readArgumentMaximum = (symbols: Effect.Success<typeof openMacOsLibrary>) =
   return symbols.sysctl(name, name.length, value, valueSize, null, 0) === 0 ? (value[0] ?? 0) : 0;
 };
 
-const macOsEnvironmentHoldsToken = (
+const readMacOsMarkerTokens = (
   symbols: Effect.Success<typeof openMacOsLibrary>,
   processArguments: Uint8Array,
   processId: number,
@@ -267,13 +267,12 @@ const macOsEnvironmentHoldsToken = (
 ) => {
   const valueSize = new BigUint64Array([BigInt(processArguments.byteLength)]);
   const name = Int32Array.from([CTL_KERN, KERN_PROCARGS2, processId]);
-  return (
-    symbols.sysctl(name, name.length, processArguments, valueSize, null, 0) === 0 &&
-    holdsToken(processArguments.subarray(0, Number(valueSize[0])), token)
-  );
+  return symbols.sysctl(name, name.length, processArguments, valueSize, null, 0) === 0
+    ? readMarkerTokens(processArguments.subarray(0, Number(valueSize[0])), token)
+    : null;
 };
 
-const findMacOsMarkedProcessIds = (
+const findMacOsMarkedProcesses = (
   marker: typeof RunMarker.Type,
   candidateProcessIds: readonly number[],
 ) =>
@@ -283,11 +282,22 @@ const findMacOsMarkedProcessIds = (
         const pipeIdentity = readMacOsPipeHandle(symbols, process.pid, marker.fileDescriptor);
         const fileDescriptors = new Uint8Array(PROC_FDINFO_BYTES * LISTED_FILE_DESCRIPTOR_LIMIT);
         const processArguments = new Uint8Array(readArgumentMaximum(symbols));
-        return candidateProcessIds.filter(
-          (processId) =>
-            (pipeIdentity !== null &&
-              macOsHoldsPipe(symbols, fileDescriptors, processId, pipeIdentity)) ||
-            macOsEnvironmentHoldsToken(symbols, processArguments, processId, marker.token),
+        return new Map(
+          candidateProcessIds.flatMap((processId) => {
+            const markerTokens = readMacOsMarkerTokens(
+              symbols,
+              processArguments,
+              processId,
+              marker.token,
+            );
+            if (markerTokens !== null) {
+              return [[processId, findTaskOfMarkedCommand(marker, markerTokens)] as const];
+            }
+            const holdsMarkerPipe =
+              pipeIdentity !== null &&
+              macOsHoldsPipe(symbols, fileDescriptors, processId, pipeIdentity);
+            return holdsMarkerPipe ? [[processId, null] as const] : [];
+          }),
         );
       }),
     ),
@@ -309,16 +319,18 @@ const linuxHoldsPipe = (
     Effect.map((links) => links.includes(pipeIdentity)),
   );
 
-const linuxEnvironmentHoldsToken = (
+const readLinuxMarkerTokens = (
   fileSystem: FileSystem.FileSystem,
   processId: number,
   token: string,
 ) =>
   readProcFileUnlessGone(`${PROC_DIRECTORY_PATH}/${processId}/environ`, fileSystem.readFile).pipe(
-    Effect.map((environment) => environment !== null && holdsToken(environment, token)),
+    Effect.map((environment) =>
+      environment === null ? null : readMarkerTokens(environment, token),
+    ),
   );
 
-const findLinuxMarkedProcessIds = (
+const findLinuxMarkedProcesses = (
   marker: typeof RunMarker.Type,
   candidateProcessIds: readonly number[],
 ) =>
@@ -333,20 +345,22 @@ const findLinuxMarkedProcessIds = (
       pipeIdentity === null
         ? Effect.succeed(false)
         : linuxHoldsPipe(fileSystem, processId, pipeIdentity);
-    return yield* Effect.filter(
+    const markedProcesses = yield* Effect.forEach(
       candidateProcessIds,
       (processId) =>
         Effect.gen(function* () {
-          return (
-            (yield* linuxEnvironmentHoldsToken(fileSystem, processId, marker.token)) ||
-            (yield* holdsMarkerPipe(processId))
-          );
+          const markerTokens = yield* readLinuxMarkerTokens(fileSystem, processId, marker.token);
+          if (markerTokens !== null) {
+            return [[processId, findTaskOfMarkedCommand(marker, markerTokens)] as const];
+          }
+          return (yield* holdsMarkerPipe(processId)) ? [[processId, null] as const] : [];
         }),
       { concurrency: yield* availableParallelism },
     );
+    return new Map(markedProcesses.flat());
   });
 
-export const findMarkedProcessIds = (
+export const findMarkedProcesses = (
   marker: typeof RunMarker.Type | null,
   candidateProcessIds: Iterable<number>,
 ) => {
@@ -355,13 +369,9 @@ export const findMarkedProcessIds = (
     (processId) => !runProcessIds.has(processId),
   );
   if (marker === null) {
-    return Effect.succeed(new Set<number>());
+    return Effect.succeed(new Map<number, string | null>());
   }
-  return Effect.gen(function* () {
-    return new Set(
-      process.platform === "darwin"
-        ? yield* findMacOsMarkedProcessIds(marker, otherProcessIds)
-        : yield* findLinuxMarkedProcessIds(marker, otherProcessIds),
-    );
-  });
+  return process.platform === "darwin"
+    ? findMacOsMarkedProcesses(marker, otherProcessIds)
+    : findLinuxMarkedProcesses(marker, otherProcessIds);
 };

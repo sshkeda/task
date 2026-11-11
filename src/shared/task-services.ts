@@ -1,7 +1,6 @@
 import { Context } from "effect";
 import type { Effect, Schema } from "effect";
 
-import type { TaskResultNotJson } from "../lib/errors/index.ts";
 import type { Task } from "../lib/task/index.ts";
 import type { TaskRequestFailure } from "./task-errors.ts";
 import { TASK_PACKAGE } from "./task-package.ts";
@@ -23,8 +22,6 @@ export class Served<Success> {
 export class Serving extends Context.Service<
   Serving,
   {
-    readonly serve: <Success>(
-      servedValue: Success,
-    ) => Effect.Effect<Served<Success>, TaskResultNotJson>;
+    readonly serve: <Success>(servedValue: Success) => Effect.Effect<Served<Success>>;
   }
 >()(`${TASK_PACKAGE.name}/Serving`) {}

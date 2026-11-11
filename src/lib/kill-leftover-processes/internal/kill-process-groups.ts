@@ -8,7 +8,7 @@ import { printLine } from "../../../shared/print-to-standard-error.ts";
 import type { RunMarker } from "../../../shared/run-marker.ts";
 import { findDescendantProcessIds, findSessionProcessIds } from "./find-process-ids.ts";
 import { isStillListedAs, listProcesses } from "./list-processes.ts";
-import { findMarkedProcessIds } from "./mark-run-processes.ts";
+import { findMarkedProcesses } from "./mark-run-processes.ts";
 import { ProcessNotKillable } from "./process-cleanup-errors.ts";
 import { sendSignal, signalUnlessReplaced } from "./send-signal.ts";
 import { findStartedGroupWitness } from "./started-process-groups.ts";
@@ -106,10 +106,11 @@ const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(funct
     }
   }
 
+  const markedProcesses = yield* findMarkedProcesses(input.runMarker, listedProcesses.keys());
   const processIds = [
     ...findDescendantProcessIds(listedProcesses, [...childProcessIds, ...adoptedProcessIds]),
     ...findSessionProcessIds(listedProcesses, input.sessionId),
-    ...(yield* findMarkedProcessIds(input.runMarker, listedProcesses.keys())),
+    ...markedProcesses.keys(),
     ...[...listedProcesses]
       .filter(([, listedProcess]) => killableGroups.has(listedProcess.processGroupId))
       .map(([processId]) => processId),
@@ -136,6 +137,7 @@ const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(funct
       input.startedProcessGroups.get(processId)?.taskName ??
       findOwner(row.parentProcessId) ??
       killableGroups.get(row.processGroupId) ??
+      markedProcesses.get(processId) ??
       null
     );
   };
