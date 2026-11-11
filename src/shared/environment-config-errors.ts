@@ -11,6 +11,17 @@ export class StateDirectoryPathBlank extends Schema.TaggedError<StateDirectoryPa
   }
 }
 
+export class LogLevelInvalid extends Schema.TaggedError<LogLevelInvalid>()("LogLevelInvalid", {
+  ...TASK_ERROR_FIELDS,
+  variableName: Schema.String,
+  value: Schema.String,
+  logLevelNames: Schema.Array(Schema.String),
+}) {
+  public override get message() {
+    return `${this.variableName} is "${this.value}", not ${this.logLevelNames.join(" or ")}`;
+  }
+}
+
 export class HomeDirectoryPathMissing extends Schema.TaggedError<HomeDirectoryPathMissing>()(
   "HomeDirectoryPathMissing",
   {

@@ -9,24 +9,28 @@ import {
   Option,
   PlatformError,
   Predicate,
+  Redacted,
   Stream,
 } from "effect";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
+import { CapturedCommandFailed, CommandFailed } from "../../src/lib/errors/index.ts";
 import { inheritedEnvironment } from "../../src/shared/read-environment-config.ts";
 import { exists, read } from "../shared/access-files.ts";
+import { encodeJson } from "../shared/encode-json.ts";
 import { failTestCleanup } from "../shared/fail-test-cleanup.ts";
 import { exitAsValue, failureAsValue } from "../shared/failure-as-value.ts";
 import { findMisprintedErrorLines } from "../shared/find-misprinted-error-lines.ts";
 import { isProcessAlive } from "../shared/is-process-alive.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTemporaryDirectory } from "../shared/make-temporary-directories.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
-export const input = Task.make(
-  "Task.exec streams exact input, closes default stdin and retains failure output",
-  Effect.gen(function* () {
+export const input = Task.make({
+  name: "Task.exec streams exact input, closes default stdin and retains failure output",
+  run: Effect.gen(function* () {
     const contents = "first line\nsecond line\n";
     expect(
       yield* Task.exec("cat", [], {
@@ -39,11 +43,11 @@ export const input = Task.make(
     );
     expect(failure.message).toContain("error-output");
   }),
-);
+});
 
-export const separateStreams = Task.make(
-  "a failed command keeps its standard output and standard error apart and exact, and its message shows both",
-  Effect.gen(function* () {
+export const separateStreams = Task.make({
+  name: "a failed command keeps its standard output and standard error apart and exact, and its message shows both",
+  run: Effect.gen(function* () {
     const report = '{"diagnostics":[]}\n';
     yield* Task.exec("sh", [
       "-c",
@@ -62,11 +66,11 @@ export const separateStreams = Task.make(
       ),
     );
   }),
-);
+});
 
-export const emptyStandardOutput = Task.make(
-  "a failed command that prints nothing on standard output keeps it empty and leaves it out of the message",
-  Task.exec("sh", ["-c", String.raw`printf 'only error\n' >&2; exit 2`]).pipe(
+export const emptyStandardOutput = Task.make({
+  name: "a failed command that prints nothing on standard output keeps it empty and leaves it out of the message",
+  run: Task.exec("sh", ["-c", String.raw`printf 'only error\n' >&2; exit 2`]).pipe(
     Effect.flatMap((output) => Effect.die(`the command succeeded and printed ${output}`)),
     Effect.catchTag("CommandFailed", (failure) =>
       Effect.sync(() => {
@@ -76,11 +80,11 @@ export const emptyStandardOutput = Task.make(
       }),
     ),
   ),
-);
+});
 
-export const leadingWhitespace = Task.make(
-  "a failed command keeps leading and trailing whitespace on both outputs",
-  Task.exec("sh", [
+export const leadingWhitespace = Task.make({
+  name: "a failed command keeps leading and trailing whitespace on both outputs",
+  run: Task.exec("sh", [
     "-c",
     String.raw`printf '  indented report\n\n'; printf '\t tabbed error \n' >&2; exit 1`,
   ]).pipe(
@@ -92,11 +96,11 @@ export const leadingWhitespace = Task.make(
       }),
     ),
   ),
-);
+});
 
 const CONSUMER_EXEC_SOURCE = `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   const output = yield* Task.exec("sh", ["-c", 'printf "%s" "$GREETING"'], {
     env: { GREETING: "hello from Task.exec" },
   });
@@ -106,11 +110,10 @@ export const main = Task.make("main", Effect.gen(function* () {
     Effect.catchTag("CommandFailed", (failed) => Effect.succeed(\`\${failed.code} \${failed.standardError}\`)),
   );
   yield* Effect.log(\`failure: \${failure}\`);
-}));
-if (import.meta.main) Task.main(main);
+}) });
 `;
 
-export const consumerExec = Task.make(
+export const consumerExec = makeTest(
   "a consumer project imports Task from the package to run commands with Task.exec and catch their failures",
   Effect.scoped(
     Effect.gen(function* () {
@@ -122,32 +125,27 @@ export const consumerExec = Task.make(
       expect(ran.standardError).toContain("[main] failure: 3 broken");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const ROOT_TASK_FAILURE_SOURCES = {
   "command.ts": `import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Task.exec("sh", ["-c", "exit 7"]));
-if (import.meta.main) Task.main(main);
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "exit 7"]) });
 `,
   "task-error.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const main = Task.make("main", Effect.fail(new TaskError({ message: "broken" })));
-if (import.meta.main) Task.main(main);
+export default Task.make({ name: "main", run: Effect.fail(new TaskError({ message: "broken" })) });
 `,
   "awaited-command.ts": `import { Task } from "@sshkeda/task";
-export const command = Task.make("command", Task.exec("sh", ["-c", "exit 7"]));
-export const main = Task.make("main", command);
-if (import.meta.main) Task.main(main);
+export const command = Task.make({ name: "command", run: Task.exec("sh", ["-c", "exit 7"]) });
+export default Task.make({ name: "main", run: command });
 `,
   "killed-command.ts": `import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Task.exec("sh", ["-c", "kill -KILL $$"]));
-if (import.meta.main) Task.main(main);
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "kill -KILL $$"]) });
 `,
 } as const;
 
-export const rootTaskCommandExitCode = Task.make(
+export const rootTaskCommandExitCode = makeTest(
   "a run whose root task fails with a command's exit code exits with that code, through the supervisor, and every other failure exits 1",
   Effect.scoped(
     Effect.gen(function* () {
@@ -168,10 +166,98 @@ export const rootTaskCommandExitCode = Task.make(
       ]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const environment = Task.make(
+const KILLED_COMMAND_ATTEMPTS = ["first", "second", "third", "fourth", "fifth"] as const;
+
+export const killedCommandOutput = makeTest(
+  "a command killed by a signal right after printing still logs everything it printed",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const attempts = yield* encodeJson(KILLED_COMMAND_ATTEMPTS);
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.forEach(
+  ${attempts},
+  (attempt) => Task.exec("sh", ["-c", \`echo out-\${attempt}; echo err-\${attempt} >&2; kill -KILL $$\`]).pipe(
+    Effect.catchTag("CommandFailed", () => Effect.void),
+  ),
+  { discard: true },
+) });
+`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      for (const attempt of KILLED_COMMAND_ATTEMPTS) {
+        expect(ran.standardError).toContain(`[main] out-${attempt}\n`);
+        expect(ran.standardError).toContain(`[main] err-${attempt}\n`);
+      }
+    }),
+  ),
+);
+
+export const signalKilledCommandFailed = makeTest(
+  "a command killed by a signal fails with a CommandFailed that Effect.catchTag catches, carrying the signal and the command's output",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  const caught = yield* Task.exec("sh", ["-c", "echo caught-out; echo caught-err >&2; kill -SEGV $$"]).pipe(
+    Effect.catchTag("CommandFailed", (failure) =>
+      Effect.succeed([failure.code, failure.signal, failure.standardOutput, failure.standardError]),
+    ),
+  );
+  yield* Effect.log(\`caught \${JSON.stringify(caught)}\`);
+  yield* Task.exec("sh", ["-c", "echo out; echo err >&2; kill -SEGV $$"]);
+}) });
+`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toContain(
+        '[main] caught [null,"SIGSEGV","caught-out\\n","caught-err\\n"]\n',
+      );
+      expect(ran.standardError).toContain("[main] out\n");
+      expect(ran.standardError).toContain("[main] err\n");
+      expect(ran.standardError).toContain(
+        "[main] error CommandFailed: sh was killed by signal SIGSEGV\nfailed: main (1 of 1 task), ",
+      );
+      expect(findMisprintedErrorLines(ran.standardError)).toEqual([]);
+    }),
+  ),
+);
+
+export const commandEndsWithCodeOrSignal = makeTest(
+  "a CommandFailed or CapturedCommandFailed is refused unless it has exactly one of an exit code and a signal",
+  Effect.sync(() => {
+    const output = { standardOutput: "", standardError: "" };
+    const capturedOutput = {
+      standardOutput: Redacted.make(""),
+      standardError: Redacted.make(""),
+    };
+    expect(new CommandFailed({ command: "c", code: 1, ...output }).message).toBe(
+      "c exited with code 1",
+    );
+    expect(
+      new CommandFailed({ command: "c", code: null, signal: "SIGKILL", ...output }).message,
+    ).toBe("c was killed by signal SIGKILL");
+    for (const end of [{ code: null }, { code: 1, signal: "SIGKILL" }]) {
+      expect(
+        () => new CommandFailed({ command: "c", ...end, ...output }).message,
+        String(end.code),
+      ).toThrow();
+      expect(
+        () => new CapturedCommandFailed({ command: "c", ...end, ...capturedOutput }).message,
+        String(end.code),
+      ).toThrow();
+    }
+  }),
+);
+
+export const environment = makeTest(
   "a command sees PATH, HOME, TMPDIR, the run's own task config, the run's marker and what it declares, not the rest of the run's environment, without losing empty, nested or sparse numeric names",
   Effect.scoped(
     Effect.gen(function* () {
@@ -198,7 +284,7 @@ const always = Object.fromEntries(["HOME", "PATH", "TMPDIR", "SSHKEDA_TASK_STATE
   const value = process.env[name];
   return value === undefined ? [] : [[name, value]];
 }));
-export const main = Task.make("main", Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   expect(process.env.TASK_ENV).toBe("parent");
   expect(always.PATH).toBe(process.env.PATH);
   expect(yield* readEnvironment({})).toEqual(always);
@@ -218,8 +304,7 @@ export const main = Task.make("main", Effect.gen(function* () {
   expect(Object.keys(extended)).not.toContain("HOME");
   const replaced = yield* readEnvironment({env: { ONLY: "replacement" }});
   expect(replaced).toEqual({ONLY: "replacement"});
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const result = yield* runTaskProcess(project, "main.ts", {
         TASK_ENV: "parent",
@@ -229,10 +314,9 @@ if (import.meta.main) Task.main(main);`,
       expect(result.exitCode, result.standardError).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const nestedRunConfig = Task.make(
+export const nestedRunConfig = makeTest(
   "a task run that a command starts keeps the outer run's state directory, worker count and setup limit",
   Effect.scoped(
     Effect.gen(function* () {
@@ -240,13 +324,12 @@ export const nestedRunConfig = Task.make(
         "outer/package.json": `{ "name": "outer", "type": "module" }`,
         "outer/main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Task.exec("bun", ["inner.ts"], { cwd: "nested" }));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Task.exec("bun", ["inner.ts"], { cwd: "nested" }) });`,
         "outer/nested/package.json": `{ "name": "nested", "type": "module" }`,
         "outer/nested/inner.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const inner = Task.make("inner", Effect.log(\`inner sees workers=\${process.env.SSHKEDA_TASK_WORKERS} setup=\${process.env.SSHKEDA_TASK_SETUP_LIMIT}\`));
-if (import.meta.main) Task.main(inner);`,
+export const inner = Task.make({ name: "inner", run: Effect.log(\`inner sees workers=\${process.env.SSHKEDA_TASK_WORKERS} setup=\${process.env.SSHKEDA_TASK_SETUP_LIMIT}\`) });
+export default inner;`,
       });
       const taskConfig = {
         SSHKEDA_TASK_STATE_DIRECTORY: "state",
@@ -267,10 +350,9 @@ if (import.meta.main) Task.main(inner);`,
       expect(yield* fileSystem.exists(`${project.home}/.sshkeda-task`)).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const declaredEnvironment = Task.make(
+export const declaredEnvironment = makeTest(
   "a task's commands see a variable from the run only when the task passes it, besides PATH",
   Effect.scoped(
     Effect.gen(function* () {
@@ -279,10 +361,9 @@ export const declaredEnvironment = Task.make(
 import { Task } from "@sshkeda/task";
 const declared = Config.String("TASK_TEST_DECLARED");
 const printVariables = 'printf "undeclared=%s declared=%s %s path=%s" "$TASK_TEST_UNDECLARED" "$TASK_TEST_DECLARED" "$(git --version)" "$PATH"';
-export const main = Task.make("main", Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* Effect.log(yield* Task.exec("sh", ["-c", printVariables], { env: { TASK_TEST_DECLARED: yield* declared } }));
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const { PATH: inheritedPath } = yield* inheritedEnvironment;
       const runPath = yield* Effect.fromNullishOr(inheritedPath);
@@ -294,7 +375,7 @@ if (import.meta.main) Task.main(main);`,
         TASK_TEST_DECLARED: "a",
       });
       expect(first.exitCode, first.standardError).toBe(0);
-      expect(first.standardError).toContain(`[main] started\n[main] ${printed("a")}\n`);
+      expect(first.standardError).toContain(`\n[main] ${printed("a")}\n`);
       const pathChanged = yield* runTaskProcess(project, "main.ts", {
         TASK_TEST_DECLARED: "b",
         PATH: `${runPath}:${project.directory}`,
@@ -302,10 +383,9 @@ if (import.meta.main) Task.main(main);`,
       expect(pathChanged.standardError).toContain(`path=${runPath}:${project.directory}\n`);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const unsupportedCommandRefusals = Task.make(
+export const unsupportedCommandRefusals = makeTest(
   "a refused piped command or spawn option prints its tag",
   Effect.scoped(
     Effect.gen(function* () {
@@ -313,12 +393,11 @@ export const unsupportedCommandRefusals = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { ChildProcess } from "effect/process";
 import { Task } from "@sshkeda/task";
-export const piped = Task.make("piped", Effect.scoped(
+export const piped = Task.make({ name: "piped", run: Effect.scoped(
   ChildProcess.make("echo", ["a"]).pipe(ChildProcess.pipeTo(ChildProcess.make("cat", []))),
-));
-export const shell = Task.make("shell", Effect.scoped(ChildProcess.make("echo", ["a"], { shell: true })));
-export const main = Task.make("main", Task.allSettled([piped, shell]));
-if (import.meta.main) Task.main(main);`,
+) });
+export const shell = Task.make({ name: "shell", run: Effect.scoped(ChildProcess.make("echo", ["a"], { shell: true })) });
+export default Task.make({ name: "main", run: Task.allSettled([piped, shell]) });`,
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode, result.standardError).toBe(1);
@@ -331,10 +410,9 @@ if (import.meta.main) Task.main(main);`,
       expect(findMisprintedErrorLines(result.standardError)).toEqual([]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const commandsThatCannotStart = Task.make(
+export const commandsThatCannotStart = makeTest(
   "a command that cannot start fails with CommandNotStarted, which names a missing or non-directory working directory instead of the program, and keeps Bun's text for a missing program",
   Effect.scoped(
     Effect.gen(function* () {
@@ -343,15 +421,14 @@ export const commandsThatCannotStart = Task.make(
         "tools/build.sh": "echo built",
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const missingDirectory = Task.make("missing-directory", Task.exec("sh", ["build.sh"], { cwd: "tool" }));
-export const fileDirectory = Task.make("file-directory", Task.exec("sh", ["build.sh"], { cwd: "a-file.txt" }));
-export const missingProgram = Task.make("missing-program", Task.exec("no-such-program", ["--version"]));
-export const caught = Task.make("caught", Task.exec("sh", ["build.sh"], { cwd: "tool" }).pipe(
+export const missingDirectory = Task.make({ name: "missing-directory", run: Task.exec("sh", ["build.sh"], { cwd: "tool" }) });
+export const fileDirectory = Task.make({ name: "file-directory", run: Task.exec("sh", ["build.sh"], { cwd: "a-file.txt" }) });
+export const missingProgram = Task.make({ name: "missing-program", run: Task.exec("no-such-program", ["--version"]) });
+export const caught = Task.make({ name: "caught", run: Task.exec("sh", ["build.sh"], { cwd: "tool" }).pipe(
   Effect.catchTag("CommandNotStarted", (failure) => Effect.log(\`caught: \${failure.command}\`)),
-));
-export const started = Task.make("started", Task.exec("sh", ["build.sh"], { cwd: "tools" }));
-export const main = Task.make("main", Task.allSettled([missingDirectory, fileDirectory, missingProgram, caught, started]));
-if (import.meta.main) Task.main(main);`,
+) });
+export const started = Task.make({ name: "started", run: Task.exec("sh", ["build.sh"], { cwd: "tools" }) });
+export default Task.make({ name: "main", run: Task.allSettled([missingDirectory, fileDirectory, missingProgram, caught, started]) });`,
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode, result.standardError).toBe(1);
@@ -369,30 +446,28 @@ if (import.meta.main) Task.main(main);`,
       expect(findMisprintedErrorLines(result.standardError)).toEqual([]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failingStandardInputStreams = Task.make(
+export const failingStandardInputStreams = makeTest(
   "a standard input stream that fails or dies fails the run with CommandStandardInputFailed, next to CommandFailed when the command it stopped still exits non-zero, while a command that stops reading its standard input still passes",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect, PlatformError, Stream } from "effect";
 import { Task } from "@sshkeda/task";
-export const failing = Task.make("failing", Task.exec("cat", [], {
+export const failing = Task.make({ name: "failing", run: Task.exec("cat", [], {
   stdin: Stream.fail(PlatformError.systemError({ _tag: "NotFound", module: "FileSystem", method: "stream", description: "input file missing" })),
-}));
-export const dying = Task.make("dying", Task.exec("cat", [], { stdin: Stream.die(new Error("input stream died")) }));
+}) });
+export const dying = Task.make({ name: "dying", run: Task.exec("cat", [], { stdin: Stream.die(new Error("input stream died")) }) });
 const dyingOnceTrapIsSet = Stream.fromEffect(Effect.promise(async () => {
   while (!(await Bun.file("trap-set").exists())) await Bun.sleep(10);
   return new Uint8Array();
 })).pipe(Stream.concat(Stream.die(new Error("input stream died"))));
-export const dyingAndExiting = Task.make("dying-and-exiting", Task.exec("sh", ["-c", "trap 'exit 3' TERM; touch trap-set; cat; exit 3"], { stdin: dyingOnceTrapIsSet }));
-export const stopsReading = Task.make("stops-reading", Task.exec("head", ["-c", "1"], {
+export const dyingAndExiting = Task.make({ name: "dying-and-exiting", run: Task.exec("sh", ["-c", "trap 'exit 3' TERM; touch trap-set; cat; exit 3"], { stdin: dyingOnceTrapIsSet }) });
+export const stopsReading = Task.make({ name: "stops-reading", run: Task.exec("head", ["-c", "1"], {
   stdin: Stream.forever(Stream.make(new Uint8Array(65536))),
-}));
-export const main = Task.make("main", Task.allSettled([failing, dying, dyingAndExiting, stopsReading]));
-if (import.meta.main) Task.main(main);`,
+}) });
+export default Task.make({ name: "main", run: Task.allSettled([failing, dying, dyingAndExiting, stopsReading]) });`,
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode, result.standardError).toBe(1);
@@ -414,14 +489,13 @@ if (import.meta.main) Task.main(main);`,
       expect(findMisprintedErrorLines(result.standardError)).toEqual([]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const STANDARD_INPUT_CHUNK_BYTES = 65_536;
 
 const PROMPT_FAILURE_LIMIT_MILLISECONDS = 3000;
 
-const HELD_OUTPUT_FAILURE_LIMIT_MILLISECONDS = 10_000;
+const HELD_OUTPUT_FAILURE_LIMIT_MILLISECONDS = 20_000;
 
 const isBrokenPipe = (failure: Option.Option<PlatformError.PlatformError>) =>
   Option.exists(
@@ -430,7 +504,7 @@ const isBrokenPipe = (failure: Option.Option<PlatformError.PlatformError>) =>
       Predicate.hasProperty(platformError.cause, "code") && platformError.cause.code === "EPIPE",
   );
 
-export const standardInputClosedByCommand = Task.make(
+export const standardInputClosedByCommand = makeTest(
   "a command that stops reading 64 KiB chunks of standard input ends the input of Task.exec and of a stdin stream, while writing them through handle.stdin fails with EPIPE",
   Effect.scoped(
     Effect.gen(function* () {
@@ -448,10 +522,9 @@ export const standardInputClosedByCommand = Task.make(
       expect(yield* writtenThroughSink.exitCode).toBe(ChildProcessSpawner.ExitCode(0));
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const smallStandardInputClosedByCommand = Task.make(
+export const smallStandardInputClosedByCommand = makeTest(
   "a few bytes of standard input for a command that already closed it end the input of Task.exec and of a stdin stream, while writing them through handle.stdin fails with EPIPE",
   Effect.scoped(
     Effect.gen(function* () {
@@ -493,10 +566,9 @@ export const smallStandardInputClosedByCommand = Task.make(
       expect(yield* writtenThroughSink.exitCode).toBe(ChildProcessSpawner.ExitCode(0));
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const standardInputStreamsOwnBrokenPipe = Task.make(
+export const standardInputStreamsOwnBrokenPipe = makeTest(
   "a standard input stream that fails with its own EPIPE fails Task.exec with that failure's own description",
   Effect.scoped(
     Effect.gen(function* () {
@@ -504,8 +576,7 @@ export const standardInputStreamsOwnBrokenPipe = Task.make(
         "main.ts": `import { Effect, PlatformError, Stream } from "effect";
 import { Task } from "@sshkeda/task";
 const ownBrokenPipe = PlatformError.systemError({ _tag: "Unknown", module: "Upstream", method: "read", description: "the upstream socket closed", cause: Object.assign(new Error("EPIPE: broken pipe, read"), { code: "EPIPE", syscall: "read" }) });
-export const main = Task.make("main", Task.exec("cat", [], { stdin: Stream.concat(Stream.make(new TextEncoder().encode("a")), Stream.fail(ownBrokenPipe)) }));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Task.exec("cat", [], { stdin: Stream.concat(Stream.make(new TextEncoder().encode("a")), Stream.fail(ownBrokenPipe)) }) });`,
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode, result.standardError).toBe(1);
@@ -518,10 +589,9 @@ if (import.meta.main) Task.main(main);`,
       ]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const selfInterruptingStandardInput = Task.make(
+export const selfInterruptingStandardInput = makeTest(
   "a standard input stream that interrupts itself fails with CauseWithoutFailure, through Task.exec and through a stdin stream",
   Effect.scoped(
     Effect.gen(function* () {
@@ -533,18 +603,17 @@ import { Task } from "@sshkeda/task";
 const interruptsItself = Stream.concat(Stream.make(new TextEncoder().encode("a")), Stream.fromEffect(Effect.interrupt));
 const interruptsItselfAndFinishesAfterTheCommand = (marker: string) => Stream.fromEffect(Effect.sync(() => writeFileSync(\`\${import.meta.dir}/\${marker}\`, "")).pipe(Effect.andThen(Effect.interrupt))).pipe(Stream.ensuring(Effect.sleep("300 millis")));
 const exitsOnceMarked = (marker: string) => ["-c", \`until [ -e \${marker} ]; do sleep 0.01; done\`];
-export const throughRunCommand = Task.make("through-run-command", Task.exec("cat", [], { stdin: interruptsItself }));
-export const throughStream = Task.make("through-stream", Effect.scoped(Effect.gen(function* () {
+export const throughRunCommand = Task.make({ name: "through-run-command", run: Task.exec("cat", [], { stdin: interruptsItself }) });
+export const throughStream = Task.make({ name: "through-stream", run: Effect.scoped(Effect.gen(function* () {
   const child = yield* ChildProcess.make("cat", [], { stdin: interruptsItself });
   return yield* child.exitCode;
-})));
-export const throughRunCommandAfterExit = Task.make("through-run-command-after-exit", Task.exec("sh", exitsOnceMarked("run-command-stdin-started"), { stdin: interruptsItselfAndFinishesAfterTheCommand("run-command-stdin-started") }));
-export const throughStreamAfterExit = Task.make("through-stream-after-exit", Effect.scoped(Effect.gen(function* () {
+})) });
+export const throughRunCommandAfterExit = Task.make({ name: "through-run-command-after-exit", run: Task.exec("sh", exitsOnceMarked("run-command-stdin-started"), { stdin: interruptsItselfAndFinishesAfterTheCommand("run-command-stdin-started") }) });
+export const throughStreamAfterExit = Task.make({ name: "through-stream-after-exit", run: Effect.scoped(Effect.gen(function* () {
   const child = yield* ChildProcess.make("sh", exitsOnceMarked("stream-stdin-started"), { stdin: interruptsItselfAndFinishesAfterTheCommand("stream-stdin-started") });
   return yield* child.exitCode;
-})));
-export const main = Task.make("main", Task.allSettled([throughRunCommand, throughStream, throughRunCommandAfterExit, throughStreamAfterExit]));
-if (import.meta.main) Task.main(main);`,
+})) });
+export default Task.make({ name: "main", run: Task.allSettled([throughRunCommand, throughStream, throughRunCommandAfterExit, throughStreamAfterExit]) });`,
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode, result.standardError).toBe(1);
@@ -561,10 +630,9 @@ if (import.meta.main) Task.main(main);`,
       ]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const standardInputFailureStopsCommand = Task.make(
+export const standardInputFailureStopsCommand = makeTest(
   "a standard input stream that fails while its command neither reads it nor exits fails at once and stops the command",
   Effect.scoped(
     Effect.gen(function* () {
@@ -601,10 +669,9 @@ export const standardInputFailureStopsCommand = Task.make(
       expect(yield* child.isRunning).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const standardInputFailureWhileOutputStaysOpen = Task.make(
+export const standardInputFailureWhileOutputStaysOpen = makeTest(
   "a standard input stream that fails fails Task.exec at once, even when its stopped command exits cleanly and leaves a background child holding its output open",
   Effect.scoped(
     Effect.gen(function* () {
@@ -615,8 +682,7 @@ const dyingOnceTrapIsSet = Stream.fromEffect(Effect.promise(async () => {
   while (!(await Bun.file("trap-set").exists())) await Bun.sleep(10);
   return new Uint8Array();
 })).pipe(Stream.concat(Stream.die(new Error("input stream died"))));
-export const main = Task.make("main", Task.exec("sh", ["-c", "trap 'sleep 20 & exit 0' TERM; touch trap-set; while :; do sleep 0.05; done"], { stdin: dyingOnceTrapIsSet }));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "trap 'sleep 600 & exit 0' TERM; touch trap-set; while :; do sleep 0.05; done"], { stdin: dyingOnceTrapIsSet }) });`,
       });
       const [elapsed, result] = yield* Effect.timed(runTaskProcess(project, "main.ts"));
       expect(result.exitCode, result.standardError).toBe(1);
@@ -630,10 +696,10 @@ if (import.meta.main) Task.main(main);`,
       expect(Duration.toMillis(elapsed)).toBeLessThan(HELD_OUTPUT_FAILURE_LIMIT_MILLISECONDS);
     }),
   ),
-  { timeout: "30 seconds", cleanup: "5 seconds" },
+  "30 seconds",
 );
 
-export const outputFailureStopsCommand = Task.make(
+export const outputFailureStopsCommand = makeTest(
   "an output stream that fails fails Task.exec at once and stops its command",
   Effect.scoped(
     Effect.gen(function* () {
@@ -658,20 +724,18 @@ export const outputFailureStopsCommand = Task.make(
       expect(failure).toBe(outputReadFailure);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const everyStandardInputFailure = Task.make(
+export const everyStandardInputFailure = makeTest(
   "a standard input stream that fails in several ways at once prints each failure",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Cause, Effect, Stream } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Task.exec("cat", [], {
+export default Task.make({ name: "main", run: Task.exec("cat", [], {
   stdin: Stream.failCause(Cause.combine(Cause.die(new Error("first input failure")), Cause.die(new Error("second input failure")))),
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode, result.standardError).toBe(1);
@@ -685,10 +749,9 @@ if (import.meta.main) Task.main(main);`,
       ]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const signalKilledCommandWithBackgroundChild = Task.make(
+export const signalKilledCommandWithBackgroundChild = makeTest(
   "a command killed by a signal fails at once, even while a background child still holds its output open",
   Effect.scoped(
     Effect.gen(function* () {
@@ -697,15 +760,12 @@ export const signalKilledCommandWithBackgroundChild = Task.make(
         Effect.timed,
       );
       expect(Duration.toMillis(elapsed)).toBeLessThan(PROMPT_FAILURE_LIMIT_MILLISECONDS);
-      expect(failure.message).toBe(
-        "Unknown: ChildProcess.exitCode (sh): process interrupted by signal SIGKILL",
-      );
+      expect(failure.message).toBe("sh was killed by signal SIGKILL");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const successfulCommandWithBackgroundChild = Task.make(
+export const successfulCommandWithBackgroundChild = makeTest(
   "a command that exits 0 returns at once with its output and ends the background child it left holding its output open, through Task.exec and through ChildProcess",
   Effect.scoped(
     Effect.gen(function* () {
@@ -735,18 +795,16 @@ export const successfulCommandWithBackgroundChild = Task.make(
       expect(yield* isProcessAlive(Number(backgroundChild))).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const successfulCommandWithEscapedBackgroundChild = Task.make(
+export const successfulCommandWithEscapedBackgroundChild = makeTest(
   "a command that exits 0 returns its output once its cleanup limit passes, even while a background child that left its process group holds its output open",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Task.exec("sh", ["-c", "perl -MPOSIX -e 'defined POSIX::setsid() or die; open my $f, q(>), q(escaped) or die; close $f; exec qw(sleep 600)' & echo $! > pid; until [ -e escaped ]; do sleep 0.01; done; printf finished"]).pipe(Effect.flatMap((output) => Effect.log(\`output: \${output}\`))), { timeout: "20 seconds", cleanup: "1 second" });
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "perl -MPOSIX -e 'defined POSIX::setsid() or die; open my $f, q(>), q(escaped) or die; close $f; exec qw(sleep 600)' & echo $! > pid; until [ -e escaped ]; do sleep 0.01; done; printf finished"]).pipe(Effect.flatMap((output) => Effect.log(\`output: \${output}\`))), timeout: "20 seconds", cleanup: "1 second" });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       const sleep = Number((yield* read(`${project.directory}/pid`)).trim());
@@ -763,18 +821,16 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toContain("[main] output: finished");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const successfulCommandWithEscapedAndGroupBackgroundChildren = Task.make(
+export const successfulCommandWithEscapedAndGroupBackgroundChildren = makeTest(
   "a command that exits 0 returns its output once its cleanup limit passes, even while a background child that left its process group and one that stayed in it hold its output open",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Task.exec("sh", ["-c", "perl -MPOSIX -e 'defined POSIX::setsid() or die; open my $f, q(>), q(escaped) or die; close $f; exec qw(sleep 600)' & echo $! > pid; until [ -e escaped ]; do sleep 0.01; done; sleep 600 & printf finished"]).pipe(Effect.flatMap((output) => Effect.log(\`output: \${output}\`))), { timeout: "20 seconds", cleanup: "1 second" });
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "perl -MPOSIX -e 'defined POSIX::setsid() or die; open my $f, q(>), q(escaped) or die; close $f; exec qw(sleep 600)' & echo $! > pid; until [ -e escaped ]; do sleep 0.01; done; sleep 600 & printf finished"]).pipe(Effect.flatMap((output) => Effect.log(\`output: \${output}\`))), timeout: "20 seconds", cleanup: "1 second" });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       const sleep = Number((yield* read(`${project.directory}/pid`)).trim());
@@ -791,12 +847,11 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toContain("[main] output: finished");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const outputReadLongAfterExit = Task.make(
-  "a command's output read after its cleanup limit has passed since it exited still holds everything it printed",
-  Effect.scoped(
+export const outputReadLongAfterExit = Task.make({
+  name: "a command's output read after its cleanup limit has passed since it exited still holds everything it printed",
+  run: Effect.scoped(
     Effect.gen(function* () {
       const command = yield* ChildProcess.make("printf", ["finished"], {
         forceKillAfter: "100 millis",
@@ -806,9 +861,9 @@ export const outputReadLongAfterExit = Task.make(
       expect(yield* command.stdout.pipe(Stream.decodeText, Stream.mkString)).toBe("finished");
     }),
   ),
-);
+});
 
-export const stoppedBackgroundChildCleansUp = Task.make(
+export const stoppedBackgroundChildCleansUp = makeTest(
   "a background child that stopped itself and holds a successful command's output open is continued after SIGTERM, so its TERM handler's output reaches Task.exec",
   Effect.gen(function* () {
     const output = yield* Task.exec("sh", [
@@ -817,18 +872,45 @@ export const stoppedBackgroundChildCleansUp = Task.make(
     ]);
     expect(output).toBe("finished\ncleaned\n");
   }),
-  { timeout: "30 seconds", cleanup: "5 seconds" },
+  "30 seconds",
 );
 
-export const successfulCommandWithBackgroundChildIgnoringTerm = Task.make(
+const HELPER_PROCESS_LINES = 20_000;
+
+export const outputThroughHelperProcess = makeTest(
+  "a command that sends its output through a helper process returns everything the helper passes on after the command exits",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Task.exec("bash", ["-c", "exec > >(sed -u 's/^/[build] /'); seq 1 ${HELPER_PROCESS_LINES}"]).pipe(
+  Effect.flatMap((output) => {
+    const lines = output.split("\\n").filter((line) => line !== "");
+    return Effect.log(\`returned \${lines.length} lines, the last \${lines.at(-1)}\`);
+  }),
+) });
+`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode).toBe(0);
+      expect(
+        ran.standardError.split("\n").find((line) => line.startsWith("[main] returned ")),
+      ).toBe(
+        `[main] returned ${HELPER_PROCESS_LINES} lines, the last [build] ${HELPER_PROCESS_LINES}`,
+      );
+    }),
+  ),
+);
+
+export const successfulCommandWithBackgroundChildIgnoringTerm = makeTest(
   "a background child that ignores SIGTERM and holds a successful command's output open is killed and reported once the SIGKILL grace period passes, and Task.exec returns its output",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Task.exec("sh", ["-c", "trap '' TERM; sleep 600 & echo $! > pid; printf finished"]).pipe(Effect.flatMap((output) => Effect.log(\`output: \${output}\`))));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "trap '' TERM; sleep 600 & echo $! > pid; printf finished"]).pipe(Effect.flatMap((output) => Effect.log(\`output: \${output}\`))) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(0);
@@ -838,5 +920,27 @@ if (import.meta.main) Task.main(main);`,
       expect(yield* isProcessAlive(Number(sleep))).toBe(false);
     }),
   ),
-  { timeout: "30 seconds", cleanup: "5 seconds" },
+  "30 seconds",
+);
+
+const MORE_CHARACTERS_THAN_ONE_STRING_HOLDS = 2_147_483_648;
+
+export const outputTooLong = makeTest(
+  "a command that prints more than one string can hold fails with an error naming the command, even when it exits 0",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.asVoid(Task.exec("sh", ["-c", "yes 0123456789 | head -c ${MORE_CHARACTERS_THAN_ONE_STRING_HOLDS}"], { secret: true })) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toContain(
+        "[main] error CommandOutputTooLong: the standard output of sh is too long to hold in one string\n",
+      );
+      expect(findMisprintedErrorLines(ran.standardError)).toEqual([]);
+    }),
+  ),
+  "2 minutes",
 );

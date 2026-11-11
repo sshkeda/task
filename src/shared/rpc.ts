@@ -4,7 +4,9 @@ import { Transferable } from "effect/workers";
 
 import { PrintableError } from "../lib/errors/index.ts";
 import { ProcessIdentity } from "./claim-processes-to-report.ts";
-import { SCRIPT_LOADERS } from "./find-bun-loader-for-script.ts";
+import { TaskOptionsRead } from "./resolve-task-options.ts";
+import { RootTaskGroup } from "./root-task-group.ts";
+import { TerminalCommand, TerminalCommandEnded, TerminalCommandId } from "./run-in-terminal.ts";
 import { RunMarker } from "./run-marker.ts";
 import { AwaitedTasksFailure, TaskRequestFailure } from "./task-errors.ts";
 
@@ -16,12 +18,18 @@ export const StandardInputRead = Schema.TaggedUnion({
 
 export const StartTaskFiber = Schema.Struct({
   taskName: Schema.String,
+  rootTaskFilePath: Schema.String,
   taskFilePath: Schema.String,
   taskPackageDirectoryPath: Schema.String,
-  cleanupMilliseconds: Schema.Finite,
+  cleanup: Schema.DurationFromMillis,
   traceId: Schema.String,
   spanId: Schema.String,
   standardInput: Schema.Struct({ isTerminal: Schema.Boolean, rootTaskName: Schema.String }),
+});
+
+export const TaskMadeInBody = Schema.Struct({
+  locations: Schema.Array(Schema.NullOr(Schema.String)),
+  options: TaskOptionsRead,
 });
 
 export const TaskFiberResult = Schema.TaggedUnion({
@@ -72,7 +80,6 @@ export const TASK_EVENT_FIELDS = {
   TaskFiberEnded: {
     taskName: Schema.String,
     result: TaskFiberResult,
-    logs: Schema.Array(Schema.String),
   },
 };
 
@@ -99,7 +106,12 @@ export const TaskWorkerRpcs = RpcGroup.make(
 export const MainThreadRpcs = RpcGroup.make(
   Rpc.make("ReportTaskEvent", { payload: TaskEvent }),
   Rpc.make("RequestTask", {
-    payload: { taskName: Schema.String, dependencyTaskName: Schema.String },
+    payload: {
+      taskName: Schema.String,
+      dependencyTaskName: Schema.String,
+      dependencyTaskFilePath: Schema.NullOr(Schema.String),
+      dependencyTaskMadeInBody: Schema.NullOr(TaskMadeInBody),
+    },
     success: Schema.Struct({ value: Schema.optionalKey(Schema.Json) }),
     error: TaskRequestFailure,
   }),
@@ -107,6 +119,8 @@ export const MainThreadRpcs = RpcGroup.make(
     payload: { taskName: Schema.String },
     success: StandardInputRead,
   }),
+  Rpc.make("RunInTerminal", { payload: TerminalCommand, success: TerminalCommandEnded }),
+  Rpc.make("AwaitTerminalCommandExit", { payload: TerminalCommandId }),
   Rpc.make("RecordStartedProcess", { payload: StartedProcess }),
   Rpc.make("RecordTraceSpan", { payload: { spanJson: Schema.String } }),
   Rpc.make("ClaimProcessReports", {
@@ -158,10 +172,9 @@ export const MessageFromMainThreadRpcServer = Schema.Union([
 export const WorkerData = Schema.Struct({
   workerId: Schema.Int,
   projectDirectoryPath: Schema.String,
-  rewrittenFiles: Schema.Record(
-    Schema.String,
-    Schema.Struct({ contents: Schema.String, loader: Schema.Literals(SCRIPT_LOADERS) }),
-  ),
   taskLogHold: Schema.instanceOf(Int32Array<SharedArrayBuffer>),
+  postedBodyStartCount: Schema.instanceOf(Int32Array<SharedArrayBuffer>),
   runMarker: Schema.NullOr(RunMarker),
+  rootTaskGroup: Schema.NullOr(RootTaskGroup),
+  flags: Schema.Record(Schema.String, Schema.String),
 });

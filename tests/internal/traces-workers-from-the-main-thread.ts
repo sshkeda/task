@@ -1,6 +1,5 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
 import { Effect, FileSystem } from "effect";
 
 import { edit } from "../shared/access-files.ts";
@@ -8,9 +7,10 @@ import { encodeJson } from "../shared/encode-json.ts";
 import { REPOSITORY_DIRECTORY } from "../shared/find-repository-directory.ts";
 import { makeProjectUsingTaskFrom } from "../shared/make-projects.ts";
 import { makeScratchDirectory } from "../shared/make-temporary-directories.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
-export const workerOpensNoTraceFile = Task.make(
+export const workerOpensNoTraceFile = makeTest(
   "workers open no trace file and the main thread writes their spans and log records",
   Effect.scoped(
     Effect.gen(function* () {
@@ -31,11 +31,10 @@ export const workerOpensNoTraceFile = Task.make(
         files: {
           "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* Effect.log("first worker log");
   yield* Effect.log("second worker log");
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
         },
       });
       const result = yield* runTaskProcess(project, "main.ts");
@@ -57,5 +56,4 @@ if (import.meta.main) Task.main(main);`,
       ).toContain('"stringValue":"worker"');
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

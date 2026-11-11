@@ -1,4 +1,14 @@
-import { Cause, Array as Arrays, Clock, Deferred, Effect, Schema, Stream, Fiber } from "effect";
+import {
+  Cause,
+  Array as Arrays,
+  Clock,
+  Deferred,
+  Effect,
+  Exit,
+  Schema,
+  Stream,
+  Fiber,
+} from "effect";
 
 import { formatFailureLines } from "../../../shared/format-error-lines.ts";
 import { formatSeconds } from "../../../shared/format-task-lines.ts";
@@ -13,6 +23,7 @@ import { failRun, failRunOnFailure } from "../shared/fail-run.ts";
 import {
   RootTaskWorkingDirectoryUnavailable,
   StopRequested,
+  TasksNeverRan,
   UnawaitedTasksFailed,
 } from "../shared/main-thread-errors.ts";
 import { DiscoveredTasks } from "../shared/provide-discovered-tasks.ts";
@@ -35,8 +46,11 @@ const stopEverythingStarted = Effect.fn("stopEverythingStarted")(function* (
   );
   const finalizerCommandsWouldEndUnreportedWithTheirWorkers = yield* shutdown.isForced;
   if (finalizerCommandsWouldEndUnreportedWithTheirWorkers) {
+    yield* workerPool.awaitPostedBodyStartsHandled;
+    const cutOffTaskNames = yield* taskRuns.findTaskNamesStillInBodyOrCleanup;
     yield* workerPool.terminateAllWorkers;
     yield* killAllProcessGroups;
+    yield* taskRuns.reportCleanupsCutOff(cutOffTaskNames);
   }
   yield* workerPool.requestExitOfAllWorkers;
   const workersGone = yield* Deferred.make<false>();
@@ -66,6 +80,7 @@ const MOST_NAMED_FAILED_TASKS = 3;
 const exitCodeOfRunEndingFailure = (
   runEndingFailure:
     | Effect.Success<ReturnType<typeof stopEverythingStarted>>
+    | TasksNeverRan
     | UnawaitedTasksFailed
     | null,
   rootTaskName: string,
@@ -90,7 +105,7 @@ const exitCodeOfRunEndingFailure = (
 
 export const runRootTaskFiber = Effect.gen(function* () {
   const runRootTaskConfig = yield* RunRootTaskConfig;
-  const rootTask = runRootTaskConfig.rootTask;
+  const { rootTaskName } = runRootTaskConfig;
   const runSpan = yield* Effect.currentSpan.pipe(
     dieOnInvariantFailure("main-thread tracing", "the run has a parent span"),
   );
@@ -125,8 +140,8 @@ export const runRootTaskFiber = Effect.gen(function* () {
         }),
     });
     yield* Effect.gen(function* () {
-      yield* taskRuns.requestRootTaskResult(rootTask.name);
-      yield* taskRuns.awaitServingTaskClosure(rootTask.name);
+      yield* taskRuns.requestRootTaskResult(rootTaskName);
+      yield* taskRuns.awaitServingTaskClosure(rootTaskName);
     }).pipe(
       Effect.matchEffect({
         onFailure: (error) => shutdown.recordFirstFailure(error),
@@ -144,7 +159,20 @@ export const runRootTaskFiber = Effect.gen(function* () {
   const unawaitedTasksFailed = Arrays.isArrayNonEmpty(unawaitedFailedTaskNames)
     ? new UnawaitedTasksFailed({ failedTaskNames: unawaitedFailedTaskNames })
     : null;
-  const runEndingFailure = failure ?? unawaitedTasksFailed;
+  const isEveryRootFileTaskDue =
+    failure === null && unawaitedTasksFailed === null && runRootTaskConfig.checksForgottenTasks;
+  const neverRanTaskNames = isEveryRootFileTaskDue
+    ? discoveredTasks.unexportedRootFileTaskNames.filter(
+        (taskName) => !taskRunCounts.taskNames.includes(taskName),
+      )
+    : [];
+  const tasksNeverRan = Arrays.isArrayNonEmpty(neverRanTaskNames)
+    ? new TasksNeverRan({
+        taskNames: neverRanTaskNames,
+        filePath: runRootTaskConfig.rootTaskFilePath,
+      })
+    : null;
+  const runEndingFailure = failure ?? unawaitedTasksFailed ?? tasksNeverRan;
   const runPassed = runEndingFailure === null;
   const failedTaskCount = taskRunCounts.failedTaskNames.length;
   const totalTasks = `${taskRunCounts.total} ${taskRunCounts.total === 1 ? "task" : "tasks"}`;
@@ -157,7 +185,8 @@ export const runRootTaskFiber = Effect.gen(function* () {
   ].join(" ");
   const caughtFailures = `${failedTaskCount} caught ${failedTaskCount === 1 ? "failure" : "failures"}`;
   const tasksWithFailures = runPassed ? [totalTasks, caughtFailures] : [failedTasks];
-  const tasks = failedTaskCount === 0 ? [totalTasks] : tasksWithFailures;
+  const tasksWithoutFailures = runPassed ? [totalTasks] : [`0 of ${totalTasks}`];
+  const tasks = failedTaskCount === 0 ? tasksWithoutFailures : tasksWithFailures;
   const counts = [
     ...tasks,
     ...(taskRunCounts.stopped === 0 ? [] : [`${taskRunCounts.stopped} stopped`]),
@@ -167,23 +196,28 @@ export const runRootTaskFiber = Effect.gen(function* () {
     failure !== null && (isStopRequested(failure) || !(yield* shutdown.wasPrinted(failure)));
   const runFailures = [
     ...(unawaitedTasksFailed === null ? [] : [unawaitedTasksFailed]),
+    ...(tasksNeverRan === null ? [] : [tasksNeverRan]),
     ...(isFailureUnprinted ? [failure] : []),
   ];
   yield* printLine("Info", runPassed ? `passed: ${counts}` : `failed: ${counts}`);
   for (const runFailure of runFailures) {
     yield* printLine("Error", formatFailureLines(runFailure, null));
   }
-  const exitCode = exitCodeOfRunEndingFailure(runEndingFailure, rootTask.name);
+  const exitCode = exitCodeOfRunEndingFailure(runEndingFailure, rootTaskName);
   yield* Effect.annotateCurrentSpan({
     [`${TASK_TRACE_LABEL_PREFIX}.version`]: TASK_PACKAGE.version,
     [`${TASK_TRACE_LABEL_PREFIX}.entry`]: runRootTaskConfig.rootTaskFilePath,
-    [`${TASK_TRACE_LABEL_PREFIX}.root.task`]: rootTask.name,
+    [`${TASK_TRACE_LABEL_PREFIX}.root.task`]: rootTaskName,
     [`${TASK_TRACE_LABEL_PREFIX}.exit.code`]: exitCode,
     [`${TASK_TRACE_LABEL_PREFIX}.elapsed.milliseconds`]: elapsedMilliseconds,
     [`${TASK_TRACE_LABEL_PREFIX}.workers.started`]: yield* workerPool.startedWorkerCount,
     [`${TASK_TRACE_LABEL_PREFIX}.workers.limit`]: runRootTaskConfig.workerCount,
     "host.cpus": yield* availableParallelism,
   });
+  runSpan.end(
+    yield* Clock.currentTimeNanos,
+    runEndingFailure === null ? Exit.void : Exit.fail(runEndingFailure),
+  );
   return {
     exitCode,
     runEndingCause: runEndingFailure === null ? null : Cause.fail(runEndingFailure),

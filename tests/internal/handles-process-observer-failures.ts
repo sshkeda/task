@@ -1,9 +1,9 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
 import { Effect } from "effect";
 
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
@@ -17,7 +17,7 @@ const observerFailure = (failureMode: "exited" | "resourceUsage") =>
 import { ChildProcess } from "effect/process";
 import { Task } from "@sshkeda/task";
 const originalSpawn = Bun.spawn;
-export const main = Task.make("main", Effect.scoped(Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.scoped(Effect.gen(function* () {
   Bun.spawn = (...arguments_) => {
     const subprocess = originalSpawn(...arguments_);
     return new Proxy(subprocess, { get(target, property) {
@@ -32,8 +32,7 @@ export const main = Task.make("main", Effect.scoped(Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.sync(() => { Bun.spawn = originalSpawn; }));
   const child = yield* ChildProcess.make("bun", ["-e", "process.exit(0)"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
   yield* child.exitCode;
-})));
-if (import.meta.main) Task.main(main);`,
+})) });`,
       });
       const failedRun = yield* runTaskProcess(project, "main.ts");
       expect(failedRun.exitCode).toBe(1);
@@ -43,19 +42,17 @@ if (import.meta.main) Task.main(main);`,
     }),
   );
 
-export const rejectedExitObservation = Task.make(
+export const rejectedExitObservation = makeTest(
   "a rejected child exit observer fails the command and closes its scope",
   observerFailure("exited"),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const failedResourceObservation = Task.make(
+export const failedResourceObservation = makeTest(
   "a failed child resource observer fails the command and closes its scope",
   observerFailure("resourceUsage"),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const processCleanupFailures = Task.make(
+export const processCleanupFailures = makeTest(
   "worker process cleanup failures are reported while main remains the final cleanup authority",
   Effect.scoped(
     Effect.gen(function* () {
@@ -64,7 +61,7 @@ export const processCleanupFailures = Task.make(
           "main.ts": `import { Effect } from "effect";
 import { ChildProcess } from "effect/process";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.scoped(Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.scoped(Effect.gen(function* () {
   const originalKill = process.kill;
   process.kill = (processId, signal) => {
     if (processId < 0 && signal === "SIGTERM") {
@@ -75,8 +72,7 @@ export const main = Task.make("main", Effect.scoped(Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.sync(() => { process.kill = originalKill; }));
   const child = yield* ChildProcess.make("sh", ["-c", "sleep 1000 > /dev/null 2>&1 & exit ${childExitCode}"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
   yield* child.exitCode;
-})));
-if (import.meta.main) Task.main(main);`,
+})) });`,
         });
         const completedRun = yield* runTaskProcess(project, "main.ts");
         expect(completedRun.exitCode).toBe(0);
@@ -105,10 +101,9 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const zombieCommandKill = Task.make(
+export const zombieCommandKill = makeTest(
   "killing a command that exited but is not reaped yet succeeds, because its process group holds only a zombie",
   Effect.scoped(
     Effect.gen(function* () {
@@ -118,7 +113,7 @@ import { ChildProcess } from "effect/process";
 import { Task } from "@sshkeda/task";
 const processState = (processId: number) =>
   Bun.spawnSync(["ps", "-o", "stat=", "-p", String(processId)]).stdout.toString().trim();
-export const main = Task.make("main", Effect.scoped(Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.scoped(Effect.gen(function* () {
   const child = yield* ChildProcess.make("sleep", ["1000"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
   const stateBeforeKill = yield* Effect.sync(() => {
     process.kill(child.pid, "SIGKILL");
@@ -131,8 +126,7 @@ export const main = Task.make("main", Effect.scoped(Effect.gen(function* () {
   yield* Effect.log(\`command state before kill \${stateBeforeKill.slice(0, 1)}\`);
   const killed = yield* Effect.exit(child.kill());
   yield* Effect.log(\`kill \${Exit.isSuccess(killed) ? "succeeded" : "failed"}\`);
-})));
-if (import.meta.main) Task.main(main);`,
+})) });`,
       });
       const completedRun = yield* runTaskProcess(project, "main.ts");
       expect(completedRun.exitCode, completedRun.standardError).toBe(0);
@@ -141,10 +135,9 @@ if (import.meta.main) Task.main(main);`,
       expect(completedRun.standardError).not.toContain("worker could not signal process group");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const processGroupKillFailure = Task.make(
+export const processGroupKillFailure = makeTest(
   "a kill whose process group signal fails reports that failure instead of signaling only the command",
   Effect.scoped(
     Effect.gen(function* () {
@@ -152,7 +145,7 @@ export const processGroupKillFailure = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { ChildProcess } from "effect/process";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.scoped(Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.scoped(Effect.gen(function* () {
   const child = yield* ChildProcess.make("cat", [], { stdout: "ignore", stderr: "ignore" });
   const originalKill = process.kill;
   process.kill = (processId, signal) => {
@@ -167,8 +160,7 @@ export const main = Task.make("main", Effect.scoped(Effect.gen(function* () {
   );
   yield* Effect.log(\`kill refused because \${killFailure.message}\`);
   yield* Effect.log(\`command still running \${yield* child.isRunning}\`);
-})));
-if (import.meta.main) Task.main(main);`,
+})) });`,
       });
       const completedRun = yield* runTaskProcess(project, "main.ts");
       expect(completedRun.exitCode, completedRun.standardError).toBe(0);
@@ -177,5 +169,4 @@ if (import.meta.main) Task.main(main);`,
       expect(completedRun.standardError).toContain("[main] command still running true");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

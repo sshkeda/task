@@ -5,6 +5,7 @@ import { Effect, FileSystem } from "effect";
 
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTemporaryDirectory } from "../shared/make-temporary-directories.ts";
+import { makeTest } from "../shared/make-tests.ts";
 
 const compileOutsideAnyNodeModules = (mainFileText: string) =>
   Effect.gen(function* () {
@@ -17,15 +18,15 @@ const compileOutsideAnyNodeModules = (mainFileText: string) =>
     return { binaryPath, binaryDirectory };
   });
 
-export const importsWithoutRun = Task.make(
-  "a bun build --compile binary that imports Task and its errors without calling Task.main() starts and exits 0",
+export const importsWithoutRun = makeTest(
+  "a bun build --compile binary that imports Task and its errors and makes a task without a default export starts and exits 0",
   Effect.scoped(
     Effect.gen(function* () {
       const { binaryPath, binaryDirectory } = yield* compileOutsideAnyNodeModules(
         `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { CommandFailed } from "@sshkeda/task/errors";
-const made = Task.make("made", Effect.void);
+const made = Task.make({ name: "made", run: Effect.void });
 console.log(made.name, new CommandFailed({ command: "c", code: 1, standardOutput: "", standardError: "" })._tag);`,
       );
       expect(yield* Task.exec(binaryPath, [], { cwd: binaryDirectory })).toBe(
@@ -33,10 +34,9 @@ console.log(made.name, new CommandFailed({ command: "c", code: 1, standardOutput
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const locatesErrorsMadeByFilesOnDisk = Task.make(
+export const locatesErrorsMadeByFilesOnDisk = makeTest(
   "a TaskError made by a file a bun build --compile binary imports from disk points at that file",
   Effect.scoped(
     Effect.gen(function* () {
@@ -56,24 +56,23 @@ console.log(made._tag, made.location);`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const runRefused = Task.make(
-  "Task.main() inside a bun build --compile binary fails with RunCalledInStandaloneExecutable before the task body runs",
+export const runRefused = makeTest(
+  "a bun build --compile binary whose default export is a task fails with RunCalledInStandaloneExecutable before the task body runs",
   Effect.scoped(
     Effect.gen(function* () {
       const { binaryPath, binaryDirectory } = yield* compileOutsideAnyNodeModules(
         `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-Task.main(Task.make("root", Effect.log("root ran")));`,
+export default Task.make({ name: "root", run: Effect.log("root ran") });`,
       );
       yield* Task.exec(binaryPath, [], { cwd: binaryDirectory }).pipe(
         Effect.flatMap((output) => Effect.die(`the binary succeeded and printed ${output}`)),
         Effect.catchTag("CommandFailed", (failure) =>
           Effect.sync(() => {
             expect(failure.standardError)
-              .toBe(`error RunCalledInStandaloneExecutable: Task.main() was called with "root" inside a bun build --compile binary, which holds only its bundle, not the task source files @sshkeda/task scans and re-imports in worker threads
+              .toBe(`error RunCalledInStandaloneExecutable: @sshkeda/task can't run "root" inside a bun build --compile binary, which holds only its bundle, not the task source files it imports again to run tasks
 `);
             expect(failure.code).toBe(1);
             expect(failure.standardOutput).not.toContain("root ran");
@@ -82,5 +81,4 @@ Task.main(Task.make("root", Effect.log("root ran")));`,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

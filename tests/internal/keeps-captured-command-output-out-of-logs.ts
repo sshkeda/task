@@ -7,6 +7,7 @@ import { TASK_STATE_DIRECTORY_NAME } from "../../src/shared/names-from-package-j
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import type { makeProjectUsingTaskFrom } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
@@ -59,18 +60,17 @@ const expectNoFakeSecrets = (
   }
 };
 
-export const capturedOutputStaysOutOfLogs = Task.make(
+export const capturedOutputStaysOutOfLogs = makeTest(
   "Task.exec with secret: true logs no line of the command, so its output is in neither the run's output nor any file in the state directory",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect, Redacted } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   const token = yield* Task.exec("sh", ["-c", "${PRINT_FAKE_SECRETS}"], { secret: true });
   yield* Effect.log(\`captured \${Redacted.value(token).length} characters\`);
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       const stateFiles = yield* readStateDirectoryFiles(project);
@@ -88,22 +88,21 @@ if (import.meta.main) Task.main(main);`,
       ).toBe(true);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const capturedOutputUnwraps = Task.make(
-  "Task.exec with secret: true returns standard output as a Redacted that unwraps to the exact text",
-  Effect.gen(function* () {
+export const capturedOutputUnwraps = Task.make({
+  name: "Task.exec with secret: true returns standard output as a Redacted that unwraps to the exact text",
+  run: Effect.gen(function* () {
     const output = yield* Task.exec("sh", ["-c", String.raw`printf '  first line\nsecond\n'`], {
       secret: true,
     });
     expect(Redacted.isRedacted(output)).toBe(true);
     expect(Redacted.value(output)).toBe("  first line\nsecond\n");
   }),
-);
+});
 
-export const capturedFailureHidesOutput = Task.make(
-  "a failed command run with secret: true keeps both outputs Redacted on its CapturedCommandFailed, and out of its message, the run's output and the trace",
+export const capturedFailureHidesOutput = makeTest(
+  "a failed command run with secret: true keeps both outputs Redacted on its CapturedCommandFailed, and out of its message, the run's output and the trace, and the run exits with its code",
   Effect.scoped(
     Effect.gen(function* () {
       yield* Task.exec("sh", ["-c", `${PRINT_FAKE_SECRETS}; exit ${FAILING_EXIT_CODE}`], {
@@ -123,25 +122,23 @@ export const capturedFailureHidesOutput = Task.make(
       );
       const project = yield* makeProject({
         "main.ts": `import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Task.exec("sh", ["-c", "${PRINT_FAKE_SECRETS}; exit ${FAILING_EXIT_CODE}"], { secret: true }));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "${PRINT_FAKE_SECRETS}; exit ${FAILING_EXIT_CODE}"], { secret: true }) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.exitCode, ran.standardError).toBe(FAILING_EXIT_CODE);
       expect(
         ran.standardError.split("\n").filter((line) => line.startsWith("[main] error ")),
       ).toEqual([CAPTURED_FAILURE_LINE]);
       expectNoFakeSecrets(ran, yield* readStateDirectoryFiles(project));
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const ROOT_TASK_COMMAND_EXIT_CODE = 4;
 
 const CONSUMER_SECRET_OPTION_SOURCE = `import { Effect, Redacted } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   const byDefault: string = yield* Task.exec("sh", ["-c", "echo default line"]);
   const notSecret: string = yield* Task.exec("sh", ["-c", "echo not secret line"], { secret: false });
   const captured: Redacted.Redacted<string> = yield* Task.exec("sh", ["-c", "echo captured line"], { secret: true });
@@ -150,11 +147,10 @@ export const main = Task.make("main", Effect.gen(function* () {
     Effect.catchTag("CommandFailed", (failure) => Effect.log(\`caught \${failure.standardOutput.trim()} \${failure.standardError.trim()}\`)),
   );
   yield* Task.exec("sh", ["-c", "echo failed; exit ${ROOT_TASK_COMMAND_EXIT_CODE}"]);
-}));
-if (import.meta.main) Task.main(main);
+}) });
 `;
 
-export const defaultOutputLogs = Task.make(
+export const defaultOutputLogs = makeTest(
   "Task.exec logs each line and returns a string by default and with secret: false",
   Effect.scoped(
     Effect.gen(function* () {
@@ -163,31 +159,28 @@ export const defaultOutputLogs = Task.make(
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(ROOT_TASK_COMMAND_EXIT_CODE);
       expect(ran.standardError).toContain(
-        `[main] default line\n[main] not secret line\n[main] returned ["default line\\n","not secret line\\n","captured line\\n"]\n[main] checked\n[main] broken\n[main] caught checked broken\n[main] failed\n[main] error CommandFailed: sh exited with code ${ROOT_TASK_COMMAND_EXIT_CODE}\n[main]   failed\n`,
+        `[main] default line\n[main] not secret line\n[main] returned ["default line\\n","not secret line\\n","captured line\\n"]\n[main] checked\n[main] broken\n[main] caught checked broken\n[main] failed\n[main] error CommandFailed: sh exited with code ${ROOT_TASK_COMMAND_EXIT_CODE}\nfailed: main (1 of 1 task), `,
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const optionalSecretOptionsCompile = Task.make(
+export const optionalSecretOptionsCompile = makeTest(
   "Task.exec takes options whose secret is an optional boolean, typed as they are or derived from its parameters",
   Effect.scoped(
     typeCheckSource(`import { Effect, Redacted } from "effect";
 import { Task } from "@sshkeda/task";
 const options: { cwd?: string; secret?: boolean } = { cwd: "." };
 const derived: NonNullable<Parameters<typeof Task.exec>[2]> = { cwd: "." };
-export const main = Task.make("main", Effect.gen(function* () {
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   const fromOptions: string | Redacted.Redacted<string> = yield* Task.exec("echo", ["hello"], options);
   const fromDerived: string | Redacted.Redacted<string> = yield* Task.exec("echo", ["derived"], derived);
   yield* Effect.log(fromOptions, fromDerived);
-}));
-if (import.meta.main) Task.main(main);`),
+}) });`),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const secretTypeNeedsTheSecretOption = Task.make(
+export const secretTypeNeedsTheSecretOption = makeTest(
   "Task.exec typed as secret without secret: true does not compile",
   Effect.scoped(
     Effect.gen(function* () {
@@ -196,8 +189,7 @@ export const secretTypeNeedsTheSecretOption = Task.make(
 import { Task } from "@sshkeda/task";
 export const bare = Task.exec<true>("echo", ["bare"]);
 export const other = Task.exec<true>("echo", ["other"], { cwd: "." });
-export const main = Task.make("main", Effect.void);
-if (import.meta.main) Task.main(main);`),
+export default Task.make({ name: "main", run: Effect.void });`),
       );
       expect(failed.message).toContain(
         "main.ts(3,26): error TS2554: Expected 3 arguments, but got 2.",
@@ -206,5 +198,4 @@ if (import.meta.main) Task.main(main);`),
       expect(failed.message).toContain("Property 'secret' is missing");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

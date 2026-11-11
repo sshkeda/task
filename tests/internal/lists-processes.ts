@@ -11,6 +11,7 @@ import { exitAsValue } from "../shared/failure-as-value.ts";
 import { REPOSITORY_DIRECTORY } from "../shared/find-repository-directory.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeScratchDirectory } from "../shared/make-temporary-directories.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { makeTaskProcessEnvironment } from "../shared/run-task-processes.ts";
 
 const FIXTURE_PROCESS_ID = 300;
@@ -35,7 +36,7 @@ const killWhenDone = (processId: number) =>
     ),
   );
 
-export const ownProcess = Task.make(
+export const ownProcess = makeTest(
   "the process list shows this process running, with its parent process id, the process group ps reports and the name of the bun running it",
   Effect.gen(function* () {
     const ownListedProcess = yield* Effect.fromNullishOr(
@@ -48,10 +49,9 @@ export const ownProcess = Task.make(
       process.execPath.slice(process.execPath.lastIndexOf("/") + 1),
     );
   }),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const ownProcessUnderBunPathWithSpace = Task.make(
+export const ownProcessUnderBunPathWithSpace = makeTest(
   "the process list test of this process passes when the bun running it is in a directory whose name has a space",
   Effect.scoped(
     Effect.gen(function* () {
@@ -68,8 +68,7 @@ export const ownProcessUnderBunPathWithSpace = Task.make(
       const project = yield* makeProject({
         "main.ts": `import { Task } from "@sshkeda/task";
 import { ownProcess } from "${repository}/tests/internal/lists-processes.ts";
-export const main = Task.make("main", ownProcess);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: ownProcess });`,
       });
       const child = yield* ChildProcess.make(bunPath, [`${project.directory}/main.ts`], {
         cwd: project.directory,
@@ -82,10 +81,9 @@ if (import.meta.main) Task.main(main);`,
       expect(Number(yield* child.exitCode), standardError).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const spawnedTree = Task.make(
+export const spawnedTree = makeTest(
   "the process list shows a started sh and the perl it starts with their parent process ids, process group and program names",
   Effect.scoped(
     Effect.gen(function* () {
@@ -109,10 +107,9 @@ export const spawnedTree = Task.make(
       expect(yield* listedPerl.readCommandLineUnlessGone).toBe("perl");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const zombie = Task.make(
+export const zombie = makeTest(
   "the process list shows a child its parent has not reaped as an ended child of that parent, whose program name reads as gone",
   Effect.scoped(
     Effect.gen(function* () {
@@ -137,10 +134,9 @@ sleep;`,
       expect(yield* listedZombie.readCommandLineUnlessGone).toBeNull();
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const emptyFirstArgument = Task.make(
+export const emptyFirstArgument = makeTest(
   "a process started with an empty argv[0] is named by its executable, not by its arguments or its environment",
   Effect.scoped(
     Effect.gen(function* () {
@@ -167,10 +163,9 @@ sleep;`,
       expect(yield* listedSleep.readCommandLineUnlessGone).toBe("sleep");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const namedByFirstArgument = Task.make(
+export const namedByFirstArgument = makeTest(
   "a process is named by the base name of its argv[0], without its arguments",
   Effect.scoped(
     Effect.gen(function* () {
@@ -188,10 +183,9 @@ export const namedByFirstArgument = Task.make(
       expect(yield* listedPerl.readCommandLineUnlessGone).toBe("perl");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const exitedAfterListing = Task.make(
+export const exitedAfterListing = makeTest(
   "a process that exits after the process list shows it reads as gone instead of failing",
   Effect.scoped(
     Effect.gen(function* () {
@@ -204,10 +198,9 @@ export const exitedAfterListing = Task.make(
       expect((yield* listProcesses(null)).has(sleep.pid)).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const linuxByteOrderMarks = Task.make(
+export const linuxByteOrderMarks = makeTest(
   "the Linux process list names a process by its argv[0] with one U+FEFF dropped from its start, and without its other arguments",
   Effect.scoped(
     Effect.gen(function* () {
@@ -237,5 +230,4 @@ export const linuxByteOrderMarks = Task.make(
       expect(yield* listedPerl.readCommandLineUnlessGone).toBe("\uFEFFperl");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

@@ -1,4 +1,4 @@
-import { Context, Deferred, Effect, Exit, Layer } from "effect";
+import { Context, Deferred, Effect, Exit, Layer, Schema } from "effect";
 import type { Cause } from "effect";
 
 import {
@@ -10,7 +10,6 @@ import type { StandardErrorWriteFailed } from "../../../shared/print-to-standard
 import type { WorkerExited } from "../../../shared/process-errors.ts";
 import type { STOP_REASONS } from "../../../shared/stop-signals.ts";
 import type {
-  RunCalledTwice,
   ServedTaskFailed,
   TaskBodyFailed,
   TaskCleanupFailed,
@@ -21,7 +20,7 @@ import { TASK_PACKAGE } from "../../../shared/task-package.ts";
 import type {
   AwaitedTaskFailed,
   SettledTasksFailed,
-  TaskNotMadeAtTopLevel,
+  TaskNotMadeWhileLoading,
   TaskWaitsOnItself,
 } from "../../errors/index.ts";
 import type { killAllProcessGroups } from "../../kill-leftover-processes/index.ts";
@@ -30,10 +29,13 @@ import { FailureReasonNotFormatted, StopRequested } from "./main-thread-errors.t
 import type {
   BrokenTasksFound,
   ServingTaskRequestsItself,
+  TaskCleanupCutOff,
   TaskCleanupFrozeWorker,
   TaskCleanupNotStarted,
   TaskCleanupTimedOut,
 } from "./main-thread-errors.ts";
+
+const isStopRequested = Schema.is(StopRequested);
 
 const makeShutdown = Effect.gen(function* () {
   const shutdownStartedDeferred = yield* Deferred.make<void>();
@@ -41,18 +43,18 @@ const makeShutdown = Effect.gen(function* () {
     | AwaitedTaskFailed
     | BrokenTasksFound
     | Effect.Error<ReturnType<typeof killAllProcessGroups>>
-    | RunCalledTwice
     | ServedTaskFailed
     | ServingTaskRequestsItself
     | SettledTasksFailed
     | StandardErrorWriteFailed
     | StopRequested
     | TaskBodyFailed
+    | TaskCleanupCutOff
     | TaskCleanupFailed
     | TaskCleanupFrozeWorker
     | TaskCleanupNotStarted
     | TaskCleanupTimedOut
-    | TaskNotMadeAtTopLevel
+    | TaskNotMadeWhileLoading
     | TaskSetupTimedOut
     | TaskTimedOut
     | TaskWaitsOnItself
@@ -61,6 +63,13 @@ const makeShutdown = Effect.gen(function* () {
   const awaitFailure = Deferred.await(firstFailureDeferred);
 
   const forcedStopDeferred = yield* Deferred.make<Effect.Success<typeof awaitFailure>>();
+  const failedBeforeForcedStopDeferred = yield* Deferred.make<boolean>();
+  const forceStopWith = (failure: Effect.Success<typeof awaitFailure>) => {
+    const failedBeforeForcedStop = Deferred.isDoneUnsafe(firstFailureDeferred);
+    if (Deferred.doneUnsafe(forcedStopDeferred, Exit.succeed(failure))) {
+      Deferred.doneUnsafe(failedBeforeForcedStopDeferred, Exit.succeed(failedBeforeForcedStop));
+    }
+  };
   const printedFailures = new Set<Effect.Success<typeof awaitFailure>>();
   const failureCauseByTaskName = new Map<
     string,
@@ -110,13 +119,15 @@ const makeShutdown = Effect.gen(function* () {
         if (stopBecameFirstFailure) {
           return true;
         }
-        Deferred.doneUnsafe(forcedStopDeferred, Exit.succeed(stopRequested));
+        if (signal !== "SIGHUP") {
+          forceStopWith(stopRequested);
+        }
         return false;
       }),
     forceStop: (failure: Effect.Success<typeof awaitFailure>) =>
       Effect.sync(() => {
+        forceStopWith(failure);
         Deferred.doneUnsafe(firstFailureDeferred, Exit.succeed(failure));
-        Deferred.doneUnsafe(forcedStopDeferred, Exit.succeed(failure));
       }),
     begin: Effect.sync(() => {
       Deferred.doneUnsafe(shutdownStartedDeferred, Exit.void);
@@ -132,13 +143,19 @@ const makeShutdown = Effect.gen(function* () {
     awaitForcedStop: Deferred.await(forcedStopDeferred),
     isForced: Deferred.isDone(forcedStopDeferred),
     outcome: Effect.gen(function* () {
+      const firstFailure = Deferred.isDoneUnsafe(firstFailureDeferred)
+        ? yield* Deferred.await(firstFailureDeferred)
+        : null;
       if (Deferred.isDoneUnsafe(forcedStopDeferred)) {
-        return yield* Deferred.await(forcedStopDeferred);
+        const forcedStop = yield* Deferred.await(forcedStopDeferred);
+        const isSignalAfterTaskFailure =
+          isStopRequested(forcedStop) &&
+          (yield* Deferred.await(failedBeforeForcedStopDeferred)) &&
+          firstFailure !== null &&
+          !isStopRequested(firstFailure);
+        return isSignalAfterTaskFailure ? firstFailure : forcedStop;
       }
-      if (Deferred.isDoneUnsafe(firstFailureDeferred)) {
-        return yield* Deferred.await(firstFailureDeferred);
-      }
-      return null;
+      return firstFailure;
     }),
   };
 });

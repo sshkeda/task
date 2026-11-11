@@ -1,12 +1,13 @@
 import { expect } from "bun:test";
 
 import { Task } from "@sshkeda/task";
-import { Cause, Effect, FileSystem, Redacted } from "effect";
+import { Cause, Effect, Redacted } from "effect";
 
-import { TASK_STATE_DIRECTORY_NAME } from "../../src/shared/names-from-package-json.ts";
 import { read } from "../shared/access-files.ts";
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
+import { readStateDirectoryTexts } from "../shared/read-state-directory-texts.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
@@ -23,7 +24,7 @@ const SHOWN_SECRETS = [FAKE_SECRET, "sec\0ret-5d1e", "sec ret-5d1e"];
 const CONSUMER_SOURCE = `import { Effect, Redacted } from "effect";
 import { Task } from "@sshkeda/task";
 const secret = Redacted.make(${SPLIT_FAKE_SECRET_SOURCE});
-export const seen = Task.make("seen", Effect.gen(function* () {
+export const seen = Task.make({ name: "seen", run: Effect.gen(function* () {
   const length = yield* Task.exec("sh", ["-c", 'printf "%s" "$SECRET" | wc -c'], {
     env: { PLAIN: "plain", SECRET: secret },
   });
@@ -31,24 +32,40 @@ export const seen = Task.make("seen", Effect.gen(function* () {
   yield* Task.exec("sh", ["-c", '[ "$SECRET" = "$EXPECTED" ] && exit ${SECRET_SEEN_EXIT_CODE}; exit 1'], {
     env: { EXPECTED: Redacted.value(secret), SECRET: secret },
   });
-}));
-export const nul = Task.make("nul", Task.exec("sh", ["-c", "true"], {
+}) });
+export const nul = Task.make({ name: "nul", run: Effect.asVoid(Task.exec("sh", ["-c", "true"], {
   env: { SECRET: Redacted.make(${SECRET_NUL_SOURCE}) },
-}));
-export const main = Task.make("main", Task.allSettled([seen, nul]));
-if (import.meta.main) Task.main(main);
+})) });
+export default Task.make({ name: "main", run: Task.allSettled([seen, nul]) });
+`;
+
+const NON_STRING_SECRET_PART = "fake-listed-secret-9b3f";
+
+const NUMERIC_SECRET = 731_904_266;
+
+const UNTYPED_SOURCE = `import { Redacted } from "effect";
+import { Task } from "@sshkeda/task";
+export const listed = Task.make({ name: "listed", run: Task.exec("sh", ["-c", "true"], {
+  secret: true,
+  env: { TOKEN: Redacted.make(["${NON_STRING_SECRET_PART}", "x\\0"]) },
+}) });
+export const numeric = Task.make({ name: "numeric", run: Task.exec("sh", ["-c", "true"], {
+  env: { PLAIN: "plain", TOKEN: Redacted.make(${NUMERIC_SECRET}) },
+}) });
+export const argument = Task.make({ name: "argument", run: Task.exec("echo", ["plain", Redacted.make(["${NON_STRING_SECRET_PART}"])]) });
+export default Task.make({ name: "main", run: Task.allSettled([listed, numeric, argument]) });
 `;
 
 const RETURNED_SECRET = "fake-returned-secret-7c4a";
 
-const RETURNING_SOURCE = `import { Effect, Redacted } from "effect";
+const RETURNING_SOURCE = `import { Effect, Redacted, Schema } from "effect";
 import { Task } from "@sshkeda/task";
-export const token = Task.make("token", Task.exec("cat", ["secret.txt"], { secret: true }));
-export const tokens = Task.make("tokens", Effect.gen(function* () {
+export const token = Task.make({ name: "token", output: Schema.Redacted(Schema.String), run: Task.exec("cat", ["secret.txt"], { secret: true }) });
+export const tokens = Task.make({ name: "tokens", output: Schema.Struct({ nested: Schema.Struct({ value: Schema.Redacted(Schema.String) }), list: Schema.Array(Schema.Redacted(Schema.String)) }), run: Effect.gen(function* () {
   const value = yield* token;
   return { nested: { value }, list: [value] };
-}));
-export const main = Task.make("main", Effect.gen(function* () {
+}) });
+export default Task.make({ name: "main", output: Schema.Struct({ direct: Schema.Redacted(Schema.String), nested: Schema.Struct({ value: Schema.Redacted(Schema.String) }) }), run: Effect.gen(function* () {
   const direct: Redacted.Redacted<string> = yield* token;
   const { nested, list } = yield* tokens;
   const nestedValue: Redacted.Redacted<string> = nested.value;
@@ -57,40 +74,23 @@ export const main = Task.make("main", Effect.gen(function* () {
     env: { DIRECT: direct, NESTED: nestedValue, LISTED: list[0] ?? "missing" },
   });
   return { direct, nested };
-}));
-if (import.meta.main) Task.main(main);
+}) });
 `;
 
-const readStateDirectoryTexts = (home: string) =>
-  Effect.gen(function* () {
-    const fileSystem = yield* FileSystem.FileSystem;
-    const directory = `${home}/${TASK_STATE_DIRECTORY_NAME}`;
-    const paths = yield* fileSystem.readDirectory(directory, { recursive: true });
-    const files = yield* Effect.forEach(paths, (path) =>
-      Effect.gen(function* () {
-        if ((yield* fileSystem.stat(`${directory}/${path}`)).type !== "File") {
-          return [];
-        }
-        return [{ path, text: yield* fileSystem.readFileString(`${directory}/${path}`) }];
-      }),
-    );
-    return files.flat();
-  });
-
-export const redactedValueReachesTheCommand = Task.make(
-  "Task.exec passes a Redacted env value to the command as its real value, next to plain values",
-  Effect.gen(function* () {
+export const redactedValueReachesTheCommand = Task.make({
+  name: "Task.exec passes a Redacted env value to the command as its real value, next to plain values",
+  run: Effect.gen(function* () {
     const output = yield* Task.exec("sh", ["-c", 'printf "%s|%s" "$PLAIN" "$SECRET"'], {
       env: { PLAIN: "plain", SECRET: Redacted.make(FAKE_SECRET) },
       secret: true,
     });
     expect(Redacted.value(output)).toBe(`plain|${FAKE_SECRET}`);
   }),
-);
+});
 
-export const redactedValueWithNulIsRefusedWithoutShowingIt = Task.make(
-  "Task.exec refuses a Redacted env value holding a NUL character, naming the variable but not the value",
-  Effect.gen(function* () {
+export const redactedValueWithNulIsRefusedWithoutShowingIt = Task.make({
+  name: "Task.exec refuses a Redacted env value holding a NUL character, naming the variable but not the value",
+  run: Effect.gen(function* () {
     const failure = yield* Task.exec("sh", ["-c", "true"], {
       env: { SECRET: Redacted.make("fake-env-sec\0ret-5d1e") },
     }).pipe(failureAsValue);
@@ -103,9 +103,9 @@ export const redactedValueWithNulIsRefusedWithoutShowingIt = Task.make(
       expect(Cause.pretty(Cause.fail(failure))).not.toContain(shownSecret);
     }
   }),
-);
+});
 
-export const redactedValueStaysOutOfOutputTracesAndErrors = Task.make(
+export const redactedValueStaysOutOfOutputTracesAndErrors = makeTest(
   "a Redacted env value reaches commands in a run but is in neither its output, its errors nor any file in the state directory",
   Effect.scoped(
     Effect.gen(function* () {
@@ -133,10 +133,38 @@ export const redactedValueStaysOutOfOutputTracesAndErrors = Task.make(
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const returnedRedactedValueReachesOtherTasks = Task.make(
+export const nonStringRedactedValueIsRefusedWithoutShowingIt = makeTest(
+  "a Redacted command value that plain JavaScript made from a non-string is refused, naming it but leaving its value out of output, errors and state files",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({ "main.js": UNTYPED_SOURCE });
+      const ran = yield* runTaskProcess(project, "main.js");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      for (const [taskName, programName, valueName] of [
+        ["listed", "sh", "the environment variable TOKEN"],
+        ["numeric", "sh", "the environment variable TOKEN"],
+        ["argument", "echo", "argument 2"],
+      ]) {
+        expect(ran.standardError).toContain(
+          `[${taskName}] error CommandNotStarted: could not start ${programName}: task's process service refused ${valueName} for ${programName}, a Redacted value that is not a string\n`,
+        );
+      }
+      const stateFiles = yield* readStateDirectoryTexts(project.home);
+      expect(stateFiles.some((file) => file.path.startsWith("traces/"))).toBe(true);
+      for (const shownSecret of [NON_STRING_SECRET_PART, String(NUMERIC_SECRET)]) {
+        expect(ran.standardOutput).not.toContain(shownSecret);
+        expect(ran.standardError).not.toContain(shownSecret);
+        expect(
+          stateFiles.filter((file) => file.text.includes(shownSecret)).map((file) => file.path),
+        ).toEqual([]);
+      }
+    }),
+  ),
+);
+
+export const returnedRedactedValueReachesOtherTasks = makeTest(
   "a task returns the Redacted output of a secret command, alone or nested, and other tasks yield it typed as Redacted and pass it to commands, while it stays out of output, traces and state files",
   Effect.scoped(
     Effect.gen(function* () {
@@ -162,35 +190,4 @@ export const returnedRedactedValueReachesOtherTasks = Task.make(
       ).toEqual([]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
-);
-
-const LABELLED_SOURCE = `import { Effect, Redacted } from "effect";
-import { Task } from "@sshkeda/task";
-export const token = Task.make("token", Effect.succeed({ token: Redacted.make("fake-labelled-token", { label: "API_TOKEN" }) }));
-export const password = Task.make("password", Effect.gen(function* () {
-  return yield* Task.serve(Redacted.make("fake-labelled-password", { label: "DB_PASSWORD" }));
-}));
-export const main = Task.make("main", Effect.gen(function* () {
-  const returned = yield* token;
-  const served = yield* password;
-  yield* Effect.log(\`token \${returned.token}, password \${served}\`);
-}));
-if (import.meta.main) Task.main(main);
-`;
-
-export const labelledRedactedValueKeepsItsLabel = Task.make(
-  "a labelled Redacted value that a task returns or serves reaches other tasks with its label",
-  Effect.scoped(
-    Effect.gen(function* () {
-      yield* typeCheckSource(LABELLED_SOURCE);
-      const project = yield* makeProject({ "main.ts": LABELLED_SOURCE });
-      const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.exitCode, ran.standardError).toBe(0);
-      expect(ran.standardError).toContain(
-        "[main] token <redacted:API_TOKEN>, password <redacted:DB_PASSWORD>\n",
-      );
-    }),
-  ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

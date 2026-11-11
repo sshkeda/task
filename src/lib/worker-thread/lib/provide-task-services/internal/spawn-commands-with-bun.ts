@@ -1,6 +1,7 @@
 import {
   Array as Arrays,
   Cause,
+  Clock,
   Deferred,
   Duration,
   Effect,
@@ -21,16 +22,19 @@ import type { CommandLine } from "effect/process";
 import {
   CommandOptionsRefused,
   CommandPipelineRefused,
+  RedactedNonStringRefused,
   RedactedValueWithNulRefused,
 } from "../../../../../shared/command-errors.ts";
 import type { CommandRefusal } from "../../../../../shared/command-errors.ts";
 import { formatFailureLines } from "../../../../../shared/format-error-lines.ts";
+import { markKilledBySignal } from "../../../../../shared/killed-by-signal.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../../../shared/names-from-package-json.ts";
 import {
   environmentEveryCommandSees,
   RUN_MARKERS_VARIABLE_NAME,
 } from "../../../../../shared/read-environment-config.ts";
 import { CauseWithoutFailure } from "../../../../../shared/report-errors.ts";
+import { markCommandOfTask } from "../../../../../shared/run-marker.ts";
 import { failuresOfCause } from "../../../../../shared/select-cause-reasons.ts";
 import {
   makeStandardInputRunner,
@@ -50,6 +54,10 @@ const MODULE = "ChildProcess";
 
 const OUTPUT_NAMES = ["stdout", "stderr"] as const;
 
+const OUTPUT_FLUSH_AFTER_LEADER_EXIT_MILLISECONDS = 100;
+
+const OUTPUT_FLUSH_AFTER_LEADER_EXIT = Duration.millis(OUTPUT_FLUSH_AFTER_LEADER_EXIT_MILLISECONDS);
+
 export const formatProgramNames = (command: ChildProcess.Command): string =>
   ChildProcess.isStandardCommand(command)
     ? command.command.slice(command.command.lastIndexOf("/") + 1)
@@ -65,27 +73,33 @@ const refuseUnsupportedCommand = (unsupportedCommand: typeof CommandRefusal.Type
     }),
   );
 
-const toPlatformError =
-  (method: string, command: string, step?: string) => (thrown: Cause.UnknownError) => {
-    const isNotFound =
-      Predicate.hasProperty(thrown.cause, "code") &&
-      (thrown.cause.code === "ENOENT" || thrown.cause.code === "ESRCH");
-    return PlatformError.systemError({
-      _tag: isNotFound ? "NotFound" : "Unknown",
-      module: MODULE,
-      method,
-      pathOrDescriptor: command,
-      description:
-        step === undefined ? String(thrown.cause) : `${step} failed with ${String(thrown.cause)}`,
-      cause: thrown.cause,
-    });
-  };
+const toPlatformError = (thrown: {
+  readonly method: string;
+  readonly command: string;
+  readonly step?: string;
+  readonly cause: unknown;
+}) => {
+  const { cause, step } = thrown;
+  const isNotFound =
+    Predicate.hasProperty(cause, "code") && (cause.code === "ENOENT" || cause.code === "ESRCH");
+  return PlatformError.systemError({
+    _tag: isNotFound ? "NotFound" : "Unknown",
+    module: MODULE,
+    method: thrown.method,
+    pathOrDescriptor: thrown.command,
+    description: step === undefined ? String(cause) : `${step} failed with ${String(cause)}`,
+    cause,
+  });
+};
 
 const reveal = <Plain extends string | undefined>(word: Plain | Redacted.Redacted) =>
   Redacted.isRedacted(word) ? Redacted.value(word) : word;
 
+const holdsNonString = (word: CommandLine.Word | undefined) =>
+  Redacted.isRedacted(word) && !Predicate.isString(Redacted.value(word));
+
 const holdsNul = (word: CommandLine.Word | undefined) =>
-  Redacted.isRedacted(word) && Redacted.value(word).includes("\0");
+  Redacted.isRedacted(word) && !holdsNonString(word) && Redacted.value(word).includes("\0");
 
 const isBrokenPipe = (failure: PlatformError.PlatformError) =>
   Predicate.hasProperty(failure.cause, "code") && failure.cause.code === "EPIPE";
@@ -97,8 +111,40 @@ const describeExit = (subprocess: Bun.Subprocess, latestMemberStartTime: string 
   latestMemberStartTime,
 });
 
+export const blameMissingWorkingDirectory = (
+  programName: string,
+  packageDirectoryPath: string,
+  workingDirectory: string,
+  spawnFailure: PlatformError.PlatformError,
+) => {
+  const describedWorkingDirectory = workingDirectory.startsWith(`${packageDirectoryPath}/`)
+    ? workingDirectory.slice(packageDirectoryPath.length + 1)
+    : workingDirectory;
+  const workingDirectoryFailure = (_tag: "BadResource" | "NotFound", whatIsWrong: string) =>
+    PlatformError.systemError({
+      _tag,
+      module: MODULE,
+      method: "spawn",
+      pathOrDescriptor: programName,
+      description: `the working directory ${describedWorkingDirectory} ${whatIsWrong}`,
+      cause: spawnFailure.reason.cause,
+    });
+  return FileSystem.FileSystem.use((fileSystem) => fileSystem.stat(workingDirectory)).pipe(
+    Effect.map((workingDirectoryInformation) =>
+      workingDirectoryInformation.type === "Directory"
+        ? spawnFailure
+        : workingDirectoryFailure("BadResource", "is not a directory"),
+    ),
+    Effect.catchReason("PlatformError", "NotFound", () =>
+      Effect.succeed(workingDirectoryFailure("NotFound", "doesn't exist")),
+    ),
+    Effect.flatMap(Effect.fail),
+  );
+};
+
 export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
   command: ChildProcess.Command,
+  taskName: string,
   standardInputRefusal: StandardInputReadOutsideRootTask | null,
   packageDirectoryPath: string,
   cleanupDuration: Duration.Duration,
@@ -141,14 +187,21 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
     );
   }
 
-  const redactedValuesWithNul = [
+  const namesOfRedactedValues = (isRefused: (word: CommandLine.Word | undefined) => boolean) => [
     ...command.args.flatMap((word, index) =>
-      holdsNul(word) ? [`argument ${String(index + 1)}`] : [],
+      isRefused(word) ? [`argument ${String(index + 1)}`] : [],
     ),
     ...Object.entries(spawnOptions.env ?? {}).flatMap(([name, value]) =>
-      holdsNul(value) ? [`the environment variable ${name}`] : [],
+      isRefused(value) ? [`the environment variable ${name}`] : [],
     ),
   ];
+  const redactedNonStrings = namesOfRedactedValues(holdsNonString);
+  if (Arrays.isArrayNonEmpty(redactedNonStrings)) {
+    return yield* refuseUnsupportedCommand(
+      new RedactedNonStringRefused({ programName, valueNames: redactedNonStrings }),
+    );
+  }
+  const redactedValuesWithNul = namesOfRedactedValues(holdsNul);
   if (Arrays.isArrayNonEmpty(redactedValuesWithNul)) {
     return yield* refuseUnsupportedCommand(
       new RedactedValueWithNulRefused({ programName, valueNames: redactedValuesWithNul }),
@@ -176,6 +229,10 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
     stdout: Deferred.makeUnsafe<void>(),
     stderr: Deferred.makeUnsafe<void>(),
   };
+  const outputMustEndAtMilliseconds = {
+    stdout: Deferred.makeUnsafe<number>(),
+    stderr: Deferred.makeUnsafe<number>(),
+  };
   const outputMayEndWhenIdle = Deferred.makeUnsafe<void>();
   const exitedDeferred = Deferred.makeUnsafe<
     ReturnType<typeof describeExit>,
@@ -192,9 +249,12 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
         cause: listingFailure,
       });
   const signalProcessGroup = (subprocess: Bun.Subprocess, signal: ChildProcess.Signal) =>
-    Effect.try(() => process.kill(-subprocess.pid, signal)).pipe(
+    Effect.try({
+      try: () => process.kill(-subprocess.pid, signal),
+      catch: (cause) => toPlatformError({ method: "kill", command: programName, cause }),
+    }).pipe(
       Effect.as(true),
-      Effect.catchTag("UnknownError", (error) => {
+      Effect.catchTag("PlatformError", (error) => {
         const permissionDenied =
           Predicate.hasProperty(error.cause, "code") && error.cause.code === "EPERM";
         return permissionDenied
@@ -205,10 +265,22 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
             )
           : Effect.fail(error);
       }),
-      Effect.mapError((error) =>
-        PlatformError.isPlatformError(error) ? error : toPlatformError("kill", programName)(error),
-      ),
       Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(false)),
+    );
+  const signalMembersLeftByLeader = (
+    subprocess: Bun.Subprocess,
+    signal: ChildProcess.Signal,
+    latestMemberStartTimeAtLeaderExit: string,
+  ) =>
+    findStartedGroupWitnessNow(null, subprocess.pid, {
+      leaderStartTime: null,
+      latestMemberStartTimeAtLeaderExit,
+    }).pipe(
+      workerState.provideRuntimeServices,
+      Effect.mapError(listingFailureToPlatformError("kill")),
+      Effect.flatMap((witness) =>
+        witness === null ? Effect.succeed(false) : signalProcessGroup(subprocess, signal),
+      ),
     );
   const signalProcessGroupUnlessReused = (
     subprocess: Bun.Subprocess,
@@ -219,19 +291,13 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
         return yield* signalProcessGroup(subprocess, signal);
       }
       const processExit = yield* Effect.exit(Deferred.await(exitedDeferred));
-      const leftNoMembers =
-        Exit.isFailure(processExit) || processExit.value.latestMemberStartTime === null;
-      if (leftNoMembers) {
+      const latestMemberStartTime = Exit.isFailure(processExit)
+        ? null
+        : processExit.value.latestMemberStartTime;
+      if (latestMemberStartTime === null) {
         return false;
       }
-      const witness = yield* findStartedGroupWitnessNow(null, subprocess.pid, {
-        leaderStartTime: null,
-        latestMemberStartTimeAtLeaderExit: processExit.value.latestMemberStartTime,
-      }).pipe(
-        workerState.provideRuntimeServices,
-        Effect.mapError(listingFailureToPlatformError("kill")),
-      );
-      return witness === null ? false : yield* signalProcessGroup(subprocess, signal);
+      return yield* signalMembersLeftByLeader(subprocess, signal, latestMemberStartTime);
     });
 
   const reportProcessCleanupFailure =
@@ -282,18 +348,31 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
 
   const endOutputOnceIdle = Deferred.done(outputMayEndWhenIdle, Exit.void).pipe(Effect.asVoid);
 
+  const awaitOutputReleased = (subprocess: Bun.Subprocess) =>
+    Effect.forEach(
+      OUTPUT_NAMES.filter((name) => subprocess[name] instanceof ReadableStream),
+      (name) => Deferred.await(outputReleased[name]),
+      { discard: true },
+    );
+
   const endMembersLeftByLeader = (
     subprocess: Bun.Subprocess,
     latestMemberStartTimeAtLeaderExit: string,
   ) =>
-    signalProcessGroup(subprocess, spawnOptions.killSignal ?? "SIGTERM").pipe(
-      Effect.andThen(signalProcessGroup(subprocess, "SIGCONT")),
+    awaitOutputReleased(subprocess).pipe(
+      Effect.timeoutOption(OUTPUT_FLUSH_AFTER_LEADER_EXIT),
       Effect.andThen(
-        Effect.forEach(
-          OUTPUT_NAMES.filter((name) => subprocess[name] instanceof ReadableStream),
-          (name) => Deferred.await(outputReleased[name]),
-          { discard: true },
-        ).pipe(
+        signalMembersLeftByLeader(
+          subprocess,
+          spawnOptions.killSignal ?? "SIGTERM",
+          latestMemberStartTimeAtLeaderExit,
+        ),
+      ),
+      Effect.andThen(
+        signalMembersLeftByLeader(subprocess, "SIGCONT", latestMemberStartTimeAtLeaderExit),
+      ),
+      Effect.andThen(
+        awaitOutputReleased(subprocess).pipe(
           Effect.timeoutOption(readForceKillAfter(spawnOptions)),
           Effect.flatMap((released) =>
             Option.isSome(released)
@@ -308,37 +387,6 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
       ),
     );
 
-  const describeWorkingDirectory = (workingDirectory: string) =>
-    workingDirectory.startsWith(`${packageDirectoryPath}/`)
-      ? workingDirectory.slice(packageDirectoryPath.length + 1)
-      : workingDirectory;
-  const blameMissingWorkingDirectory = (
-    workingDirectory: string,
-    spawnFailure: PlatformError.PlatformError,
-  ) => {
-    const workingDirectoryFailure = (_tag: "BadResource" | "NotFound", whatIsWrong: string) =>
-      PlatformError.systemError({
-        _tag,
-        module: MODULE,
-        method: "spawn",
-        pathOrDescriptor: programName,
-        description: `the working directory ${describeWorkingDirectory(workingDirectory)} ${whatIsWrong}`,
-        cause: spawnFailure.reason.cause,
-      });
-    return FileSystem.FileSystem.use((fileSystem) => fileSystem.stat(workingDirectory)).pipe(
-      workerState.provideRuntimeServices,
-      Effect.map((workingDirectoryInformation) =>
-        workingDirectoryInformation.type === "Directory"
-          ? spawnFailure
-          : workingDirectoryFailure("BadResource", "is not a directory"),
-      ),
-      Effect.catchReason("PlatformError", "NotFound", () =>
-        Effect.succeed(workingDirectoryFailure("NotFound", "doesn't exist")),
-      ),
-      Effect.flatMap(Effect.fail),
-    );
-  };
-
   const extendsEnvironmentEveryCommandSees =
     spawnOptions.extendEnv === true || spawnOptions.env === undefined;
   const declaredEnvironment = extendsEnvironmentEveryCommandSees
@@ -348,32 +396,43 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
   const environment =
     runMarker === null
       ? declaredEnvironment
-      : { ...declaredEnvironment, [RUN_MARKERS_VARIABLE_NAME]: runMarker.environmentValue };
+      : {
+          ...declaredEnvironment,
+          [RUN_MARKERS_VARIABLE_NAME]: markCommandOfTask(runMarker, taskName),
+        };
   const child = yield* Effect.acquireRelease(
-    Effect.try(() =>
-      Bun.spawn([command.command, ...command.args.map(reveal)], {
-        ...(spawnOptions.cwd === undefined ? {} : { cwd: spawnOptions.cwd }),
-        env: Record.map(environment, reveal),
-        stdio: [
-          standardStreamOption("stdin"),
-          standardStreamOption("stdout"),
-          standardStreamOption("stderr"),
-          ...(runMarker === null ? [] : [runMarker.fileDescriptor]),
-        ],
-        detached: true,
-      }),
-    ).pipe(
-      Effect.mapError(toPlatformError("spawn", programName)),
+    Effect.try({
+      try: () =>
+        Bun.spawn([command.command, ...command.args.map(reveal)], {
+          ...(spawnOptions.cwd === undefined ? {} : { cwd: spawnOptions.cwd }),
+          env: Record.map(environment, reveal),
+          stdio: [
+            standardStreamOption("stdin"),
+            standardStreamOption("stdout"),
+            standardStreamOption("stderr"),
+            ...(runMarker === null ? [] : [runMarker.fileDescriptor]),
+          ],
+          detached: true,
+        }),
+      catch: (cause) => toPlatformError({ method: "spawn", command: programName, cause }),
+    }).pipe(
       Effect.catchTag("PlatformError", (error) =>
         spawnOptions.cwd === undefined
           ? Effect.fail(error)
-          : blameMissingWorkingDirectory(spawnOptions.cwd, error),
+          : blameMissingWorkingDirectory(
+              programName,
+              packageDirectoryPath,
+              spawnOptions.cwd,
+              error,
+            ).pipe(workerState.provideRuntimeServices),
       ),
       Effect.tap((subprocess) =>
         Deferred.complete(
           exitedDeferred,
-          Effect.tryPromise(() => subprocess.exited).pipe(
-            Effect.mapError(toPlatformError("exited", programName)),
+          Effect.tryPromise({
+            try: () => subprocess.exited,
+            catch: (cause) => toPlatformError({ method: "exited", command: programName, cause }),
+          }).pipe(
             Effect.andThen(() =>
               readLatestMemberStartTime(null, subprocess.pid).pipe(
                 workerState.provideRuntimeServices,
@@ -391,9 +450,11 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
                   ),
             ),
             Effect.flatMap((latestMemberStartTime) =>
-              Effect.try(() => describeExit(subprocess, latestMemberStartTime)).pipe(
-                Effect.mapError(toPlatformError("resourceUsage", programName)),
-              ),
+              Effect.try({
+                try: () => describeExit(subprocess, latestMemberStartTime),
+                catch: (cause) =>
+                  toPlatformError({ method: "resourceUsage", command: programName, cause }),
+              }),
             ),
           ),
         ).pipe(workerState.forkInWorkerScope),
@@ -429,22 +490,33 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
           evaluate: () => readable,
           releaseLockOnEnd: true,
           onError: (cause) =>
-            toPlatformError(`fromReadable(${name})`, programName)(new Cause.UnknownError(cause)),
+            toPlatformError({ method: `fromReadable(${name})`, command: programName, cause }),
         }).pipe(
           (output) =>
             Stream.transformPull(output, (pull) =>
               Effect.succeed(
                 Effect.gen(function* () {
                   const reading = yield* Effect.forkChild(pull);
-                  const mayEndFirst = yield* Effect.raceFirst(
-                    Fiber.await(reading).pipe(Effect.as(false)),
-                    Deferred.await(outputMayEndWhenIdle).pipe(Effect.as(true)),
-                  );
-                  if (!mayEndFirst) {
+                  const mayEnd =
+                    Deferred.isDoneUnsafe(outputMayEndWhenIdle) ||
+                    (yield* Effect.raceFirst(
+                      Fiber.await(reading).pipe(Effect.as(false)),
+                      Deferred.await(outputMayEndWhenIdle).pipe(Effect.as(true)),
+                    ));
+                  if (!mayEnd) {
                     return yield* Fiber.join(reading);
                   }
+                  const nowMilliseconds = yield* Clock.currentTimeMillis;
+                  yield* Deferred.done(
+                    outputMustEndAtMilliseconds[name],
+                    Exit.succeed(
+                      nowMilliseconds + Duration.toMillis(readForceKillAfter(spawnOptions)),
+                    ),
+                  );
+                  const millisecondsLeft =
+                    (yield* Deferred.await(outputMustEndAtMilliseconds[name])) - nowMilliseconds;
                   const read = yield* Fiber.join(reading).pipe(
-                    Effect.timeoutOption(readForceKillAfter(spawnOptions)),
+                    Effect.timeoutOption(Duration.millis(Math.max(millisecondsLeft, 0))),
                   );
                   if (Option.isSome(read)) {
                     return read.value;
@@ -467,8 +539,10 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
     write: () => unknown,
     brokenPipeEndsTheInput: boolean,
   ) =>
-    Effect.tryPromise(() => Promise.resolve(write())).pipe(
-      Effect.mapError(toPlatformError(method, programName, step)),
+    Effect.tryPromise({
+      try: () => Promise.resolve(write()),
+      catch: (cause) => toPlatformError({ method, command: programName, step, cause }),
+    }).pipe(
       Effect.as(true),
       Effect.catchTag("PlatformError", (failure) => {
         const brokenPipeEndedTheInput = brokenPipeEndsTheInput && isBrokenPipe(failure);
@@ -544,13 +618,16 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
       Effect.flatMap((processExit) =>
         processExit.code === null
           ? Effect.fail(
-              PlatformError.systemError({
-                _tag: "Unknown",
-                module: MODULE,
-                method: "exitCode",
-                pathOrDescriptor: programName,
-                description: `process interrupted by signal ${processExit.signal}`,
-              }),
+              markKilledBySignal(
+                PlatformError.systemError({
+                  _tag: "Unknown",
+                  module: MODULE,
+                  method: "exitCode",
+                  pathOrDescriptor: programName,
+                  description: `process interrupted by signal ${processExit.signal}`,
+                }),
+                String(processExit.signal),
+              ),
             )
           : Effect.succeed(ChildProcessSpawner.ExitCode(processExit.code)),
       ),

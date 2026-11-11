@@ -1,6 +1,6 @@
-import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
 
+import * as BunStream from "@effect/platform-bun/BunStream";
 import {
   Cause,
   Context,
@@ -8,15 +8,19 @@ import {
   Duration,
   Effect,
   Exit,
+  Fiber,
   FiberSet,
   Layer,
   Option,
   Queue,
   Ref,
+  Result,
   Schema,
   Scope,
   Semaphore,
+  Stdio,
   Stream,
+  SubscriptionRef,
   Tracer,
 } from "effect";
 import { RpcClient, RpcSerialization, RpcServer, RpcWorker } from "effect/rpc";
@@ -34,13 +38,19 @@ import {
   MainThreadRpcs,
   MessageFromMainThreadRpcClient,
   TASK_EVENT_FIELDS,
+  TaskMadeInBody,
   TaskWorkerRpcs,
   WorkerInitialMessage,
 } from "../../../shared/rpc.ts";
 import type { StandardInputRead, StartTaskFiber, WorkerData } from "../../../shared/rpc.ts";
+import { awaitTerminalCommandExit, runInTerminal } from "../../../shared/run-in-terminal.ts";
 import type { TaskRequestFailure } from "../../../shared/task-errors.ts";
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
-import { ModuleGraph } from "../lib/find-code-each-task-depends-on/index.ts";
+import {
+  awaitTheSupervisorTerminalCommandExit,
+  runInTheSupervisorTerminal,
+} from "../../supervise-the-run/index.ts";
+import { StopRequested } from "./main-thread-errors.ts";
 import { DiscoveredTasks } from "./provide-discovered-tasks.ts";
 import { RunRootTaskConfig } from "./provide-run-root-task-config.ts";
 import { StopState } from "./provide-stop-state.ts";
@@ -52,12 +62,20 @@ const WORKER_EXIT_GRACE = Duration.seconds(WORKER_EXIT_GRACE_SECONDS);
 
 const FORCED_STOP_REASON = "without waiting for it to exit because the stop was forced";
 
+const OUTPUT_READER_WAIT_AFTER_A_STOP_SIGNAL = Duration.seconds(1);
+
+const WORKER_OUTPUT_CHUNKS_WAITING_TO_BE_WRITTEN = 16;
+
+const isStopRequested = Schema.is(StopRequested);
+
 export const FromWorker = Schema.TaggedUnion({
   ...TASK_EVENT_FIELDS,
   TaskFiberRequestedTask: {
     dependencyRequestId: Schema.Int,
     taskName: Schema.String,
     dependencyTaskName: Schema.String,
+    dependencyTaskFilePath: Schema.NullOr(Schema.String),
+    dependencyTaskMadeInBody: Schema.NullOr(TaskMadeInBody),
   },
   TaskFiberCancelledRequest: { taskName: Schema.String, dependencyRequestId: Schema.Int },
   TaskFiberRequestedStandardInput: { taskName: Schema.String, readId: Schema.Int },
@@ -137,21 +155,21 @@ const answerPendingRequest = <Success, Failure>(
 const makeWorkerPool = Effect.gen(function* () {
   const shutdown = yield* StopState;
   const runRootTaskConfig = yield* RunRootTaskConfig;
-  const moduleGraph = yield* ModuleGraph;
   const traceFile = yield* TraceFile;
+  const stdio = yield* Stdio.Stdio;
   const parentSpan = yield* Tracer.ParentSpan;
   const { tasksByName } = yield* DiscoveredTasks;
-  const taskFilePaths =
-    tasksByName === null
-      ? []
-      : Array.from(tasksByName.values(), (discoveredTask) => discoveredTask.filePath);
-  const workerLimit = Math.min(runRootTaskConfig.workerCount, taskFilePaths.length);
+  const workerLimit = Math.min(runRootTaskConfig.workerCount, tasksByName?.size ?? 0);
   const workersById = new Map<
     number,
     {
       readonly thread: Worker;
       readonly client: RpcClient.FromGroup<typeof TaskWorkerRpcs, RpcClientError.RpcClientError>;
       readonly exitDeferred: Deferred.Deferred<void>;
+      readonly postedBodyStartCount: Int32Array<SharedArrayBuffer>;
+      readonly handledBodyStartCount: SubscriptionRef.SubscriptionRef<number>;
+      readonly outputCopied: Fiber.Fiber<void>;
+      readonly isIsolated: boolean;
       terminationRequested: boolean;
       terminateCalled: boolean;
       uncaughtError: Option.Option<typeof UncaughtWorkerError.Type>;
@@ -161,6 +179,41 @@ const makeWorkerPool = Effect.gen(function* () {
   const workerEvents = yield* Queue.unbounded<typeof WorkerEvent.Type, Cause.Done>();
   const workerConnectionsScope = yield* Scope.fork(yield* Effect.scope);
   const callsToWorkers = yield* FiberSet.make().pipe(Scope.provide(workerConnectionsScope));
+  const workerOutput = yield* Queue.bounded<Deferred.Deferred<void> | Uint8Array>(
+    WORKER_OUTPUT_CHUNKS_WAITING_TO_BE_WRITTEN,
+  );
+  const workerOutputWriterStopped = yield* Deferred.make<void>();
+  yield* Stream.fromQueue(workerOutput).pipe(
+    Stream.rechunk(1),
+    Stream.filterMapEffect((chunkOrWritten) =>
+      chunkOrWritten instanceof Uint8Array
+        ? Effect.succeed(Result.succeed(chunkOrWritten))
+        : Deferred.done(chunkOrWritten, Exit.void).pipe(Effect.as(Result.fail(chunkOrWritten))),
+    ),
+    Stream.run(stdio.stdout()),
+    Effect.catchTag("PlatformError", () => Effect.void),
+    Effect.ensuring(Deferred.done(workerOutputWriterStopped, Exit.void)),
+    Effect.forkIn(workerConnectionsScope),
+  );
+  const copyWorkerOutput = (thread: Worker) =>
+    Effect.gen(function* () {
+      const written = yield* Deferred.make<void>();
+      yield* BunStream.fromReadable({ evaluate: () => thread.stdout }).pipe(
+        Stream.runForEach((chunk) => Queue.offer(workerOutput, chunk)),
+        Effect.andThen(Queue.offer(workerOutput, written)),
+        Effect.andThen(Deferred.await(written)),
+        Effect.raceFirst(
+          Deferred.await(workerOutputWriterStopped).pipe(
+            Effect.andThen(
+              Effect.sync(() => {
+                thread.stdout.resume();
+              }),
+            ),
+          ),
+        ),
+        Effect.catchTag("UnknownError", () => Effect.void),
+      );
+    });
   const nextAnswerId = yield* Ref.make(0);
   const pendingDependencyResults = new Map<
     number,
@@ -284,6 +337,19 @@ const makeWorkerPool = Effect.gen(function* () {
           Effect.sync(() => {
             traceFile.writeWorkerSpan(recorded.spanJson);
           }),
+        RunInTerminal: (command) =>
+          runRootTaskConfig.ownsSession
+            ? runInTheSupervisorTerminal(command)
+            : runInTerminal(
+                Effect.asVoid(shutdown.awaitFailure),
+                runRootTaskConfig.runMarker === null
+                  ? null
+                  : runRootTaskConfig.runMarker.fileDescriptor,
+              )(command),
+        AwaitTerminalCommandExit: (command) =>
+          runRootTaskConfig.ownsSession
+            ? awaitTheSupervisorTerminalCommandExit(command)
+            : awaitTerminalCommandExit(command),
         RecordStartedProcess: (started) =>
           reportAndAwaitAnswer(
             workerId,
@@ -332,42 +398,37 @@ const makeWorkerPool = Effect.gen(function* () {
       dieOnInvariantFailure("worker startup", "a started worker can be called over RPC"),
     );
 
-  const startWorker = (
-    workerId: number,
-    rewrittenFiles: (typeof WorkerData.Type)["rewrittenFiles"],
-  ) =>
+  const startWorker = (workerId: number, isIsolated: boolean) =>
     Effect.gen(function* () {
+      const postedBodyStartCount = new Int32Array(
+        new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
+      );
       const workerData = {
         workerId,
         projectDirectoryPath: runRootTaskConfig.rootTaskPackageJsonDirectoryPath,
-        rewrittenFiles,
         taskLogHold: shutdown.taskLogHold,
+        postedBodyStartCount,
         runMarker: runRootTaskConfig.runMarker,
+        rootTaskGroup: runRootTaskConfig.rootTaskGroup,
+        flags: runRootTaskConfig.flags,
       } satisfies typeof WorkerData.Type;
       const rpcChannel = new MessageChannel();
       yield* serveWorker(workerId, rpcChannel.port1);
       const thread = new Worker(new URL("../../worker-thread/index.ts", import.meta.url), {
         workerData,
+        stdout: true,
         argv: yield* commandLineArguments,
         execArgv: yield* bunArguments,
-        ...(Object.keys(rewrittenFiles).length === 0
-          ? {}
-          : {
-              preload: [
-                fileURLToPath(
-                  new URL(
-                    "../../preload-rewritten-imports-into-each-worker/index.ts",
-                    import.meta.url,
-                  ),
-                ),
-              ],
-            }),
       });
       const threadMessages = holdMessagesUntilListened(thread);
       const workerThread = {
         thread,
         client: yield* connectToWorker(threadMessages, rpcChannel.port2),
         exitDeferred: yield* Deferred.make<void>(),
+        postedBodyStartCount,
+        handledBodyStartCount: yield* SubscriptionRef.make(0),
+        outputCopied: yield* copyWorkerOutput(thread).pipe(Effect.forkIn(workerConnectionsScope)),
+        isIsolated,
         terminationRequested: false,
         terminateCalled: false,
         uncaughtError: Option.none(),
@@ -396,21 +457,15 @@ const makeWorkerPool = Effect.gen(function* () {
         );
       });
     });
-  const readRewrittenWorkerImports = yield* Effect.cached(
-    moduleGraph.rewriteBareImports([
-      fileURLToPath(new URL("../../worker-thread/index.ts", import.meta.url)),
-      ...taskFilePaths,
-    ]),
-  );
-  const startNextWorker = Effect.gen(function* () {
-    const workerId = workersById.size;
-    const rewrittenWorkerImports = yield* readRewrittenWorkerImports;
-    if (yield* shutdown.isStopping) {
-      return yield* Effect.interrupt;
-    }
-    yield* startWorker(workerId, rewrittenWorkerImports);
-    return workerId;
-  });
+  const startNextWorker = (isIsolated: boolean) =>
+    Effect.gen(function* () {
+      const workerId = workersById.size;
+      if (yield* shutdown.isStopping) {
+        return yield* Effect.interrupt;
+      }
+      yield* startWorker(workerId, isIsolated);
+      return workerId;
+    });
   const terminateWorker = (
     workerId: number,
     workerThread: Parameters<typeof workersById.set>[1],
@@ -429,25 +484,22 @@ const makeWorkerPool = Effect.gen(function* () {
       );
       void workerThread.thread.terminate();
     }).pipe(Effect.uninterruptible);
-  const requestExitOfAllWorkers = Effect.forEach(
-    workersById.values(),
-    (workerThread) =>
-      Effect.gen(function* () {
-        const isWorkerLeaving =
-          workerThread.terminationRequested || Deferred.isDoneUnsafe(workerThread.exitDeferred);
-        if (isWorkerLeaving) {
-          return;
-        }
-        workerThread.terminationRequested = true;
-        yield* FiberSet.run(
-          callsToWorkers,
-          workerThread.client
-            .ExitWorker()
-            .pipe(Effect.catchTag("RpcClientError", () => Effect.void)),
-        );
-      }),
-    { discard: true },
-  );
+  const requestWorkerExit = (workerThread: Parameters<typeof workersById.set>[1]) =>
+    Effect.gen(function* () {
+      const isWorkerLeaving =
+        workerThread.terminationRequested || Deferred.isDoneUnsafe(workerThread.exitDeferred);
+      if (isWorkerLeaving) {
+        return;
+      }
+      workerThread.terminationRequested = true;
+      yield* FiberSet.run(
+        callsToWorkers,
+        workerThread.client.ExitWorker().pipe(Effect.catchTag("RpcClientError", () => Effect.void)),
+      );
+    });
+  const requestExitOfAllWorkers = Effect.forEach(workersById.values(), requestWorkerExit, {
+    discard: true,
+  });
   const terminateAllWorkers = Effect.forEach(
     workersById,
     ([workerId, workerThread]) => terminateWorker(workerId, workerThread, FORCED_STOP_REASON),
@@ -457,12 +509,22 @@ const makeWorkerPool = Effect.gen(function* () {
     workersById,
     ([workerId, workerThread]) =>
       Effect.gen(function* () {
-        const exited = yield* Deferred.await(workerThread.exitDeferred).pipe(
+        const awaitWorkerDone = workerThread.isIsolated
+          ? Fiber.join(workerThread.outputCopied)
+          : Deferred.await(workerThread.exitDeferred);
+        const done = yield* awaitWorkerDone.pipe(
           Effect.timeoutOption(WORKER_EXIT_GRACE),
           Effect.raceFirst(shutdown.awaitForcedStop.pipe(Effect.as(Option.none()))),
         );
-        if (Option.isSome(exited)) {
-          return;
+        if (Option.isSome(done)) {
+          const outputCopied = Fiber.join(workerThread.outputCopied).pipe(
+            Effect.raceFirst(shutdown.awaitForcedStop),
+          );
+          const isStoppedBySignal =
+            (yield* shutdown.hasFailed) && isStopRequested(yield* shutdown.awaitFailure);
+          return yield* isStoppedBySignal
+            ? Effect.timeoutOption(outputCopied, OUTPUT_READER_WAIT_AFTER_A_STOP_SIGNAL)
+            : outputCopied;
         }
         yield* terminateWorker(
           workerId,
@@ -471,7 +533,9 @@ const makeWorkerPool = Effect.gen(function* () {
             ? FORCED_STOP_REASON
             : `because it did not exit within ${Duration.format(WORKER_EXIT_GRACE)} of being asked to`,
         );
-        yield* Deferred.await(workerThread.exitDeferred);
+        if (!workerThread.isIsolated) {
+          yield* Deferred.await(workerThread.exitDeferred);
+        }
       }),
     { concurrency: "unbounded", discard: true },
   ).pipe(Effect.andThen(Queue.end(workerEvents)));
@@ -513,51 +577,91 @@ const makeWorkerPool = Effect.gen(function* () {
       );
       return true;
     });
-  yield* Effect.addFinalizer(() => Effect.andThen(requestExitOfAllWorkers, awaitWorkerShutdown));
-  return {
-    events: Stream.fromQueue(workerEvents).pipe(
-      Stream.provideService(Tracer.ParentSpan, parentSpan),
-    ),
-    selectWorkerIdForTask: (
-      readWorkerLoad: (workerId: number) => {
-        readonly occupyingTaskCount: number;
-        readonly servingTaskCount: number;
-      },
-      recordAssignment: (workerId: number) => Effect.Effect<void>,
-    ) =>
-      Effect.gen(function* () {
+  const selectWorkerIdForTask = (
+    readWorkerLoad: (workerId: number) => {
+      readonly occupyingTaskCount: number;
+      readonly servingTaskCount: number;
+    },
+    recordAssignment: (workerId: number) => Effect.Effect<void>,
+    requiredWorkerId: number | null,
+    isIsolated: boolean,
+    awaitNextWorkerLoadChange: () => Effect.Effect<void>,
+  ): Effect.Effect<number> =>
+    Effect.gen(function* () {
+      const workerLoadChanged = awaitNextWorkerLoadChange();
+      const selectedWorkerId = yield* Effect.gen(function* () {
         if (yield* shutdown.isStopping) {
           return yield* Effect.interrupt;
         }
-        const usableWorkerIds = [...workersById]
-          .filter(
-            ([, workerThread]) =>
-              !workerThread.terminationRequested &&
-              !Deferred.isDoneUnsafe(workerThread.exitDeferred),
-          )
-          .map(([workerId]) => workerId);
-        const usableWorkerLoads = usableWorkerIds.map(
-          (usableWorkerId) => [usableWorkerId, readWorkerLoad(usableWorkerId)] as const,
+        const usableWorkers = [...workersById].filter(
+          ([, workerThread]) =>
+            !workerThread.terminationRequested && !Deferred.isDoneUnsafe(workerThread.exitDeferred),
         );
-        const idleWorkerId = usableWorkerLoads.find(
+        const usableWorkerIds = usableWorkers.map(([workerId]) => workerId);
+        const sharedWorkerLoads = usableWorkers
+          .filter(([, workerThread]) => !workerThread.isIsolated)
+          .map(([workerId]) => [workerId, readWorkerLoad(workerId)] as const);
+        const busyWorkerCount = usableWorkerIds.filter(
+          (workerId) => readWorkerLoad(workerId).occupyingTaskCount > 0,
+        ).length;
+        const startsIsolatedWorker = isIsolated && requiredWorkerId === null;
+        const awaitsFreeWorkerSlot = startsIsolatedWorker && busyWorkerCount >= workerLimit;
+        if (awaitsFreeWorkerSlot) {
+          return null;
+        }
+        const idleWorkerId = sharedWorkerLoads.find(
           ([, load]) => load.occupyingTaskCount === 0 && load.servingTaskCount === 0,
         )?.[0];
+        const startsSharedWorker =
+          idleWorkerId === undefined &&
+          [...workersById.values()].filter((workerThread) => !workerThread.isIsolated).length <
+            workerLimit;
+        const selectSharedWorkerId = startsSharedWorker
+          ? startNextWorker(false)
+          : Effect.succeed(
+              idleWorkerId ??
+                sharedWorkerLoads.toSorted(
+                  ([, left], [, right]) =>
+                    left.occupyingTaskCount - right.occupyingTaskCount ||
+                    left.servingTaskCount - right.servingTaskCount,
+                )[0]?.[0],
+            );
         const workerId =
-          idleWorkerId ??
-          (workersById.size < workerLimit
-            ? yield* startNextWorker
-            : usableWorkerLoads.toSorted(
-                ([, left], [, right]) =>
-                  left.occupyingTaskCount - right.occupyingTaskCount ||
-                  left.servingTaskCount - right.servingTaskCount,
-              )[0]?.[0]);
+          requiredWorkerId === null
+            ? yield* startsIsolatedWorker ? startNextWorker(true) : selectSharedWorkerId
+            : usableWorkerIds.find((usableWorkerId) => usableWorkerId === requiredWorkerId);
         if (workerId === undefined) {
           yield* shutdown.awaitFailure;
           return yield* Effect.interrupt;
         }
         yield* recordAssignment(workerId);
         return workerId;
-      }).pipe(workerSelectionSemaphore.withPermits(1)),
+      }).pipe(workerSelectionSemaphore.withPermits(1));
+      if (selectedWorkerId !== null) {
+        return selectedWorkerId;
+      }
+      yield* Effect.raceFirst(workerLoadChanged, Effect.asVoid(shutdown.awaitFailure));
+      return yield* selectWorkerIdForTask(
+        readWorkerLoad,
+        recordAssignment,
+        requiredWorkerId,
+        isIsolated,
+        awaitNextWorkerLoadChange,
+      );
+    });
+  yield* Effect.addFinalizer(() => Effect.andThen(requestExitOfAllWorkers, awaitWorkerShutdown));
+  return {
+    events: Stream.fromQueue(workerEvents).pipe(
+      Stream.provideService(Tracer.ParentSpan, parentSpan),
+    ),
+    selectWorkerIdForTask,
+    discardIsolatedWorker: (workerId: number) =>
+      Effect.fromNullishOr(workersById.get(workerId)).pipe(
+        dieOnInvariantFailure("worker pool", "a worker whose tasks ended was started"),
+        Effect.flatMap((workerThread) =>
+          workerThread.isIsolated ? requestWorkerExit(workerThread) : Effect.void,
+        ),
+      ),
     startTaskFiber: (workerId: number, start: typeof StartTaskFiber.Type) =>
       callWorker(workerId, "StartTaskFiber", (client) => client.StartTaskFiber(start)),
     stopTaskFiber: (workerId: number, taskName: string) =>
@@ -599,6 +703,24 @@ const makeWorkerPool = Effect.gen(function* () {
     requestExitOfAllWorkers,
     terminateAllWorkers,
     awaitWorkerShutdown,
+    recordBodyStartHandled: (workerId: number) =>
+      Effect.fromNullishOr(workersById.get(workerId)).pipe(
+        dieOnInvariantFailure("worker pool", "a body start comes from a started worker"),
+        Effect.flatMap((workerThread) =>
+          SubscriptionRef.update(workerThread.handledBodyStartCount, (count) => count + 1),
+        ),
+      ),
+    awaitPostedBodyStartsHandled: Effect.forEach(
+      workersById.values(),
+      (workerThread) => {
+        const postedCount = Atomics.load(workerThread.postedBodyStartCount, 0);
+        return SubscriptionRef.changes(workerThread.handledBodyStartCount).pipe(
+          Stream.takeUntil((handledCount) => handledCount >= postedCount),
+          Stream.runDrain,
+        );
+      },
+      { concurrency: "unbounded", discard: true },
+    ),
     startedWorkerCount: Effect.sync(() => workersById.size),
   };
 });

@@ -13,11 +13,12 @@ import { failureAsValue } from "../shared/failure-as-value.ts";
 import { findMisprintedErrorLines } from "../shared/find-misprinted-error-lines.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeScratchDirectory } from "../shared/make-temporary-directories.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
 const DIGITS_BEYOND_THE_LARGEST_NUMBER = 401;
 
-export const stateDirectory = Task.make(
+export const stateDirectory = makeTest(
   "configured state directories hold the traces and reject blank paths",
   Effect.scoped(
     Effect.gen(function* () {
@@ -25,8 +26,7 @@ export const stateDirectory = Task.make(
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.log("computed"));
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.log("computed") });`,
       });
       for (const directory of [`${project.directory}/absolute-state`, "relative-state"]) {
         const location = directory.startsWith("/")
@@ -51,10 +51,9 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const homeDirectoryPath = Task.make(
+export const homeDirectoryPath = makeTest(
   "runtime configuration requires HOME only without an explicit state directory",
   Effect.scoped(
     Effect.gen(function* () {
@@ -62,8 +61,7 @@ export const homeDirectoryPath = Task.make(
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.void);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.void });`,
       });
       for (const configuration of [
         { environment: {}, succeeds: false },
@@ -104,18 +102,16 @@ if (import.meta.main) Task.main(main);`,
       expect(yield* fileSystem.exists(`${project.directory}/explicit-state/traces`)).toBe(true);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const workerCount = Task.make(
+export const workerCount = makeTest(
   "runtime configuration rejects worker counts that are not whole decimal numbers above 0 or that exceed the maximum",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.void);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.void });`,
       });
       for (const configuredWorkerCount of ["", "0", "-1", "1.5", "many", "Infinity", "1e2", " 4"]) {
         const invalid = yield* runTaskProcess(project, "main.ts", {
@@ -150,10 +146,9 @@ if (import.meta.main) Task.main(main);`,
       expect(valid.exitCode).toBe(0);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const parentEnvironment = Task.make(
+export const parentEnvironment = makeTest(
   "test children get their own Task config even when the parent environment sets Task variables",
   Effect.scoped(
     Effect.gen(function* () {
@@ -172,10 +167,9 @@ export const parentEnvironment = Task.make(
       expect(yield* fileSystem.exists(leakedStateDirectory)).toBe(false);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const bunVersionRange = Task.make(
+export const bunVersionRange = makeTest(
   "a Bun older than the package's engines.bun range fails startup naming the package and both versions",
   Effect.gen(function* () {
     const refused = yield* failureAsValue(requireSupportedBunVersion("1.3.14", ">=1.4.2"));
@@ -188,18 +182,16 @@ export const bunVersionRange = Task.make(
     }
     yield* requireSupportedBunVersion(Bun.version);
   }),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const setupLimit = Task.make(
+export const setupLimit = makeTest(
   "runtime configuration rejects setup limits that are not durations above 0, and accepts a duration",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.void);
-if (import.meta.main) Task.main(main);`,
+export default Task.make({ name: "main", run: Effect.void });`,
       });
       for (const configuredSetupLimit of [
         "",
@@ -227,5 +219,4 @@ if (import.meta.main) Task.main(main);`,
       }
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

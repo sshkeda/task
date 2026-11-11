@@ -4,7 +4,7 @@ import type { ProcessNotSignaled } from "../../../shared/process-errors.ts";
 import type { RunMarker } from "../../../shared/run-marker.ts";
 import { findDescendantProcessIds, findSessionProcessIds } from "./find-process-ids.ts";
 import { listProcesses } from "./list-processes.ts";
-import { findMarkedProcessIds } from "./mark-run-processes.ts";
+import { findMarkedProcesses } from "./mark-run-processes.ts";
 import { signalUnlessReplaced } from "./send-signal.ts";
 import { findStartedGroupWitness } from "./started-process-groups.ts";
 import type { startedProcessGroup } from "./started-process-groups.ts";
@@ -32,7 +32,7 @@ export const signalRunProcesses = Effect.fn("signalRunProcesses")(function* (
     ...(run.descendantsOfProcessId === null
       ? []
       : findDescendantProcessIds(listedProcesses, [run.descendantsOfProcessId]).slice(1)),
-    ...(yield* findMarkedProcessIds(run.runMarker, listedProcesses.keys())),
+    ...(yield* findMarkedProcesses(run.runMarker, listedProcesses.keys())).keys(),
     ...[...listedProcesses]
       .filter(([, listedProcess]) => startedProcessGroupIds.has(listedProcess.processGroupId))
       .map(([processId]) => processId),

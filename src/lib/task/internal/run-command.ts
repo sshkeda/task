@@ -1,10 +1,24 @@
-import { Cause, Deferred, Effect, Exit, Fiber, Redacted, Scope, Stream } from "effect";
+import {
+  Cause,
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  Option,
+  Redacted,
+  Scope,
+  Semaphore,
+  Stream,
+} from "effect";
 import type { PlatformError } from "effect/PlatformError";
 import * as PlatformErrors from "effect/PlatformError";
 import { ChildProcess } from "effect/process";
 
+import { CommandOutputTooLong } from "../../../shared/command-errors.ts";
+import { signalThatKilled } from "../../../shared/killed-by-signal.ts";
 import { environmentEveryCommandSees } from "../../../shared/read-environment-config.ts";
 import { CauseWithoutFailure } from "../../../shared/report-errors.ts";
+import { TerminalCommandEnded, TerminalCommands } from "../../../shared/run-in-terminal.ts";
 import { failureValuesOfCause } from "../../../shared/select-cause-reasons.ts";
 import {
   isStandardInputClosedByCommand,
@@ -30,9 +44,19 @@ const logAndCapture = (output: Stream.Stream<Uint8Array, PlatformError>) =>
       ),
       Stream.splitLines,
       Stream.runForEachArray((lines) => Effect.log(lines.join("\n"))),
-      Effect.map(() => texts.join("")),
+      Effect.as(texts),
     );
   });
+
+const joinOutput = (
+  texts: readonly string[],
+  command: string,
+  outputName: CommandOutputTooLong["outputName"],
+) =>
+  Effect.try({
+    try: () => texts.join(""),
+    catch: () => new CommandOutputTooLong({ command, outputName }),
+  }).pipe(Effect.catch((error) => Effect.die(error)));
 
 const OUTPUT_MODES = {
   logged: {
@@ -43,15 +67,23 @@ const OUTPUT_MODES = {
   },
   secret: {
     readOutput: (output: Stream.Stream<Uint8Array, PlatformError>) =>
-      Stream.mkString(Stream.decodeText(output)),
+      Stream.runCollect(Stream.decodeText(output)),
     returnOutput: (standardOutput: string) => Redacted.make(standardOutput),
     makeFailure: (failure: ConstructorParameters<typeof CommandFailed>[0]) =>
       new CapturedCommandFailed({
         command: failure.command,
         code: failure.code,
+        signal: failure.signal ?? null,
         standardOutput: Redacted.make(failure.standardOutput),
         standardError: Redacted.make(failure.standardError),
       }),
+  },
+  terminal: {
+    readOutput: (output: Stream.Stream<Uint8Array, PlatformError>) =>
+      Stream.runDrain(output).pipe(Effect.as([])),
+    returnOutput: (): void => undefined,
+    makeFailure: (failure: ConstructorParameters<typeof CommandFailed>[0]) =>
+      new CommandFailed(failure),
   },
 };
 
@@ -67,51 +99,116 @@ const outputModes: {
   };
 } = OUTPUT_MODES;
 
-export const exec = <Secret extends boolean = false>(
+const terminalTurns = Semaphore.makeUnsafe(1);
+
+export const exec = <
+  Secret extends boolean = false,
+  Stdio extends "inherit" | undefined = undefined,
+>(
   name: string,
   commandArguments: readonly string[],
-  ...[commandOptions = {}]: [Secret] extends [true]
+  ...[commandOptions = {}]: [Stdio] extends ["inherit"]
     ? [
         commandOptions: {
-          readonly cwd?: string;
-          readonly env?: Readonly<Record<string, Redacted.Redacted | string>>;
-          readonly stdin?: Stream.Stream<Uint8Array, PlatformError>;
-          readonly secret: Secret;
+          readonly cwd?: string | undefined;
+          readonly env?: Readonly<Record<string, Redacted.Redacted | string>> | undefined;
+          readonly stdio: Stdio;
         },
       ]
-    : [
-        commandOptions?: {
-          readonly cwd?: string;
-          readonly env?: Readonly<Record<string, Redacted.Redacted | string>>;
-          readonly stdin?: Stream.Stream<Uint8Array, PlatformError>;
-          readonly secret?: Secret;
-        },
-      ]
+    : [Secret] extends [true]
+      ? [
+          commandOptions: {
+            readonly cwd?: string | undefined;
+            readonly env?: Readonly<Record<string, Redacted.Redacted | string>> | undefined;
+            readonly stdin?: Stream.Stream<Uint8Array, PlatformError> | undefined;
+            readonly secret: Secret;
+            readonly stdio?: undefined extends Stdio ? undefined : Stdio;
+          },
+        ]
+      : [
+          commandOptions?: {
+            readonly cwd?: string | undefined;
+            readonly env?: Readonly<Record<string, Redacted.Redacted | string>> | undefined;
+            readonly stdin?: Stream.Stream<Uint8Array, PlatformError> | undefined;
+            readonly secret?: Secret;
+            readonly stdio?: undefined extends Stdio ? undefined : Stdio;
+          },
+        ]
 ) =>
-  Tasks.use(() =>
-    Effect.scoped(
+  Tasks.use(() => {
+    const options: {
+      readonly cwd?: string | undefined;
+      readonly env?: Readonly<Record<string, Redacted.Redacted | string>> | undefined;
+      readonly stdin?: Stream.Stream<Uint8Array, PlatformError> | undefined;
+      readonly secret?: Secret;
+      readonly stdio?: Stdio | (undefined extends Stdio ? false : Stdio);
+    } = commandOptions;
+    const command = name.slice(name.lastIndexOf("/") + 1);
+    const runInTerminal = Effect.gen(function* () {
+      const outputMode = outputModes[yield* trustOutputModeName(options)];
+      const terminalCommands = yield* TerminalCommands;
+      const ended = yield* terminalCommands({
+        command: name,
+        args: commandArguments,
+        env: Object.fromEntries(
+          Object.entries({ ...(yield* environmentEveryCommandSees), ...options.env }).map(
+            ([variableName, value]) => [
+              variableName,
+              Redacted.isRedacted(value) ? Redacted.value(value) : value,
+            ],
+          ),
+        ),
+        cwd: options.cwd ?? ".",
+      }).pipe(Effect.mapError((failure) => new CommandNotStarted({ command, cause: failure })));
+      if (TerminalCommandEnded.guards.Signaled(ended)) {
+        return yield* PlatformErrors.systemError({
+          _tag: "Unknown",
+          module: "ChildProcess",
+          method: "exitCode",
+          pathOrDescriptor: command,
+          description: `process interrupted by signal ${ended.signal}`,
+        });
+      }
+      if (ended.code === 0) {
+        return outputMode.returnOutput("");
+      }
+      return yield* outputMode.makeFailure({
+        command,
+        code: ended.code,
+        standardOutput: "",
+        standardError: "",
+      });
+    });
+    const runCommand = Effect.scoped(
       Effect.gen(function* () {
-        const outputMode = outputModes[yield* trustOutputModeName(commandOptions.secret)];
-        const command = name.slice(name.lastIndexOf("/") + 1);
+        const outputMode = outputModes[yield* trustOutputModeName(options)];
         const outputScope = yield* Scope.fork(yield* Effect.scope);
         const commandReleased = yield* Deferred.make<void>();
         const child = yield* ChildProcess.make(name, commandArguments, {
-          ...(commandOptions.cwd === undefined ? {} : { cwd: commandOptions.cwd }),
-          env: { ...(yield* environmentEveryCommandSees), ...commandOptions.env },
-          stdin: commandOptions.stdin === undefined ? "ignore" : "pipe",
+          ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
+          env: { ...(yield* environmentEveryCommandSees), ...options.env },
+          stdin: options.stdin === undefined ? "ignore" : "pipe",
           stderr: "pipe",
         }).pipe(Effect.mapError((failure) => new CommandNotStarted({ command, cause: failure })));
         const standardInput = makeStandardInputRunner();
         const standardInputFiber = yield* Effect.forkScoped(
-          commandOptions.stdin === undefined
+          options.stdin === undefined
             ? Effect.void
-            : standardInput.run(Stream.run(commandOptions.stdin, child.stdin)),
+            : standardInput.run(Stream.run(options.stdin, child.stdin)),
         );
-        const readUntilCommandReleased = (output: Stream.Stream<Uint8Array, PlatformError>) =>
-          outputMode.readOutput(output.pipe(Stream.interruptWhen(Deferred.await(commandReleased))));
+        const readUntilCommandReleased = (
+          output: Stream.Stream<Uint8Array, PlatformError>,
+          outputName: CommandOutputTooLong["outputName"],
+        ) =>
+          outputMode
+            .readOutput(output.pipe(Stream.interruptWhen(Deferred.await(commandReleased))))
+            .pipe(Effect.flatMap((texts) => joinOutput(texts, command, outputName)));
         const outputFiber = yield* Effect.forkIn(
           Effect.all(
-            [readUntilCommandReleased(child.stdout), readUntilCommandReleased(child.stderr)],
+            [
+              readUntilCommandReleased(child.stdout, "standard output"),
+              readUntilCommandReleased(child.stderr, "standard error"),
+            ],
             { concurrency: "unbounded" },
           ),
           outputScope,
@@ -163,12 +260,23 @@ export const exec = <Secret extends boolean = false>(
           ),
         );
         const standardInputFailed = standardInputFailures.reasons.length > 0;
+        const killingSignal = Exit.isFailure(exitCodeExit)
+          ? Option.match(Cause.findErrorOption(exitCodeExit.cause), {
+              onNone: () => null,
+              onSome: signalThatKilled,
+            })
+          : null;
         if (Exit.isFailure(exitCodeExit)) {
-          return yield* standardInputFailed
-            ? Effect.failCause(standardInputFailures)
-            : Effect.failCause(exitCodeExit.cause);
+          if (standardInputFailed) {
+            return yield* Effect.failCause(standardInputFailures);
+          }
+          if (killingSignal === null) {
+            yield* Fiber.await(outputFiber);
+            return yield* Effect.failCause(exitCodeExit.cause);
+          }
         }
-        if (exitCodeExit.value === 0) {
+        const code = Exit.isSuccess(exitCodeExit) ? exitCodeExit.value : null;
+        if (code === 0) {
           if (standardInputFailed) {
             return yield* Effect.failCause(standardInputFailures);
           }
@@ -181,7 +289,8 @@ export const exec = <Secret extends boolean = false>(
             Cause.fail(
               outputMode.makeFailure({
                 command,
-                code: exitCodeExit.value,
+                code,
+                signal: killingSignal,
                 standardOutput,
                 standardError,
               }),
@@ -190,5 +299,6 @@ export const exec = <Secret extends boolean = false>(
           ),
         );
       }),
-    ),
-  );
+    );
+    return options.stdio === "inherit" ? terminalTurns.withPermit(runInTerminal) : runCommand;
+  });

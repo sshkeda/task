@@ -6,7 +6,7 @@ import { RunRootTaskConfig } from "../../../shared/provide-run-root-task-config.
 
 export const makeRootTaskStandardInput = Effect.gen(function* () {
   const stdio = yield* Stdio.Stdio;
-  const rootTaskName = (yield* RunRootTaskConfig).rootTask.name;
+  const rootTaskName = (yield* RunRootTaskConfig).rootTaskName;
   const isTerminal = yield* stdio.stdinIsTerminal;
   const runScope = yield* Effect.scope;
   const pullStandardInputChunks = yield* Effect.cached(

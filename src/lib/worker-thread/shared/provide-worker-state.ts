@@ -12,6 +12,7 @@ import {
   FiberSet,
   Option,
 } from "effect";
+import { constVoid } from "effect/Function";
 import type { HttpClient } from "effect/http";
 import { RpcClient, RpcSerialization, RpcWorker } from "effect/rpc";
 import type { RpcMessage } from "effect/rpc";
@@ -119,15 +120,22 @@ const connectToMainThread = Effect.gen(function* () {
       MainThreadRpcRequest.make({ ...request, id: "", headers: [], isNotification: true }),
     );
   };
-  const reportToMainThread = (event: typeof TaskEvent.Type) =>
+  const reportToMainThreadThen = (event: typeof TaskEvent.Type, afterPosting: () => void) =>
     encodeTaskEvent(event).pipe(
       dieOnInvariantFailure("worker protocol", "reports reach the main thread"),
       Effect.flatMap((payload) =>
         Effect.sync(() => {
           notifyMainThread({ tag: "ReportTaskEvent", payload });
+          afterPosting();
         }),
       ),
     );
+  const reportToMainThread = (event: typeof TaskEvent.Type) =>
+    reportToMainThreadThen(event, constVoid);
+  const reportBodyStarted = (taskName: string) =>
+    reportToMainThreadThen(TaskEvent.cases.TaskFiberStarted.make({ taskName }), () => {
+      Atomics.add(decodedWorkerData.postedBodyStartCount, 0, 1);
+    });
   const runInWorkerScope = yield* FiberSet.makeRuntime<never, void, never>();
   const reportToMainThreadNow = (event: typeof TaskEvent.Type) => {
     runInWorkerScope(reportToMainThread(event));
@@ -142,6 +150,7 @@ const connectToMainThread = Effect.gen(function* () {
     ...decodedWorkerData,
     mainThread,
     reportToMainThread,
+    reportBodyStarted,
     reportToMainThreadNow,
     recordTraceSpanNow,
   };

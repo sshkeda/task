@@ -1,25 +1,10 @@
 import { Array as Arrays, Duration, Schema } from "effect";
 
 import { TASK_ERROR_FIELDS, UNATTRIBUTED_FAILURE_FIELDS } from "../../../shared/error-fields.ts";
-import { ImportResolutionThrew } from "../../../shared/module-graph-errors.ts";
 import { describeCauseMessage, reportError } from "../../../shared/report-errors.ts";
 import { TASK_OPTION_NAMES } from "../../../shared/resolve-task-options.ts";
 import { exitCodeAfterStopSignal, STOP_REASONS } from "../../../shared/stop-signals.ts";
-import { TASK_PACKAGE } from "../../../shared/task-package.ts";
-import type { PrintableError } from "../../errors/index.ts";
-
-export class ImportNotFound extends Schema.TaggedError<ImportNotFound>()("ImportNotFound", {
-  ...TASK_ERROR_FIELDS,
-  importingFilePath: Schema.String,
-  specifier: Schema.String,
-}) {
-  public get location() {
-    return this.importingFilePath;
-  }
-  public override get message() {
-    return `imports "${this.specifier}", which the resolver reported as not found`;
-  }
-}
+import { TaskDefinitionNotGiven, TaskNameNotString } from "../../../shared/task-errors.ts";
 
 export class MissingPackageJson extends Schema.TaggedError<MissingPackageJson>()(
   "MissingPackageJson",
@@ -54,124 +39,30 @@ export class RootTaskWorkingDirectoryUnavailable extends Schema.TaggedError<Root
   }
 }
 
-const SCANNED_LINE_FIELDS = { line: Schema.NullOr(Schema.Int) };
-
-export class ModuleSyntaxInvalid extends Schema.TaggedError<ModuleSyntaxInvalid>()(
-  "ModuleSyntaxInvalid",
-  { ...TASK_ERROR_FIELDS, ...SCANNED_LINE_FIELDS, parserMessage: Schema.String },
-) {
-  public override get message() {
-    return `has the syntax error ${this.parserMessage}`;
-  }
-}
-
-export class TaskPackageImportedWithoutTask extends Schema.TaggedError<TaskPackageImportedWithoutTask>()(
-  "TaskPackageImportedWithoutTask",
-  { ...SCANNED_LINE_FIELDS, ...TASK_ERROR_FIELDS },
-) {
-  public override get message() {
-    return `imports ${TASK_PACKAGE.name} without naming Task`;
-  }
-}
-
-export class ModuleLoaderRefused extends Schema.TaggedError<ModuleLoaderRefused>()(
-  "ModuleLoaderRefused",
-  { ...TASK_ERROR_FIELDS, ...SCANNED_LINE_FIELDS, loader: Schema.String },
-) {
-  public override get message() {
-    return `uses the module loader ${this.loader}`;
-  }
-}
-
-export class ModuleLoadedByComputedPath extends Schema.TaggedError<ModuleLoadedByComputedPath>()(
-  "ModuleLoadedByComputedPath",
-  {
-    ...TASK_ERROR_FIELDS,
-    ...SCANNED_LINE_FIELDS,
-    loader: Schema.String,
-    argumentText: Schema.String,
-  },
-) {
-  public override get message() {
-    return `calls ${this.loader}(${this.argumentText}), which has no literal path`;
-  }
-}
-
-export class TaskNameMissing extends Schema.TaggedError<TaskNameMissing>()("TaskNameMissing", {
-  ...SCANNED_LINE_FIELDS,
-  ...TASK_ERROR_FIELDS,
-}) {
-  public override get message() {
-    return "calls Task.make() without a name";
-  }
-}
-
-export class TaskNameNotString extends Schema.TaggedError<TaskNameNotString>()(
-  "TaskNameNotString",
-  { ...SCANNED_LINE_FIELDS, ...TASK_ERROR_FIELDS, nameText: Schema.String },
-) {
-  public override get message() {
-    return `calls Task.make() with the name ${this.nameText}, which is not a string`;
-  }
-}
-
-export class TaskNameComputed extends Schema.TaggedError<TaskNameComputed>()("TaskNameComputed", {
-  ...SCANNED_LINE_FIELDS,
-  ...TASK_ERROR_FIELDS,
-  nameText: Schema.String,
-}) {
-  public override get message() {
-    return `calls Task.make() with the name ${this.nameText}, which is computed`;
-  }
-}
-
 export class TaskNameEmpty extends Schema.TaggedError<TaskNameEmpty>()("TaskNameEmpty", {
-  ...SCANNED_LINE_FIELDS,
   ...TASK_ERROR_FIELDS,
+  location: Schema.String,
 }) {
   public override get message() {
     return "calls Task.make() with an empty name";
   }
 }
 
-export class TaskCalledBelowTopLevel extends Schema.TaggedError<TaskCalledBelowTopLevel>()(
-  "TaskCalledBelowTopLevel",
-  { ...SCANNED_LINE_FIELDS, ...TASK_ERROR_FIELDS },
-) {
+export class TaskNameBlank extends Schema.TaggedError<TaskNameBlank>()("TaskNameBlank", {
+  ...TASK_ERROR_FIELDS,
+  location: Schema.String,
+}) {
   public override get message() {
-    return "calls Task.make() below the top level of its module";
+    return "calls Task.make() with a name of only whitespace";
   }
 }
 
-export const ModuleScanRefusal = Schema.Union([
-  ModuleSyntaxInvalid,
-  TaskPackageImportedWithoutTask,
-  ModuleLoaderRefused,
-  ModuleLoadedByComputedPath,
-  TaskNameMissing,
-  TaskNameNotString,
-  TaskNameComputed,
-  TaskNameEmpty,
-  TaskCalledBelowTopLevel,
-]);
-
-const ScannedModuleRefusal = Schema.Struct({
-  filePath: Schema.String,
-  refusal: ModuleScanRefusal,
-});
-
-export const ModuleRefusal = Schema.Union([
-  ScannedModuleRefusal,
-  ImportNotFound,
-  ImportResolutionThrew,
-]);
-
-export class TaskFileImportsItself extends Schema.TaggedError<TaskFileImportsItself>()(
-  "TaskFileImportsItself",
-  { ...TASK_ERROR_FIELDS, filePath: Schema.String, cycle: Schema.Array(Schema.String) },
+export class TaskNameMultiline extends Schema.TaggedError<TaskNameMultiline>()(
+  "TaskNameMultiline",
+  { ...TASK_ERROR_FIELDS, location: Schema.String, nameText: Schema.String },
 ) {
   public override get message() {
-    return `imports ${this.cycle.slice(1).join(", which imports ")}; a worker imports only the file of the task it runs, so a task file in an import cycle would load in a different order there than when Task.main() loaded it`;
+    return `calls Task.make() with the name ${this.nameText}, which has a line break`;
   }
 }
 
@@ -181,29 +72,6 @@ export class TaskMadeMoreThanOnce extends Schema.TaggedError<TaskMadeMoreThanOnc
 ) {
   public override get message() {
     return `makes the task "${this.taskName}", which ${this.madeCount} Task.make() calls make`;
-  }
-}
-
-export class TaskNotMadeByImport extends Schema.TaggedError<TaskNotMadeByImport>()(
-  "TaskNotMadeByImport",
-  { ...TASK_ERROR_FIELDS, taskName: Schema.String, filePath: Schema.String },
-) {
-  public override get message() {
-    return `importing this file did not make task "${this.taskName}" in the copy of ${TASK_PACKAGE.name} that calls Task.main()`;
-  }
-}
-
-export class TaskMadeAgainInThread extends Schema.TaggedError<TaskMadeAgainInThread>()(
-  "TaskMadeAgainInThread",
-  {
-    ...TASK_ERROR_FIELDS,
-    taskName: Schema.String,
-    filePath: Schema.String,
-    madeCount: Schema.Int,
-  },
-) {
-  public override get message() {
-    return `Task.make() made "${this.taskName}" ${this.madeCount} times in this thread, but this file has its only top-level Task.make() call`;
   }
 }
 
@@ -225,6 +93,28 @@ export class TaskCleanupInvalid extends Schema.TaggedError<TaskCleanupInvalid>()
   }
 }
 
+export class TaskIsolatedInvalid extends Schema.TaggedError<TaskIsolatedInvalid>()(
+  "TaskIsolatedInvalid",
+  {
+    ...TASK_ERROR_FIELDS,
+    taskName: Schema.String,
+    isolated: Schema.String,
+  },
+) {
+  public override get message() {
+    return `sets isolated to ${this.isolated}, which is not true or false`;
+  }
+}
+
+export class TaskIsolatedInBody extends Schema.TaggedError<TaskIsolatedInBody>()(
+  "TaskIsolatedInBody",
+  { ...TASK_ERROR_FIELDS, taskName: Schema.String, madeInTaskName: Schema.String },
+) {
+  public override get message() {
+    return `is made inside the body of "${this.madeInTaskName}", so it cannot run on a worker of its own`;
+  }
+}
+
 export class TaskOptionsUnknown extends Schema.TaggedError<TaskOptionsUnknown>()(
   "TaskOptionsUnknown",
   {
@@ -239,39 +129,29 @@ export class TaskOptionsUnknown extends Schema.TaggedError<TaskOptionsUnknown>()
   }
 }
 
-export class RootTaskNotMadeAtTopLevel extends Schema.TaggedError<RootTaskNotMadeAtTopLevel>()(
-  "RootTaskNotMadeAtTopLevel",
+export class RootTaskNotMadeWhileLoading extends Schema.TaggedError<RootTaskNotMadeWhileLoading>()(
+  "RootTaskNotMadeWhileLoading",
   { ...TASK_ERROR_FIELDS, rootTaskFilePath: Schema.String },
 ) {
   public override get message() {
-    return `${this.rootTaskFilePath} runs a task that is not made by a top-level Task.make() call`;
+    return `${this.rootTaskFilePath} runs a task that no Task.make() call made while ${this.rootTaskFilePath} loaded`;
   }
 }
 
 export const TaskDefinitionViolation = Schema.Union([
-  ModuleRefusal,
-  TaskFileImportsItself,
+  TaskDefinitionNotGiven,
+  TaskNameNotString,
+  TaskNameEmpty,
+  TaskNameBlank,
+  TaskNameMultiline,
   TaskMadeMoreThanOnce,
-  TaskNotMadeByImport,
-  TaskMadeAgainInThread,
   TaskTimeoutInvalid,
   TaskCleanupInvalid,
+  TaskIsolatedInvalid,
+  TaskIsolatedInBody,
   TaskOptionsUnknown,
-  RootTaskNotMadeAtTopLevel,
+  RootTaskNotMadeWhileLoading,
 ]);
-
-const isScannedModuleRefusal = Schema.is(ScannedModuleRefusal);
-
-export const reportTaskDefinitionViolation = (
-  violation: typeof TaskDefinitionViolation.Type,
-): PrintableError =>
-  isScannedModuleRefusal(violation)
-    ? {
-        tag: violation.refusal._tag,
-        location: `${violation.filePath}${violation.refusal.line === null ? "" : `:${violation.refusal.line}`}`,
-        message: violation.refusal.message,
-      }
-    : reportError(violation);
 
 export class BrokenTasksFound extends Schema.TaggedError<BrokenTasksFound>()("BrokenTasksFound", {
   ...TASK_ERROR_FIELDS,
@@ -279,7 +159,7 @@ export class BrokenTasksFound extends Schema.TaggedError<BrokenTasksFound>()("Br
   violations: Schema.NonEmptyArray(TaskDefinitionViolation),
 }) {
   public get reportedErrors() {
-    return Arrays.map(this.violations, reportTaskDefinitionViolation);
+    return Arrays.map(this.violations, reportError);
   }
   public override get message() {
     return `found ${this.violations.length} task definition ${this.violations.length === 1 ? "violation" : "violations"}`;
@@ -315,7 +195,16 @@ export class TaskCleanupTimedOut extends Schema.TaggedError<TaskCleanupTimedOut>
   { ...TASK_ERROR_FIELDS, taskName: Schema.String, cleanupMilliseconds: Schema.Finite },
 ) {
   public override get message() {
-    return `its cleanup did not finish within ${Duration.format(Duration.millis(this.cleanupMilliseconds))}`;
+    return `its cleanup did not finish within ${Duration.format(Duration.millis(this.cleanupMilliseconds))}, so the run stopped waiting for it`;
+  }
+}
+
+export class TaskCleanupCutOff extends Schema.TaggedError<TaskCleanupCutOff>()(
+  "TaskCleanupCutOff",
+  { ...TASK_ERROR_FIELDS, taskName: Schema.String },
+) {
+  public override get message() {
+    return "its cleanup was cut off because the stop was forced";
   }
 }
 
@@ -348,6 +237,18 @@ export class UnawaitedTasksFailed extends Schema.TaggedError<UnawaitedTasksFaile
 ) {
   public override get message() {
     return `no task awaited the failure of ${this.failedTaskNames.join(", ")}`;
+  }
+}
+
+export class TasksNeverRan extends Schema.TaggedError<TasksNeverRan>()("TasksNeverRan", {
+  ...TASK_ERROR_FIELDS,
+  ...UNATTRIBUTED_FAILURE_FIELDS,
+  taskNames: Schema.NonEmptyArray(Schema.String),
+  filePath: Schema.String,
+}) {
+  public override get message() {
+    const isOneTask = this.taskNames.length === 1;
+    return `makes ${this.taskNames.map((taskName) => `"${taskName}"`).join(", ")} but nothing ran ${isOneTask ? "it" : "them"}`;
   }
 }
 

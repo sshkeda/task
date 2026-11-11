@@ -1,11 +1,18 @@
-import { Cause, Clock, Duration, Effect, Exit, Fiber, Option, Ref } from "effect";
+import { Cause, Clock, Deferred, Duration, Effect, Exit, Fiber, Option, Ref } from "effect";
 
 import { TaskSetupTimedOut } from "../../../../../../../shared/task-errors.ts";
 import { failRun } from "../../../../../shared/fail-run.ts";
 import { TaskCleanupTimedOut } from "../../../../../shared/main-thread-errors.ts";
 import { RunRootTaskConfig } from "../../../../../shared/provide-run-root-task-config.ts";
+import type { StopState } from "../../../../../shared/provide-stop-state.ts";
+import { WorkerPool } from "../../../../../shared/provide-worker-pool.ts";
+import { findTaskNamesOccupyingWorker } from "../../../shared/define-task-run-state.ts";
 import type { makeTaskRunsState } from "../../../shared/define-task-run-state.ts";
 import { awaitWithinCountedLimit } from "./await-within-counted-limit.ts";
+
+const WORKER_ANSWERS_WITHIN_MILLISECONDS = 200;
+
+const WORKER_ANSWERS_WITHIN = Duration.millis(WORKER_ANSWERS_WITHIN_MILLISECONDS);
 
 export const makeTaskSetupClock = Effect.fn("makeTaskSetupClock")(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
@@ -13,22 +20,63 @@ export const makeTaskSetupClock = Effect.fn("makeTaskSetupClock")(function* (
   cleanupDuration: Duration.Duration,
 ) {
   const limitMilliseconds = Duration.toMillis((yield* RunRootTaskConfig).setupLimit);
-  const setupStartedAtMilliseconds = yield* Clock.currentTimeMillis;
-  const workerAssignment = yield* Ref.make(
-    Option.none<{
-      readonly workerId: number;
-      readonly busyMillisecondsAtAssignment: number;
-    }>(),
-  );
+  const workerPool = yield* WorkerPool;
+  const assignedWorkerId = yield* Ref.make(Option.none<number>());
+  const setupStartedAtMilliseconds = yield* Ref.make<number | null>(null);
+  const workerLastAnsweredAtMilliseconds = yield* Ref.make(0);
+  const workerHeldMilliseconds = yield* Ref.make(0);
   const countSetupMilliseconds = (nowMilliseconds: number) =>
-    Effect.map(Ref.get(workerAssignment), (assignedWorker) => {
-      const workerBusyMilliseconds = Option.match(assignedWorker, {
-        onNone: () => 0,
-        onSome: (worker) =>
-          taskRunsState.readWorkerBodyBusyMilliseconds(worker.workerId, nowMilliseconds) -
-          worker.busyMillisecondsAtAssignment,
+    Effect.gen(function* () {
+      const startedAtMilliseconds = yield* Ref.get(setupStartedAtMilliseconds);
+      return startedAtMilliseconds === null
+        ? 0
+        : nowMilliseconds - startedAtMilliseconds - (yield* Ref.get(workerHeldMilliseconds));
+    });
+  const isWorkerHeldByOtherTasks = (workerId: number) =>
+    Effect.gen(function* () {
+      const isOccupiedByOtherTasks = findTaskNamesOccupyingWorker(
+        taskRunsState.runsByTaskName,
+        workerId,
+      ).some((occupyingTaskName) => {
+        const occupyingTaskRun = taskRunsState.runsByTaskName.get(occupyingTaskName);
+        const hasStartedBody =
+          occupyingTaskRun !== undefined &&
+          Deferred.isDoneUnsafe(occupyingTaskRun.bodyStartedAtMillisecondsDeferred);
+        return occupyingTaskName !== taskName && hasStartedBody;
       });
-      return nowMilliseconds - setupStartedAtMilliseconds - workerBusyMilliseconds;
+      if (!isOccupiedByOtherTasks) {
+        return false;
+      }
+      const answer = yield* workerPool
+        .awaitAnswer(workerId)
+        .pipe(Effect.timeoutOption(WORKER_ANSWERS_WITHIN));
+      return Option.isNone(answer);
+    });
+  const awaitWorkerHeldByOtherTasks = <Success, Failure>(
+    setupFiber: Fiber.Fiber<Success, Failure>,
+  ) =>
+    Effect.gen(function* () {
+      const workerId = yield* Ref.get(assignedWorkerId);
+      if (Option.isNone(workerId)) {
+        return false;
+      }
+      if (!(yield* isWorkerHeldByOtherTasks(workerId.value))) {
+        return false;
+      }
+      yield* workerPool
+        .awaitAnswer(workerId.value)
+        .pipe(Effect.asVoid, Effect.raceFirst(Effect.asVoid(Fiber.await(setupFiber))));
+      const answeredAtMilliseconds = yield* Clock.currentTimeMillis;
+      const lastAnsweredAtMilliseconds = yield* Ref.getAndSet(
+        workerLastAnsweredAtMilliseconds,
+        answeredAtMilliseconds,
+      );
+      yield* Ref.update(
+        workerHeldMilliseconds,
+        (heldMilliseconds) =>
+          heldMilliseconds + answeredAtMilliseconds - lastAnsweredAtMilliseconds,
+      );
+      return true;
     });
   const interruptSetupKeepingFailures = <Success, Failure>(
     setupFiber: Fiber.Fiber<Success, Failure>,
@@ -61,7 +109,7 @@ export const makeTaskSetupClock = Effect.fn("makeTaskSetupClock")(function* (
   const awaitSetupWithinLimit = <Success, Failure>(
     setupFiber: Fiber.Fiber<Success, Failure>,
     describeUnfinishedStep: () => string,
-  ) =>
+  ): Effect.Effect<Exit.Exit<Success, Failure> | null, never, RunRootTaskConfig | StopState> =>
     Effect.gen(function* () {
       const setupExit = yield* awaitWithinCountedLimit(
         Fiber.await(setupFiber),
@@ -70,6 +118,9 @@ export const makeTaskSetupClock = Effect.fn("makeTaskSetupClock")(function* (
       );
       if (Option.isSome(setupExit)) {
         return setupExit.value;
+      }
+      if (yield* awaitWorkerHeldByOtherTasks(setupFiber)) {
+        return yield* awaitSetupWithinLimit(setupFiber, describeUnfinishedStep);
       }
       yield* failRun(
         new TaskSetupTimedOut({
@@ -83,18 +134,16 @@ export const makeTaskSetupClock = Effect.fn("makeTaskSetupClock")(function* (
     });
   return {
     recordWorkerAssignment: (workerId: number) =>
-      Effect.flatMap(Clock.currentTimeMillis, (nowMilliseconds) =>
-        Ref.set(
-          workerAssignment,
-          Option.some({
-            workerId,
-            busyMillisecondsAtAssignment: taskRunsState.readWorkerBodyBusyMilliseconds(
-              workerId,
-              nowMilliseconds,
-            ),
-          }),
+      Ref.set(assignedWorkerId, Option.some(workerId)).pipe(
+        Effect.andThen(Clock.currentTimeMillis),
+        Effect.flatMap((nowMilliseconds) =>
+          Effect.andThen(
+            Ref.set(workerLastAnsweredAtMilliseconds, nowMilliseconds),
+            Ref.set(setupStartedAtMilliseconds, nowMilliseconds),
+          ),
         ),
       ),
+    isWorkerHeldByOtherTasks,
     limit: <Success, Failure, Services>(
       setup: Effect.Effect<Success, Failure, Services>,
       describeUnfinishedStep: () => string,

@@ -29,8 +29,16 @@ class TaskResultNotHandedOver extends Schema.TaggedError<TaskResultNotHandedOver
   }
 }
 
-const describeResultNotHandedOver = (notHandedOver: TaskResultNotHandedOver) =>
-  TaskFiberResult.cases.Failed.make(reportCause(Cause.fail(notHandedOver)));
+const reportResultNotHandedOver = (taskName: string, cause: TaskResultNotHandedOver["cause"]) =>
+  TaskFiberResult.cases.Failed.make(
+    reportCause(Cause.fail(new TaskResultNotHandedOver({ taskName, cause }))),
+  );
+
+const describeResultNotHandedOver = (taskName: string, cause: TaskResultNotHandedOver["cause"]) =>
+  Result.getOrElse(
+    Result.try(() => reportResultNotHandedOver(taskName, cause)),
+    () => reportResultNotHandedOver(taskName, THROWN_VALUE_WITHOUT_MESSAGE),
+  );
 
 const endTaskBody = Effect.fn("endTaskBody")(function* (
   startMessage: typeof StartTaskFiber.Type,
@@ -49,7 +57,6 @@ const endTaskBody = Effect.fn("endTaskBody")(function* (
       TaskEvent.cases.TaskFiberEnded.make({
         taskName: startMessage.taskName,
         result,
-        logs: body.logs,
       }),
     );
   yield* Effect.suspend((): Effect.Effect<typeof TaskFiberResult.Type> => {
@@ -69,26 +76,9 @@ const endTaskBody = Effect.fn("endTaskBody")(function* (
         const defect = Cause.findDefect(failureCause);
         return Result.isFailure(defect)
           ? Effect.failCause(defect.failure)
-          : Effect.try(() =>
-              describeResultNotHandedOver(
-                new TaskResultNotHandedOver({
-                  taskName: startMessage.taskName,
-                  cause: defect.success,
-                }),
-              ),
-            ).pipe(
-              Effect.catchTag("UnknownError", () =>
-                Effect.sync(() =>
-                  describeResultNotHandedOver(
-                    new TaskResultNotHandedOver({
-                      taskName: startMessage.taskName,
-                      cause: THROWN_VALUE_WITHOUT_MESSAGE,
-                    }),
-                  ),
-                ),
-              ),
-              Effect.flatMap(sendTaskFiberEnded),
-            );
+          : Effect.sync(() =>
+              describeResultNotHandedOver(startMessage.taskName, defect.success),
+            ).pipe(Effect.flatMap(sendTaskFiberEnded));
       },
       onSuccess: (success) => Effect.succeed(success),
     }),

@@ -4,6 +4,7 @@ import { formatCauseLines } from "../../../shared/format-error-lines.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
 import { printTaskLines } from "../../../shared/print-to-standard-error.ts";
 import { reportCause } from "../../../shared/report-cause.ts";
+import { RunRootTaskConfig } from "./provide-run-root-task-config.ts";
 import { StopState } from "./provide-stop-state.ts";
 
 export const reportFailure = (failure: Error) => reportCause(Cause.fail(failure)).failures;
@@ -15,8 +16,13 @@ export const reportTaskFailure = Effect.fn("reportTaskFailure")(function* (
   const shutdown = yield* StopState;
   yield* shutdown.recordTaskFailureCause(taskName, cause);
   const errorLines = formatCauseLines(cause, taskName);
+  const { log } = yield* RunRootTaskConfig;
   if (cause.reasons.length > 0) {
-    yield* printTaskLines("Error", taskName, errorLines);
+    yield* printTaskLines(
+      "Error",
+      taskName,
+      formatCauseLines(cause, taskName, "error", log === "info" ? "left out" : "repeated"),
+    );
   }
   const failures = cause.reasons.filter(Cause.isFailReason).map((reason) => reason.error);
   for (const failure of failures) {

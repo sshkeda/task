@@ -17,14 +17,13 @@ class ParentTaskConfigLeaked extends Schema.TaggedError<ParentTaskConfigLeaked>(
 const program = Effect.scoped(
   Effect.gen(function* () {
     const project = yield* makeProject({
-      "main.ts": `import { Effect, Schema } from "effect";
+      "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("main", Effect.void);
 if (import.meta.main) {
   console.error(\`state directory \${process.env.SSHKEDA_TASK_STATE_DIRECTORY ?? "unset"}\`);
   console.error(\`unrelated setting \${process.env.SSHKEDA_TASK_UNRELATED_SETTING ?? "unset"}\`);
-  Task.main(main);
-}`,
+}
+export default Task.make({ name: "main", run: Effect.void });`,
     });
     const ran = yield* runTaskProcess(project, "main.ts");
     const isIsolatedFromParentConfig =

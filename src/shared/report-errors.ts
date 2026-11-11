@@ -16,6 +16,7 @@ export const TaskRaisedError = Schema.Struct({
   raisedBy: Schema.Literal(TASK_PACKAGE.name),
   name: Schema.String,
   message: Schema.String,
+  messageBeforeOutput: Schema.optional(Schema.String),
   location: Schema.optional(Schema.String),
   filePath: Schema.optional(Schema.String),
   taskName: Schema.optional(Schema.NullOr(Schema.String)),
@@ -27,6 +28,9 @@ export const reportError = (error: typeof TaskRaisedError.Type): PrintableError 
     tag: error.name,
     ...(location === undefined ? {} : { location }),
     message: error.message === "" ? error.name : error.message,
+    ...(error.messageBeforeOutput === undefined
+      ? {}
+      : { messageBeforeOutput: error.messageBeforeOutput }),
   };
 };
 

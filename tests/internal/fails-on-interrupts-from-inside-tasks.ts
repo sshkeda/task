@@ -1,11 +1,11 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
 import { Effect, FileSystem } from "effect";
 
 import { EXIT_CODE_AFTER_SIGINT } from "../shared/exit-codes-after-stop-signals.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTemporaryDirectory } from "../shared/make-temporary-directories.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 
 const printedErrorLinesOf = (standardError: string, taskName: string) =>
@@ -19,8 +19,7 @@ const makeMainTaskProject = (mainTaskSource: string) =>
   makeProject({
     "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-${mainTaskSource}
-if (import.meta.main) Task.main(main);`,
+${mainTaskSource}`,
   });
 
 const runMainTaskSource = (mainTaskSource: string) =>
@@ -45,14 +44,14 @@ const interruptedWithoutAFailure = (taskName: string) =>
   `[${taskName}] error CauseWithoutFailure: was interrupted without a failure`;
 
 const requestedByBody = (options: string) =>
-  `Task.make("main", Effect.gen(function* () { yield* dependency; })${options})`;
+  `Task.make({ name: "main", run: Effect.gen(function* () { yield* dependency; })${options} })`;
 
 const expectRequesterFailsAfterDependency = (dependencyTask: string, requesterTask: string) =>
   Effect.gen(function* () {
     const ran = yield* runMainTaskSource(
       `${IMPORT_FIBER}
 export const dependency = ${dependencyTask};
-export const main = ${requesterTask};`,
+export default ${requesterTask};`,
     );
     expect(ran.exitCode).toBe(1);
     expect(printedErrorLinesOf(ran.standardError, "dependency")).toEqual([
@@ -66,7 +65,7 @@ export const main = ${requesterTask};`,
 const expectRootTaskFails = (rootTask: string) =>
   Effect.gen(function* () {
     const ran = yield* runMainTaskSource(`${IMPORT_FIBER}
-export const main = ${rootTask};`);
+export default ${rootTask};`);
     expect(ran.exitCode).toBe(1);
     expect(printedErrorLinesOf(ran.standardError, "main")).toEqual([
       interruptedWithoutAFailure("main"),
@@ -74,11 +73,11 @@ export const main = ${rootTask};`);
     expect(ran.standardError).toMatch(/^failed: main \(1 of 1 task\), /mu);
   });
 
-const bodyTask = (body: string) => `Task.make("dependency", ${body})`;
+const bodyTask = (body: string) => `Task.make({ name: "dependency", run: ${body} })`;
 
-const TIMEOUT_OPTIONS = ', { timeout: "5 seconds", cleanup: "5 seconds" }';
+const TIMEOUT_OPTIONS = ', timeout: "5 seconds", cleanup: "5 seconds"';
 
-export const bodyInterruptRequestedByBody = Task.make(
+export const bodyInterruptRequestedByBody = makeTest(
   "a body that interrupts itself fails the task a body requests with CauseWithoutFailure",
   Effect.scoped(
     expectRequesterFailsAfterDependency(
@@ -86,10 +85,9 @@ export const bodyInterruptRequestedByBody = Task.make(
       requestedByBody(""),
     ),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const bodyJoinOfInterruptedFiberRequestedByBody = Task.make(
+export const bodyJoinOfInterruptedFiberRequestedByBody = makeTest(
   "a body that joins an interrupted fiber fails the task a body requests with CauseWithoutFailure",
   Effect.scoped(
     expectRequesterFailsAfterDependency(
@@ -97,10 +95,9 @@ export const bodyJoinOfInterruptedFiberRequestedByBody = Task.make(
       requestedByBody(""),
     ),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const bodyInterruptRequestedByBodyWithTimeout = Task.make(
+export const bodyInterruptRequestedByBodyWithTimeout = makeTest(
   "a body that interrupts itself fails the task a timed body requests, without blaming the timeout",
   Effect.scoped(
     expectRequesterFailsAfterDependency(
@@ -108,38 +105,37 @@ export const bodyInterruptRequestedByBodyWithTimeout = Task.make(
       requestedByBody(TIMEOUT_OPTIONS),
     ),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const bodyInterruptOfRootTask = Task.make(
+export const bodyInterruptOfRootTask = makeTest(
   "a root task body that interrupts itself fails the run with CauseWithoutFailure",
-  Effect.scoped(expectRootTaskFails(`Task.make("main", ${INTERRUPTED_FROM_INSIDE.interrupt})`)),
-  { timeout: "1 minute", cleanup: "5 seconds" },
+  Effect.scoped(
+    expectRootTaskFails(`Task.make({ name: "main", run: ${INTERRUPTED_FROM_INSIDE.interrupt} })`),
+  ),
 );
 
-export const bodyInterruptWithEndlessCleanup = Task.make(
+export const bodyInterruptWithEndlessCleanup = makeTest(
   "a root task body that interrupts itself fails at once and its cleanup limit applies, even when its cleanup never ends",
   Effect.scoped(
     Effect.gen(function* () {
       const ran = yield* runMainTaskSource(
-        'export const main = Task.make("main", Effect.gen(function* () { yield* Effect.addFinalizer(() => Effect.never); yield* Effect.interrupt; }), { cleanup: "100 millis" });',
+        'export default Task.make({ name: "main", run: Effect.gen(function* () { yield* Effect.addFinalizer(() => Effect.never); yield* Effect.interrupt; }), cleanup: "100 millis" });',
       );
       expect(ran.exitCode).toBe(1);
       expect(printedErrorLinesOf(ran.standardError, "main")).toEqual([
         interruptedWithoutAFailure("main"),
-        "[main] error TaskCleanupTimedOut: its cleanup did not finish within 100ms",
+        "[main] error TaskCleanupTimedOut: its cleanup did not finish within 100ms, so the run stopped waiting for it",
       ]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const bodyInterruptWithFailingCleanup = Task.make(
+export const bodyInterruptWithFailingCleanup = makeTest(
   "a root task body that interrupts itself and whose cleanup then fails prints both",
   Effect.scoped(
     Effect.gen(function* () {
       const ran = yield* runMainTaskSource(
-        'export const main = Task.make("main", Effect.gen(function* () { yield* Effect.addFinalizer(() => Effect.die(new Error("cleanup broke"))); yield* Effect.interrupt; }));',
+        'export default Task.make({ name: "main", run: Effect.gen(function* () { yield* Effect.addFinalizer(() => Effect.die(new Error("cleanup broke"))); yield* Effect.interrupt; }) });',
       );
       expect(ran.exitCode).toBe(1);
       const mainErrorLines = printedErrorLinesOf(ran.standardError, "main");
@@ -149,14 +145,13 @@ export const bodyInterruptWithFailingCleanup = Task.make(
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const expectOnlyTimedOutPrinted = (timedTask: string, timedOutLine: string) =>
   Effect.gen(function* () {
     const ran = yield* runMainTaskSource(
       `export const timed = ${timedTask};
-export const main = Task.make("main", Effect.log("requesting").pipe(Effect.andThen(timed)));`,
+export default Task.make({ name: "main", run: Effect.log("requesting").pipe(Effect.andThen(timed)) });`,
     );
     expect(ran.exitCode).toBe(1);
     expect(printedErrorLinesOf(ran.standardError, "timed"), ran.standardError).toEqual([
@@ -166,12 +161,12 @@ export const main = Task.make("main", Effect.log("requesting").pipe(Effect.andTh
     return ran.standardError.split("\n");
   });
 
-export const bodyStoppedByTimeout = Task.make(
+export const bodyStoppedByTimeout = makeTest(
   "a body stopped by its timeout prints only TaskTimedOut",
   Effect.scoped(
     Effect.gen(function* () {
       const lines = yield* expectOnlyTimedOutPrinted(
-        'Task.make("timed", Effect.log("waiting").pipe(Effect.andThen(Effect.never)), { timeout: "3 seconds", cleanup: "5 seconds" })',
+        'Task.make({ name: "timed", run: Effect.log("waiting").pipe(Effect.andThen(Effect.never)), timeout: "3 seconds", cleanup: "5 seconds" })',
         "[timed] error TaskTimedOut: timed out after 3s",
       );
       expect(lines.indexOf("[timed] waiting")).toBeGreaterThan(-1);
@@ -180,17 +175,16 @@ export const bodyStoppedByTimeout = Task.make(
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const bodiesStoppedByCtrlC = Task.make(
+export const bodiesStoppedByCtrlC = makeTest(
   "two bodies stopped by Ctrl-C print no error and say they stopped",
   Effect.scoped(
     Effect.gen(function* () {
       const command = yield* startMainTaskSource(
-        `export const waitingQuiet = Task.make("waiting-quiet", Effect.never);
-export const waitingBody = Task.make("waiting-body", Effect.log("waiting").pipe(Effect.andThen(Effect.never)));
-export const main = Task.make("main", Effect.all([waitingQuiet, waitingBody], { concurrency: "unbounded", discard: true }));`,
+        `export const waitingQuiet = Task.make({ name: "waiting-quiet", run: Effect.never });
+export const waitingBody = Task.make({ name: "waiting-body", run: Effect.log("waiting").pipe(Effect.andThen(Effect.never)) });
+export default Task.make({ name: "main", run: Effect.all([waitingQuiet, waitingBody], { concurrency: "unbounded", discard: true }) });`,
       );
       yield* command.waitForLine("[waiting-body] waiting");
       yield* command.sendSignal("INT");
@@ -207,21 +201,20 @@ export const main = Task.make("main", Effect.all([waitingQuiet, waitingBody], { 
       );
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-const WAITING_TASK = `export const waiting = Task.make("waiting", Effect.log("waiting").pipe(Effect.andThen(Effect.never)));`;
+const WAITING_TASK = `export const waiting = Task.make({ name: "waiting", run: Effect.log("waiting").pipe(Effect.andThen(Effect.never)) });`;
 
 const TASKS_AWAITING_A_WAITING_TASK = {
   direct: {
     source: `${WAITING_TASK}
-export const a = Task.make("a", Effect.gen(function* () { return yield* waiting; }));`,
+export const a = Task.make({ name: "a", run: Effect.gen(function* () { return yield* waiting; }) });`,
     stoppedTaskNames: ["a"],
   },
   chain: {
     source: `${WAITING_TASK}
-export const b = Task.make("b", Effect.gen(function* () { return yield* waiting; }));
-export const a = Task.make("a", Effect.gen(function* () { return yield* b; }));`,
+export const b = Task.make({ name: "b", run: Effect.gen(function* () { return yield* waiting; }) });
+export const a = Task.make({ name: "a", run: Effect.gen(function* () { return yield* b; }) });`,
     stoppedTaskNames: ["a", "b"],
   },
 } as const;
@@ -240,7 +233,7 @@ const expectTasksStoppedWithoutFailure = (
 const expectTasksStoppedByCtrlC = (tasks: Parameters<typeof expectTasksStoppedWithoutFailure>[0]) =>
   Effect.gen(function* () {
     const command = yield* startMainTaskSource(`${tasks.source}
-export const main = Task.make("main", Effect.asVoid(a));`);
+export default Task.make({ name: "main", run: Effect.asVoid(a) });`);
     yield* command.waitForLine("[waiting] waiting");
     yield* command.sendSignal("INT");
     const exited = yield* command.waitForExit;
@@ -253,8 +246,8 @@ const expectTasksStoppedBySiblingFailure = (
 ) =>
   Effect.gen(function* () {
     const ran = yield* runMainTaskSource(`${tasks.source}
-export const bad = Task.make("bad", Effect.sleep("1 second").pipe(Effect.andThen(Effect.fail(new Error("bad broke")))));
-export const main = Task.make("main", Effect.all([a, bad], { concurrency: "unbounded", discard: true }));`);
+export const bad = Task.make({ name: "bad", run: Effect.sleep("1 second").pipe(Effect.andThen(Effect.fail(new Error("bad broke")))) });
+export default Task.make({ name: "main", run: Effect.all([a, bad], { concurrency: "unbounded", discard: true }) });`);
     expect(ran.exitCode).toBe(1);
     const badLines = printedErrorLinesOf(ran.standardError, "bad");
     expect(badLines).toHaveLength(1);
@@ -269,8 +262,8 @@ const expectTasksStoppedBySiblingTimeout = (
 ) =>
   Effect.gen(function* () {
     const ran = yield* runMainTaskSource(`${tasks.source}
-export const timed = Task.make("timed", Effect.never, { timeout: "3 seconds", cleanup: "5 seconds" });
-export const main = Task.make("main", Effect.all([a, timed], { concurrency: "unbounded", discard: true }));`);
+export const timed = Task.make({ name: "timed", run: Effect.never, timeout: "3 seconds", cleanup: "5 seconds" });
+export default Task.make({ name: "main", run: Effect.all([a, timed], { concurrency: "unbounded", discard: true }) });`);
     expect(ran.exitCode).toBe(1);
     expect(printedErrorLinesOf(ran.standardError, "timed")).toEqual([
       "[timed] error TaskTimedOut: timed out after 3s",
@@ -278,50 +271,44 @@ export const main = Task.make("main", Effect.all([a, timed], { concurrency: "unb
     expectTasksStoppedWithoutFailure(tasks, ran.standardError);
   });
 
-export const bodyAwaitingATaskStoppedByCtrlC = Task.make(
+export const bodyAwaitingATaskStoppedByCtrlC = makeTest(
   "a body awaiting a task that Ctrl-C stops prints no error and says it stopped",
   Effect.scoped(expectTasksStoppedByCtrlC(TASKS_AWAITING_A_WAITING_TASK.direct)),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const bodyAwaitingATaskStoppedBySiblingFailure = Task.make(
+export const bodyAwaitingATaskStoppedBySiblingFailure = makeTest(
   "a body awaiting a task that a failing sibling stops prints no error and says it stopped",
   Effect.scoped(expectTasksStoppedBySiblingFailure(TASKS_AWAITING_A_WAITING_TASK.direct)),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const bodyAwaitingATaskStoppedBySiblingTimeout = Task.make(
+export const bodyAwaitingATaskStoppedBySiblingTimeout = makeTest(
   "a body awaiting a task that a sibling's timeout stops prints no error and says it stopped",
   Effect.scoped(expectTasksStoppedBySiblingTimeout(TASKS_AWAITING_A_WAITING_TASK.direct)),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const chainedBodiesAwaitingATaskStoppedByCtrlC = Task.make(
+export const chainedBodiesAwaitingATaskStoppedByCtrlC = makeTest(
   "a chain of bodies awaiting a task that Ctrl-C stops prints no error and every task in it says it stopped",
   Effect.scoped(expectTasksStoppedByCtrlC(TASKS_AWAITING_A_WAITING_TASK.chain)),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const chainedBodiesAwaitingATaskStoppedBySiblingFailure = Task.make(
+export const chainedBodiesAwaitingATaskStoppedBySiblingFailure = makeTest(
   "a chain of bodies awaiting a task that a failing sibling stops prints no error and every task in it says it stopped",
   Effect.scoped(expectTasksStoppedBySiblingFailure(TASKS_AWAITING_A_WAITING_TASK.chain)),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const chainedBodiesAwaitingATaskStoppedBySiblingTimeout = Task.make(
+export const chainedBodiesAwaitingATaskStoppedBySiblingTimeout = makeTest(
   "a chain of bodies awaiting a task that a sibling's timeout stops prints no error and every task in it says it stopped",
   Effect.scoped(expectTasksStoppedBySiblingTimeout(TASKS_AWAITING_A_WAITING_TASK.chain)),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const ctrlCAsABodyInterruptsItself = Task.make(
+export const ctrlCAsABodyInterruptsItself = makeTest(
   "a body that interrupts itself while uninterruptible, after Ctrl-C began the stop, prints stopped: and never CauseWithoutFailure",
   Effect.scoped(
     Effect.gen(function* () {
       const directory = yield* makeTemporaryDirectory();
       const stoppingFile = `${directory}/stopping`;
       const command = yield* startMainTaskSource(
-        `export const main = Task.make("main", Effect.log("waiting").pipe(Effect.andThen(Effect.uninterruptible(Effect.promise(async () => { while (!(await Bun.file("${stoppingFile}").exists())) await Bun.sleep(5); }).pipe(Effect.andThen(Effect.interrupt))))));`,
+        `export default Task.make({ name: "main", run: Effect.log("waiting").pipe(Effect.andThen(Effect.uninterruptible(Effect.promise(async () => { while (!(await Bun.file("${stoppingFile}").exists())) await Bun.sleep(5); }).pipe(Effect.andThen(Effect.interrupt))))) });`,
       );
       yield* command.waitForLine("[main] waiting");
       yield* command.sendSignal("INT");
@@ -333,10 +320,9 @@ export const ctrlCAsABodyInterruptsItself = Task.make(
       expect(exited.standardError).toContain("[main] stopped: the run ended before it finished");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const bodyInterruptsItselfWhileTheRunStopsAnotherTask = Task.make(
+export const bodyInterruptsItselfWhileTheRunStopsAnotherTask = makeTest(
   "a serving body that interrupts itself while the run is still stopping a serving task that requested it fails with CauseWithoutFailure",
   Effect.scoped(
     Effect.gen(function* () {
@@ -344,9 +330,9 @@ export const bodyInterruptsItselfWhileTheRunStopsAnotherTask = Task.make(
       const cleaningStartedFile = `${directory}/cleaning-started`;
       const ran = yield* runMainTaskSource(
         `import { Task } from "@sshkeda/task";
-export const interrupting = Task.make("interrupting", Effect.raceFirst(Task.serve("up"), Effect.promise(async () => { while (!(await Bun.file("${cleaningStartedFile}").exists())) await Bun.sleep(5); }).pipe(Effect.andThen(Effect.interrupt))));
-export const cleaning = Task.make("cleaning", Effect.gen(function* () { yield* interrupting; yield* Effect.addFinalizer(() => Effect.promise(async () => { await Bun.write("${cleaningStartedFile}", ""); await Bun.sleep(1000); })); return yield* Task.serve("up"); }));
-export const main = Task.make("main", Effect.all([interrupting, cleaning], { concurrency: "unbounded", discard: true }));`,
+export const interrupting = Task.make({ name: "interrupting", run: Effect.raceFirst(Task.serve("up"), Effect.promise(async () => { while (!(await Bun.file("${cleaningStartedFile}").exists())) await Bun.sleep(5); }).pipe(Effect.andThen(Effect.interrupt))) });
+export const cleaning = Task.make({ name: "cleaning", run: Effect.gen(function* () { yield* interrupting; yield* Effect.addFinalizer(() => Effect.promise(async () => { await Bun.write("${cleaningStartedFile}", ""); await Bun.sleep(1000); })); return yield* Task.serve("up"); }) });
+export default Task.make({ name: "main", run: Effect.all([interrupting, cleaning], { concurrency: "unbounded", discard: true }) });`,
       );
       expect(ran.exitCode, ran.standardError).toBe(1);
       expect(ran.standardError).toContain("[main] passed in");
@@ -356,5 +342,4 @@ export const main = Task.make("main", Effect.all([interrupting, cleaning], { con
       expect(printedErrorLinesOf(ran.standardError, "cleaning")).toEqual([]);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

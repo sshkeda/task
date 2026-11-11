@@ -12,6 +12,7 @@ import {
 import {
   BunVersionUnsupported,
   HomeDirectoryPathMissing,
+  LogLevelInvalid,
   SetupLimitInvalid,
   StateDirectoryPathBlank,
   WorkerCountAboveMaximum,
@@ -20,6 +21,7 @@ import {
 import { dieOnInvariantFailure } from "./invariant-errors.ts";
 import { markRuntimeConfigProvider } from "./name-config-key.ts";
 import { TASK_STATE_DIRECTORY_NAME, packageNameParts } from "./names-from-package-json.ts";
+import { RootTaskGroup } from "./root-task-group.ts";
 import { TASK_PACKAGE } from "./task-package.ts";
 
 const TASK_ENVIRONMENT_VARIABLE_PREFIX = packageNameParts.join("_").toUpperCase();
@@ -44,22 +46,59 @@ export const bunWatchModeFlag = Effect.sync(() =>
   Option.fromUndefinedOr(BUN_WATCH_MODE_FLAGS.find((flag) => process.execArgv.includes(flag))),
 );
 
+const BUN_EVALUATION_FLAG = /^(?:--eval|--print|-[A-Za-z]*[ep])(?==|$)/u;
+
+export const bunEvaluationFlag = Effect.sync(() =>
+  Option.fromUndefinedOr(
+    process.execArgv
+      .map((argument) => BUN_EVALUATION_FLAG.exec(argument)?.[0])
+      .find((flag) => flag !== undefined),
+  ),
+);
+
 const isWorkingDirectoryFlag = (flag: string) => flag === "--cwd" || flag.startsWith("--cwd=");
 
 const SUPERVISOR_SOCKET_ARGUMENT_PREFIX = `--${packageNameParts.join("-")}-supervisor-socket=`;
 
-export const supervisedRunCommand = (preloadFlag: string, supervisorSocketPath: string) =>
-  Effect.sync(() => [
-    process.execPath,
-    preloadFlag,
-    ...process.execArgv,
-    ...(process.execArgv.some((flag) => isWorkingDirectoryFlag(flag))
-      ? [`--cwd=${process.cwd()}`]
-      : []),
-    ...process.argv.slice(1, FIRST_SCRIPT_ARGUMENT_INDEX),
-    `${SUPERVISOR_SOCKET_ARGUMENT_PREFIX}${supervisorSocketPath}`,
-    ...process.argv.slice(FIRST_SCRIPT_ARGUMENT_INDEX),
-  ]);
+const RUN_ARGUMENT_PREFIX = `--${packageNameParts.join("-")}-run=`;
+
+export const LOG_LEVEL_NAMES = ["info", "error"] as const;
+
+const RunArgument = Schema.fromJsonString(
+  Schema.Struct({
+    rootTaskName: Schema.String,
+    rootTaskGroup: Schema.NullOr(RootTaskGroup),
+    checksForgottenTasks: Schema.Boolean,
+    flags: Schema.Record(Schema.String, Schema.String),
+    scriptFilePath: Schema.String,
+    log: Schema.Literals(LOG_LEVEL_NAMES),
+  }),
+);
+
+export const supervisedRunCommand = (
+  preloadFlag: string,
+  supervisorSocketPath: string,
+  runProcessFilePath: string,
+  run: typeof RunArgument.Type,
+) =>
+  Effect.gen(function* () {
+    const runArgument = yield* Schema.encodeEffect(RunArgument)(run).pipe(
+      dieOnInvariantFailure("supervision", "the run argument encodes as JSON"),
+    );
+    return [
+      process.execPath,
+      preloadFlag,
+      ...process.execArgv,
+      ...(process.execArgv.some((flag) => isWorkingDirectoryFlag(flag))
+        ? [`--cwd=${process.cwd()}`]
+        : []),
+      runProcessFilePath,
+      `${SUPERVISOR_SOCKET_ARGUMENT_PREFIX}${supervisorSocketPath}`,
+      `${RUN_ARGUMENT_PREFIX}${runArgument}`,
+      Bun.main,
+      ...process.argv.slice(FIRST_SCRIPT_ARGUMENT_INDEX),
+    ];
+  });
 
 export const takeSupervisorSocketPath = Effect.sync(() => {
   const supervisorSocketArgument = process.argv[FIRST_SCRIPT_ARGUMENT_INDEX] ?? "";
@@ -69,6 +108,15 @@ export const takeSupervisorSocketPath = Effect.sync(() => {
   process.argv.splice(FIRST_SCRIPT_ARGUMENT_INDEX, 1);
   return Option.some(supervisorSocketArgument.slice(SUPERVISOR_SOCKET_ARGUMENT_PREFIX.length));
 });
+
+export const takeRunArgument = Effect.sync(() => {
+  const runArgument = process.argv[FIRST_SCRIPT_ARGUMENT_INDEX] ?? "";
+  process.argv.splice(1, FIRST_SCRIPT_ARGUMENT_INDEX);
+  return runArgument.slice(RUN_ARGUMENT_PREFIX.length);
+}).pipe(
+  Effect.flatMap(Schema.decodeUnknownEffect(RunArgument)),
+  dieOnInvariantFailure("run process", "the supervisor passes the run argument"),
+);
 
 const NON_BLANK_TEXT = Schema.String.check(Schema.isPattern(/\S/u));
 
@@ -85,10 +133,13 @@ const STATE_DIRECTORY_VARIABLE_NAME = `${TASK_ENVIRONMENT_VARIABLE_PREFIX}_STATE
 
 const WORKER_COUNT_VARIABLE_NAME = `${TASK_ENVIRONMENT_VARIABLE_PREFIX}_WORKERS`;
 
-const readEnvironmentVariable = (variableName: string) =>
+const readEnvironmentVariable = (
+  variableName: string,
+  configProvider: ConfigProvider.ConfigProvider = taskOwnConfigProvider,
+) =>
   Config.String(variableName)
     .pipe(Config.option)
-    .parse(taskOwnConfigProvider)
+    .parse(configProvider)
     .pipe(
       dieOnInvariantFailure(
         "configuration",
@@ -97,11 +148,7 @@ const readEnvironmentVariable = (variableName: string) =>
     );
 
 const readEnvironmentVariableNow = (variableName: string) =>
-  Effect.suspend(() =>
-    Config.String(variableName).pipe(Config.option).parse(readEnvironmentKeepingEmptyValues()),
-  ).pipe(
-    dieOnInvariantFailure("configuration", `the environment provides ${variableName} or omits it`),
-  );
+  Effect.suspend(() => readEnvironmentVariable(variableName, readEnvironmentKeepingEmptyValues()));
 
 const isNonBlankText = Schema.is(NON_BLANK_TEXT);
 
@@ -186,6 +233,26 @@ export const readSetupLimit = Effect.fn("readSetupLimit")(function* () {
   return setupLimit.value;
 });
 
+const LOG_LEVEL_VARIABLE_NAME = `${TASK_ENVIRONMENT_VARIABLE_PREFIX}_LOG`;
+
+const decodeLogLevelName = Schema.decodeUnknownOption(Schema.Literals(LOG_LEVEL_NAMES));
+
+export const readLogLevelName = Effect.fn("readLogLevelName")(function* () {
+  const configuredLogLevelName = yield* readEnvironmentVariable(LOG_LEVEL_VARIABLE_NAME);
+  if (Option.isNone(configuredLogLevelName)) {
+    return "info";
+  }
+  const logLevelName = decodeLogLevelName(configuredLogLevelName.value);
+  if (Option.isNone(logLevelName)) {
+    return yield* new LogLevelInvalid({
+      variableName: LOG_LEVEL_VARIABLE_NAME,
+      value: configuredLogLevelName.value,
+      logLevelNames: LOG_LEVEL_NAMES,
+    });
+  }
+  return logLevelName.value;
+});
+
 export const inheritedEnvironment = Effect.sync(() => ({ ...process.env }));
 
 export const RUN_MARKERS_VARIABLE_NAME = `${TASK_ENVIRONMENT_VARIABLE_PREFIX}_RUN_MARKERS`;
@@ -206,15 +273,18 @@ const TASK_CONFIG_EVERY_COMMAND_SEES = [
   SETUP_LIMIT_VARIABLE_NAME,
 ] as const;
 
-export const environmentEveryCommandSees = Effect.forEach(
-  [...VARIABLES_EVERY_COMMAND_SEES, ...TASK_CONFIG_EVERY_COMMAND_SEES],
-  (variableName) =>
-    readEnvironmentVariableNow(variableName).pipe(
-      Effect.map((value) =>
-        Option.map(value, (presentValue) => [variableName, presentValue] as const),
+export const environmentEveryCommandSees = Effect.suspend(() => {
+  const configProvider = readEnvironmentKeepingEmptyValues();
+  return Effect.forEach(
+    [...VARIABLES_EVERY_COMMAND_SEES, ...TASK_CONFIG_EVERY_COMMAND_SEES],
+    (variableName) =>
+      readEnvironmentVariable(variableName, configProvider).pipe(
+        Effect.map((value) =>
+          Option.map(value, (presentValue) => [variableName, presentValue] as const),
+        ),
       ),
-    ),
-).pipe(Effect.map((entries) => Object.fromEntries(Arrays.getSomes(entries))));
+  );
+}).pipe(Effect.map((entries) => Object.fromEntries(Arrays.getSomes(entries))));
 
 export const passStateDirectoryToCommands = (configuredStateDirectoryPath: string | null) =>
   Effect.sync(() => {

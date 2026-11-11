@@ -6,9 +6,9 @@ import { Effect, Layer } from "effect";
 import { TaskCleanupTimedOut } from "../../src/lib/main-thread/shared/main-thread-errors.ts";
 import { StopState, StopStateLive } from "../../src/lib/main-thread/shared/provide-stop-state.ts";
 
-export const firstFailure = Task.make(
-  "shutdown records only the first failure and gates new work",
-  Effect.gen(function* () {
+export const firstFailure = Task.make({
+  name: "shutdown records only the first failure and gates new work",
+  run: Effect.gen(function* () {
     const shutdown = yield* StopState;
     expect(yield* shutdown.isStopping).toBe(false);
     expect(yield* shutdown.hasFailed).toBe(false);
@@ -33,11 +33,11 @@ export const firstFailure = Task.make(
       ),
     ),
   ),
-);
+});
 
-export const signals = Task.make(
-  "shutdown escalates a second signal and preserves the first forced-stop signal",
-  Effect.gen(function* () {
+export const signals = Task.make({
+  name: "shutdown escalates a second signal and preserves the first forced-stop signal",
+  run: Effect.gen(function* () {
     const shutdown = yield* StopState;
     expect(yield* shutdown.requestStop("SIGINT")).toBe(true);
     expect((yield* shutdown.awaitFailure)._tag).toBe("StopRequested");
@@ -56,11 +56,11 @@ export const signals = Task.make(
       ),
     ),
   ),
-);
+});
 
-export const normalCleanup = Task.make(
-  "a signal during normal shutdown forces cleanup and outranks a later failure",
-  Effect.gen(function* () {
+export const normalCleanup = Task.make({
+  name: "a signal during normal shutdown forces cleanup and outranks a later failure",
+  run: Effect.gen(function* () {
     const shutdown = yield* StopState;
     expect(yield* shutdown.begin).toBe(false);
     expect(yield* shutdown.hasFailed).toBe(false);
@@ -82,4 +82,4 @@ export const normalCleanup = Task.make(
       ),
     ),
   ),
-);
+});

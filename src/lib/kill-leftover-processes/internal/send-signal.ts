@@ -8,14 +8,20 @@ export const sendSignal = (
   processId: number,
   signal: ProcessNotSignaled["signal"],
 ) =>
-  Effect.try(() => process.kill(processId, signal)).pipe(
+  Effect.try({
+    try: () => process.kill(processId, signal),
+    catch: (cause) => new ProcessNotSignaled({ taskName, processId, signal, cause }),
+  }).pipe(
     Effect.as("sent" as const),
-    Effect.catchTag("UnknownError", (error) => {
-      const code = Predicate.hasProperty(error.cause, "code") ? error.cause.code : undefined;
+    Effect.catchTag("ProcessNotSignaled", (notSignaled) => {
+      const code = Predicate.hasProperty(notSignaled.cause, "code")
+        ? notSignaled.cause.code
+        : undefined;
       const processIsGoneOrNotOurs = code === "ESRCH" || code === "EPERM";
-      return processIsGoneOrNotOurs ? Effect.succeed<"EPERM" | "ESRCH">(code) : Effect.fail(error);
+      return processIsGoneOrNotOurs
+        ? Effect.succeed<"EPERM" | "ESRCH">(code)
+        : Effect.fail(notSignaled);
     }),
-    Effect.mapError((cause) => new ProcessNotSignaled({ taskName, processId, signal, cause })),
   );
 
 export const signalUnlessReplaced = (

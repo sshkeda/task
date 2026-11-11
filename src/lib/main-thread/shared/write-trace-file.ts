@@ -33,6 +33,9 @@ const encodeJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const WORKER_JSON_END = "]}]}]}";
 
+const isOwnedByCurrentUser = (information: FileSystem.File.Info) =>
+  Option.exists(information.uid, (ownerId) => ownerId === process.getuid?.());
+
 export class TraceFile extends Context.Service<
   TraceFile,
   Effect.Success<ReturnType<typeof makeTraceFile>>
@@ -40,27 +43,61 @@ export class TraceFile extends Context.Service<
 
 export const makeTraceFile = Effect.fn("makeTraceFile")(function* (input: {
   readonly traceFilePath: string;
+  readonly createdBelow: string;
 }) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const whyIncomplete = yield* Ref.make<string | null>(null);
   const markIncomplete = (reason: string) =>
     Ref.update(whyIncomplete, (firstReason) => firstReason ?? reason);
-  yield* fileSystem
-    .makeDirectory(path.dirname(input.traceFilePath), { recursive: true })
-    .pipe(
-      Effect.catchTag("PlatformError", (error) =>
-        markIncomplete(`${path.dirname(input.traceFilePath)} could not be made (${error.message})`),
-      ),
+  const traceDirectoryPath = path.dirname(input.traceFilePath);
+  const findDirectoryNotOwned = (createdBelow: string) =>
+    Effect.findFirst(
+      path
+        .relative(createdBelow, traceDirectoryPath)
+        .split(path.sep)
+        .map((_name, index, directoryNames) =>
+          path.join(createdBelow, ...directoryNames.slice(0, index + 1)),
+        ),
+      (directoryPath) =>
+        fileSystem.lstat(directoryPath).pipe(
+          Effect.flatMap((information) => {
+            const isLinkOwnedByCurrentUser =
+              information.type === "SymbolicLink" && isOwnedByCurrentUser(information);
+            return isLinkOwnedByCurrentUser
+              ? Effect.flatMap(fileSystem.realPath(directoryPath), fileSystem.lstat)
+              : Effect.succeed(information);
+          }),
+          Effect.map((information) => {
+            const isDirectoryOwnedByCurrentUser =
+              information.type === "Directory" && isOwnedByCurrentUser(information);
+            return !isDirectoryOwnedByCurrentUser;
+          }),
+        ),
     );
   const markUnwritable = (error: PlatformError.PlatformError) =>
     markIncomplete(`${input.traceFilePath} could not be written (${error.message})`);
-  const traceFileHandle = yield* fileSystem
-    .open(input.traceFilePath, { flag: "a", mode: 0o600 })
-    .pipe(
+  const openTraceFile = (flag: FileSystem.OpenFlag) =>
+    fileSystem.open(input.traceFilePath, { flag, mode: 0o600 }).pipe(
       Effect.asSome,
       Effect.catchTag("PlatformError", (error) =>
         markUnwritable(error).pipe(Effect.as(Option.none())),
+      ),
+    );
+  const skipTraceFile = (reason: string) => markIncomplete(reason).pipe(Effect.as(Option.none()));
+  const traceFileHandle = yield* fileSystem
+    .makeDirectory(traceDirectoryPath, { recursive: true, mode: 0o700 })
+    .pipe(
+      Effect.andThen(findDirectoryNotOwned(input.createdBelow)),
+      Effect.flatMap(
+        Option.match({
+          onNone: () => openTraceFile("ax"),
+          onSome: (directoryPath) =>
+            skipTraceFile(`${directoryPath} is not a directory owned by the current user`),
+        }),
+      ),
+      Effect.catchTag("PlatformError", (error) =>
+        skipTraceFile(`${traceDirectoryPath} could not be made (${error.message})`),
       ),
     );
   const appendLine = (line: Uint8Array) =>

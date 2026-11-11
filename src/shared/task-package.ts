@@ -1,5 +1,5 @@
 export const TASK_PACKAGE = {
   name: "@sshkeda/task",
-  version: "1.0.2",
+  version: "2.0.0",
   engines: { bun: ">=1.4.4" },
 } as const;

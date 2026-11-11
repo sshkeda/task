@@ -37,8 +37,35 @@ export class RedactedValueWithNulRefused extends Schema.TaggedError<RedactedValu
   }
 }
 
+export class RedactedNonStringRefused extends Schema.TaggedError<RedactedNonStringRefused>()(
+  "RedactedNonStringRefused",
+  {
+    ...TASK_ERROR_FIELDS,
+    programName: Schema.String,
+    valueNames: Schema.NonEmptyArray(Schema.String),
+  },
+) {
+  public override get message() {
+    return `task's process service refused ${this.valueNames.join(", ")} for ${this.programName}, a Redacted value that is not a string`;
+  }
+}
+
+export class CommandOutputTooLong extends Schema.TaggedError<CommandOutputTooLong>()(
+  "CommandOutputTooLong",
+  {
+    ...TASK_ERROR_FIELDS,
+    command: Schema.String,
+    outputName: Schema.Literals(["standard output", "standard error"]),
+  },
+) {
+  public override get message() {
+    return `the ${this.outputName} of ${this.command} is too long to hold in one string`;
+  }
+}
+
 export const CommandRefusal = Schema.Union([
   CommandPipelineRefused,
   CommandOptionsRefused,
   RedactedValueWithNulRefused,
+  RedactedNonStringRefused,
 ]);

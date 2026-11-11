@@ -1,27 +1,26 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
 import { Effect } from "effect";
 
 import { exists } from "../shared/access-files.ts";
 import { EXIT_CODE_AFTER_SIGINT } from "../shared/exit-codes-after-stop-signals.ts";
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 
-export const loop = Task.make(
+export const loop = makeTest(
   "a stop waits for a worker stuck in a synchronous loop, whatever its task's cleanup duration, until a second Ctrl-C terminates it",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const spin = Task.make("spin", Effect.gen(function* () {
+export const spin = Task.make({ name: "spin", run: Effect.gen(function* () {
   yield* Effect.log("spinning");
   yield* Effect.sync(() => { while (true) {} });
-}), { cleanup: "5 minutes" });
-export const main = Task.make("main", spin);
-if (import.meta.main) Task.main(main);`,
+}), cleanup: "5 minutes" });
+export default Task.make({ name: "main", run: spin });`,
       });
       const command = yield* startTaskProcess(project, "main.ts");
       yield* command.waitForLine("[spin] spinning");
@@ -34,10 +33,9 @@ if (import.meta.main) Task.main(main);`,
       expect(exited.standardError).toMatch(/^error StopRequested: received SIGINT$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const sharedWorker = Task.make(
+export const sharedWorker = makeTest(
   "a task whose cleanup runs out after its worker started that cleanup does not get the worker it shares with another task terminated, so both tasks' finalizers run",
   Effect.scoped(
     Effect.gen(function* () {
@@ -50,15 +48,14 @@ const serveUntilStopped = (name: string, afterCleanup: Effect.Effect<void>) => E
   yield* Effect.addFinalizer(() => Effect.sync(() => writeFileSync(\`\${name}-cleaned-up\`, "")).pipe(Effect.andThen(afterCleanup)));
   return yield* Task.serve("up");
 });
-export const quick = Task.make("quick", serveUntilStopped("quick", Effect.never), { cleanup: "1 second" });
-export const slow = Task.make("slow", serveUntilStopped("slow", Effect.void), { cleanup: "10 minutes" });
-export const main = Task.make("main", Effect.andThen(Effect.andThen(slow, quick), Effect.fail(new TaskError({ message: "boom" }))));
-if (import.meta.main) Task.main(main);`,
+export const quick = Task.make({ name: "quick", run: serveUntilStopped("quick", Effect.never), cleanup: "1 second" });
+export const slow = Task.make({ name: "slow", run: serveUntilStopped("slow", Effect.void), cleanup: "10 minutes" });
+export default Task.make({ name: "main", run: Effect.andThen(Effect.andThen(slow, quick), Effect.fail(new TaskError({ message: "boom" }))) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        "[quick] error TaskCleanupTimedOut: its cleanup did not finish within 1s",
+        "[quick] error TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it",
       );
       expect(ran.standardError).not.toContain("terminated that worker");
       expect(yield* exists(`${project.directory}/quick-cleaned-up`)).toBe(true);
@@ -72,28 +69,26 @@ if (import.meta.main) Task.main(main);`,
       expect(endedTasks).toContain("slow");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const frozenFibers = Task.make(
+export const frozenFibers = makeTest(
   "a worker frozen by one task's synchronous loop is terminated when that task times out and its cleanup duration runs out, its other fibers are stopped with it, and the run fails",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const waiter = Task.make("waiter", Effect.gen(function* () {
+export const waiter = Task.make({ name: "waiter", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("waiter cleaned up"));
   yield* Effect.log("waiting");
   yield* Effect.sync(() => { while (true) {} });
-}), { timeout: "1 second", cleanup: "1 second" });
-export const other = Task.make("other", Effect.gen(function* () {
+}), timeout: "1 second", cleanup: "1 second" });
+export const other = Task.make({ name: "other", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("other cleaned up"));
   yield* Effect.log("waiting");
   yield* waiter;
-}), { cleanup: "1 second" });
-export const main = Task.make("main", other);
-if (import.meta.main) Task.main(main);`,
+}), cleanup: "1 second" });
+export default Task.make({ name: "main", run: other });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       expect(ran.exitCode).toBe(1);
@@ -107,39 +102,36 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.standardError).toMatch(/^failed: waiter \(1 of 3 tasks\), 2 stopped, [\d.]+s$/mu);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const frozenCleanupAfterSelfInterrupt = Task.make(
+export const frozenCleanupAfterSelfInterrupt = makeTest(
   "a body that interrupts itself and whose cleanup then freezes its worker fails with TaskCleanupTimedOut, since that cleanup started, and the worker is terminated when the cleanup limit runs out, so a task sharing it still ends",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const server = Task.make("server", Effect.gen(function* () {
+export const server = Task.make({ name: "server", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("server cleaned up"));
   return yield* Task.serve("up");
-}));
-export const main = Task.make("main", Effect.gen(function* () {
+}) });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* server;
   yield* Effect.addFinalizer(() => Effect.sync(() => { while (true) {} }));
   yield* Effect.interrupt;
-}), { cleanup: "1 second" });
-if (import.meta.main) Task.main(main);`,
+}), cleanup: "1 second" });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        "[main] error TaskCleanupTimedOut: its cleanup did not finish within 1s",
+        "[main] error TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it",
       );
       expect(ran.standardError).not.toContain("server cleaned up");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const frozenAfterStartingCleanup = Task.make(
+export const frozenAfterStartingCleanup = makeTest(
   "a worker that starts a task's cleanup and then freezes does not hang the run, since each task on it ends at its cleanup limit, 5s by default",
   Effect.scoped(
     Effect.gen(function* () {
@@ -147,21 +139,20 @@ export const frozenAfterStartingCleanup = Task.make(
         "main.ts": `import { Effect, Latch } from "effect";
 import { Task } from "@sshkeda/task";
 const waiterCleanupStarted = Latch.makeUnsafe();
-export const waiter = Task.make("waiter", Effect.gen(function* () {
+export const waiter = Task.make({ name: "waiter", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => waiterCleanupStarted.open.pipe(Effect.andThen(Effect.sleep("20 seconds")), Effect.andThen(Effect.log("waiter cleaned up"))));
   return yield* Task.serve("up");
-}));
-export const freezer = Task.make("freezer", Effect.gen(function* () {
+}) });
+export const freezer = Task.make({ name: "freezer", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => waiterCleanupStarted.await.pipe(Effect.andThen(Effect.log("freezer cleanup started")), Effect.andThen(Effect.sync(() => { while (true) {} }))));
   return yield* Task.serve("up");
-}), { cleanup: "1 second" });
-export const main = Task.make("main", Effect.gen(function* () {
+}), cleanup: "1 second" });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* waiter;
   yield* freezer;
   yield* Effect.log("ready to stop");
   yield* Effect.never;
-}));
-if (import.meta.main) Task.main(main);`,
+}) });`,
       });
       const command = yield* startTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       yield* command.waitForLine("[main] ready to stop");
@@ -170,18 +161,17 @@ if (import.meta.main) Task.main(main);`,
       expect(ran.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(ran.standardError).toContain("[freezer] freezer cleanup started");
       expect(ran.standardError).toContain(
-        "[freezer] error TaskCleanupTimedOut: its cleanup did not finish within 1s",
+        "[freezer] error TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it",
       );
       expect(ran.standardError).toContain(
-        "[waiter] error TaskCleanupTimedOut: its cleanup did not finish within 5s",
+        "[waiter] error TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it",
       );
       expect(ran.standardError).not.toContain("waiter cleaned up");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const frozenAfterAnsweringPastCleanupLimit = Task.make(
+export const frozenAfterAnsweringPastCleanupLimit = makeTest(
   "a worker whose task's cleanup answers past its limit and freezes only later does not hang the run, since a cleanup waiting on that worker ends at its default 5s cleanup limit",
   Effect.scoped(
     Effect.gen(function* () {
@@ -189,33 +179,31 @@ export const frozenAfterAnsweringPastCleanupLimit = Task.make(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const waiter = Task.make("waiter", Effect.gen(function* () {
+export const waiter = Task.make({ name: "waiter", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.sleep("20 seconds").pipe(Effect.andThen(Effect.log("waiter cleaned up"))));
   return yield* Task.serve("up");
-}));
-export const freezer = Task.make("freezer", Effect.gen(function* () {
+}) });
+export const freezer = Task.make({ name: "freezer", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.sleep("1500 millis").pipe(Effect.andThen(Effect.log("freezing now")), Effect.andThen(Effect.sync(() => { while (true) {} }))));
   return yield* Task.serve("up");
-}), { cleanup: "1 second" });
-export const main = Task.make("main", Effect.andThen(Effect.andThen(waiter, freezer), Effect.fail(new TaskError({ message: "boom" }))));
-if (import.meta.main) Task.main(main);`,
+}), cleanup: "1 second" });
+export default Task.make({ name: "main", run: Effect.andThen(Effect.andThen(waiter, freezer), Effect.fail(new TaskError({ message: "boom" }))) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        "[freezer] error TaskCleanupTimedOut: its cleanup did not finish within 1s",
+        "[freezer] error TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it",
       );
       expect(ran.standardError).toContain("[freezer] freezing now");
       expect(ran.standardError).toContain(
-        "[waiter] error TaskCleanupTimedOut: its cleanup did not finish within 5s",
+        "[waiter] error TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it",
       );
       expect(ran.standardError).not.toContain("waiter cleaned up");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const longSynchronousCleanupWithinItsLimit = Task.make(
+export const longSynchronousCleanupWithinItsLimit = makeTest(
   "a task's synchronous cleanup that blocks its worker within its own cleanup limit finishes even when another task on that worker runs past a shorter limit",
   Effect.scoped(
     Effect.gen(function* () {
@@ -224,46 +212,43 @@ export const longSynchronousCleanupWithinItsLimit = Task.make(
 import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const quick = Task.make("quick", Effect.gen(function* () {
+export const quick = Task.make({ name: "quick", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.never);
   return yield* Task.serve("up");
-}), { cleanup: "1 second" });
-export const slow = Task.make("slow", Effect.gen(function* () {
+}), cleanup: "1 second" });
+export const slow = Task.make({ name: "slow", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.sleep("200 millis").pipe(Effect.andThen(Effect.sync(() => {
     const end = Date.now() + 4000;
     while (Date.now() < end) {}
     writeFileSync("slow-cleaned-up", "");
   }))));
   return yield* Task.serve("up");
-}), { cleanup: "10 seconds" });
-export const main = Task.make("main", Effect.andThen(Effect.andThen(slow, quick), Effect.fail(new TaskError({ message: "boom" }))));
-if (import.meta.main) Task.main(main);`,
+}), cleanup: "10 seconds" });
+export default Task.make({ name: "main", run: Effect.andThen(Effect.andThen(slow, quick), Effect.fail(new TaskError({ message: "boom" }))) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        "[quick] error TaskCleanupTimedOut: its cleanup did not finish within 1s",
+        "[quick] error TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it",
       );
       expect(ran.standardError).not.toContain("TaskCleanupFrozeWorker");
       expect(yield* exists(`${project.directory}/slow-cleaned-up`)).toBe(true);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const stuckLoopTimesOutThenCleansUp = Task.make(
+export const stuckLoopTimesOutThenCleansUp = makeTest(
   "a task with timeout and cleanup whose body is stuck in a synchronous loop ends the run within those durations without any signal, and the trace says why its worker was terminated, though the worker exits before the run waits for its workers",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const spin = Task.make("spin", Effect.gen(function* () {
+export const spin = Task.make({ name: "spin", run: Effect.gen(function* () {
   yield* Effect.log("spinning");
   yield* Effect.sync(() => { while (true) {} });
-}), { timeout: "1 second", cleanup: "1 second" });
-export const main = Task.make("main", spin);
-if (import.meta.main) Task.main(main);`,
+}), timeout: "1 second", cleanup: "1 second" });
+export default Task.make({ name: "main", run: spin });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
@@ -280,23 +265,21 @@ if (import.meta.main) Task.main(main);`,
       ).toEqual(['worker terminated because it did not answer the stop of "spin" within 1s']);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const frozenAtShutdown = Task.make(
+export const frozenAtShutdown = makeTest(
   "a worker frozen after its task passed is shut down at the end without waiting on it, so the run passes and exits",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const freezer = Task.make("freezer", Effect.sync(() => {
+export const freezer = Task.make({ name: "freezer", run: Effect.sync(() => {
   process.once("exit", () => {
     while (true) {}
   });
-}));
-export const main = Task.make("main", freezer);
-if (import.meta.main) Task.main(main);`,
+}) });
+export default Task.make({ name: "main", run: freezer });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
@@ -311,40 +294,38 @@ if (import.meta.main) Task.main(main);`,
       ).toBe(true);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const WAITER_CLEANUP_SECONDS = 30;
 
 const MAXIMUM_ELAPSED_SECONDS = 15;
 
-export const frozenBeforeAnotherTaskStartsCleanup = Task.make(
+export const frozenBeforeAnotherTaskStartsCleanup = makeTest(
   "a worker that freezes in a task's cleanup before another task on it starts its own is terminated once it misses an answer for that cleanup limit, so the other task ends without waiting out its longer limit",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const waiter = Task.make("waiter", Effect.gen(function* () {
+export const waiter = Task.make({ name: "waiter", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("waiter cleaned up"));
   return yield* Task.serve("up");
-}), { cleanup: "${WAITER_CLEANUP_SECONDS} seconds" });
-export const freezer = Task.make("freezer", Effect.gen(function* () {
+}), cleanup: "${WAITER_CLEANUP_SECONDS} seconds" });
+export const freezer = Task.make({ name: "freezer", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.log("freezer cleanup started").pipe(Effect.andThen(Effect.sync(() => { while (true) {} }))));
   return yield* Effect.never;
-}), { timeout: "1 second", cleanup: "1 second" });
-export const main = Task.make("main", Effect.gen(function* () {
+}), timeout: "1 second", cleanup: "1 second" });
+export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* waiter;
   yield* freezer;
-}), { cleanup: "1 second" });
-if (import.meta.main) Task.main(main);`,
+}), cleanup: "1 second" });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain("[freezer] error TaskTimedOut: timed out after 1s");
       expect(ran.standardError).toContain("[freezer] freezer cleanup started");
       expect(ran.standardError).toContain(
-        "[freezer] error TaskCleanupTimedOut: its cleanup did not finish within 1s",
+        "[freezer] error TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it",
       );
       const mainCleanupNotStarted =
         "[main] error TaskCleanupNotStarted: its worker did not start its cleanup within 1s, so task terminated that worker\n";
@@ -363,5 +344,4 @@ if (import.meta.main) Task.main(main);`,
       expect(elapsedSeconds).toBeLessThan(MAXIMUM_ELAPSED_SECONDS);
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

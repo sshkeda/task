@@ -1,5 +1,16 @@
 import * as BunSocketServer from "@effect/platform-bun/BunSocketServer";
-import { Deferred, Duration, Effect, Exit, FileSystem, Path, Predicate, Ref, Stream } from "effect";
+import {
+  Deferred,
+  Duration,
+  Effect,
+  Exit,
+  Fiber,
+  FileSystem,
+  Path,
+  Predicate,
+  Ref,
+  Stream,
+} from "effect";
 import type { Queue } from "effect";
 import { RpcServer } from "effect/rpc";
 import { SocketServer } from "effect/socket";
@@ -12,6 +23,7 @@ import {
   RUN_MARKERS_VARIABLE_NAME,
   supervisedRunCommand,
 } from "../../../shared/read-environment-config.ts";
+import { awaitTerminalCommandExit, runInTerminal } from "../../../shared/run-in-terminal.ts";
 import { saveStandardStreamFlags } from "../../../shared/save-standard-stream-flags.ts";
 import { listenToSignals } from "../../../shared/stop-signals.ts";
 import type { STOP_SIGNALS } from "../../../shared/stop-signals.ts";
@@ -25,12 +37,18 @@ const FORCED_STOP_GRACE_SECONDS = 5;
 
 const FORCED_STOP_GRACE = Duration.seconds(FORCED_STOP_GRACE_SECONDS);
 
+const HOLD_STOP_UNTIL_READY_SECONDS = 5;
+
+const HOLD_STOP_UNTIL_READY = Duration.seconds(HOLD_STOP_UNTIL_READY_SECONDS);
+
 const SUPERVISOR_SOCKET_FILE_NAME = "supervisor.sock";
 
 const serveTheRun = Effect.fn("serveTheRun")(
   function* (
     ready: Deferred.Deferred<void>,
+    stopReceived: Deferred.Deferred<void>,
     startedProcessGroups: Map<number, ReturnType<typeof startedProcessGroup>>,
+    runMarkerFileDescriptor: number | null,
   ) {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -52,6 +70,8 @@ const serveTheRun = Effect.fn("serveTheRun")(
             startedProcessGroups.set(shared.processGroupId, shared.startedGroup);
           }
         }),
+      RunInTerminal: runInTerminal(Deferred.await(stopReceived), runMarkerFileDescriptor),
+      AwaitTerminalCommandExit: awaitTerminalCommandExit,
     });
     yield* RpcServer.make(SupervisorRpcs, { disableTracing: true }).pipe(
       Effect.provideContext(handlers),
@@ -68,17 +88,27 @@ const serveTheRun = Effect.fn("serveTheRun")(
 
 export const superviseRun = Effect.fn("superviseRun")(function* (
   stopSignals: Queue.Dequeue<(typeof STOP_SIGNALS)[number]>,
+  runProcessFilePath: string,
+  runArgument: Parameters<typeof supervisedRunCommand>[3],
 ) {
   const reapAdoptedOrphans = yield* adoptOrphans;
   const exited = yield* Deferred.make<NodeJS.Signals | number>();
   const ready = yield* Deferred.make<void>();
+  const stopReceived = yield* Deferred.make<void>();
   const startedProcessGroups = new Map<number, ReturnType<typeof startedProcessGroup>>();
+  const runMarker = yield* createRunMarker(yield* inheritedRunMarkers);
   const command = yield* supervisedRunCommand(
     WATCH_THE_SUPERVISOR_FLAG,
-    yield* serveTheRun(ready, startedProcessGroups),
+    yield* serveTheRun(
+      ready,
+      stopReceived,
+      startedProcessGroups,
+      runMarker === null ? null : runMarker.fileDescriptor,
+    ),
+    runProcessFilePath,
+    runArgument,
   );
   const environment = yield* inheritedEnvironment;
-  const runMarker = yield* createRunMarker(yield* inheritedRunMarkers);
   const restoreStandardStreamFlags = yield* saveStandardStreamFlags;
   const child = yield* Effect.sync(() =>
     Bun.spawn(command, {
@@ -112,15 +142,28 @@ export const superviseRun = Effect.fn("superviseRun")(function* (
   const stopCount = yield* Ref.make(0);
   yield* Stream.fromQueue(stopSignals).pipe(
     Stream.runForEach((signal) =>
-      Ref.updateAndGet(stopCount, (count) => count + 1).pipe(
-        Effect.flatMap((count) => {
-          const forcesTheStop = signal === "SIGHUP" || count > 1;
+      Ref.get(stopCount).pipe(
+        Effect.flatMap((earlierStopCount) => {
+          const isHangUpDuringStop = signal === "SIGHUP" && earlierStopCount > 0;
+          if (isHangUpDuringStop) {
+            return Effect.void;
+          }
           const forward = Effect.sync(() => {
             child.kill(signal);
           });
-          return forcesTheStop
-            ? forward.pipe(Effect.andThen(Deferred.done(forced, Exit.void)), Effect.asVoid)
-            : Deferred.await(ready).pipe(Effect.andThen(forward), Effect.forkScoped, Effect.asVoid);
+          return Deferred.done(stopReceived, Exit.void).pipe(
+            Effect.andThen(Ref.set(stopCount, earlierStopCount + 1)),
+            Effect.andThen(
+              earlierStopCount > 0
+                ? forward.pipe(Effect.andThen(Deferred.done(forced, Exit.void)), Effect.asVoid)
+                : Deferred.await(ready).pipe(
+                    Effect.timeoutOption(HOLD_STOP_UNTIL_READY),
+                    Effect.andThen(forward),
+                    Effect.forkScoped,
+                    Effect.asVoid,
+                  ),
+            ),
+          );
         }),
       ),
     ),
@@ -128,7 +171,7 @@ export const superviseRun = Effect.fn("superviseRun")(function* (
     Effect.forkScoped,
   );
   const jobControlSignals = yield* listenToSignals(["SIGTSTP", "SIGCONT"]);
-  yield* Stream.fromQueue(jobControlSignals).pipe(
+  const jobControl = yield* Stream.fromQueue(jobControlSignals).pipe(
     Stream.runForEach((signal) =>
       signal === "SIGTSTP"
         ? signalRunProcesses(run, "SIGSTOP").pipe(
@@ -145,6 +188,7 @@ export const superviseRun = Effect.fn("superviseRun")(function* (
         Effect.andThen(Deferred.await(exited).pipe(Effect.timeoutOption(FORCED_STOP_GRACE))),
       ),
     ),
+    Effect.raceFirst(Fiber.join(jobControl)),
   );
   const runSkippedItsCleanup =
     (yield* Deferred.isDone(forced)) || Predicate.isString(yield* Deferred.await(exited));

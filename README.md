@@ -13,30 +13,31 @@ Here's an example CI script. The end-to-end tests start your server, get its URL
 ```ts
 // scripts/ci.ts
 import { Task } from "@sshkeda/task";
-import { Effect } from "effect";
+import { Effect, Schema } from "effect";
 
 import { app } from "../src/app.ts";
 
-export const server = Task.make(
-  "server",
-  Effect.gen(function* () {
+const server = Task.make({
+  name: "server",
+  output: Schema.String,
+  run: Effect.gen(function* () {
     const server = Bun.serve({ port: 0, fetch: app.fetch });
     return yield* Task.serve(server.url.href);
   }),
-);
-export const typecheck = Task.make("typecheck", Task.exec("bunx", ["tsc", "--noEmit"]));
-export const e2e = Task.make(
-  "e2e",
-  Effect.gen(function* () {
+});
+const typecheck = Task.make({
+  name: "typecheck",
+  run: Effect.asVoid(Task.exec("bunx", ["tsc", "--noEmit"])),
+});
+const e2e = Task.make({
+  name: "e2e",
+  run: Effect.gen(function* () {
     const url = yield* server;
     yield* Task.exec("bun", ["test", "e2e"], { env: { APP_URL: url } });
   }),
-);
-export const ci = Task.make("ci", Task.allSettled([typecheck, e2e]));
+});
 
-if (import.meta.main) {
-  Task.main(ci);
-}
+export default Task.make({ name: "ci", run: Task.allSettled([typecheck, e2e]) });
 ```
 
 Run it with `bun scripts/ci.ts`:
@@ -70,18 +71,35 @@ Every run writes an OpenTelemetry trace file, so you can see exactly what makes 
 
 - **Multithreaded parallelism.** Task bodies run on a pool of worker threads, so independent tasks run side by side instead of blocking a single thread.
 - **Any runtime in one run.** Vitest on Node, `bun test` and a Python script can all run side by side.
-- **Values passed straight between tasks.** A task hands its result, such as a server's URL, to the tasks that use it, with no temporary files or wait scripts in between.
+- **Values passed straight between tasks.** A task hands its result, such as a server's URL, to the tasks that use it, checked against the schema it declares, with no temporary files or wait scripts in between.
 - **Observable errors.** The last line names the command that failed and its error, so you don't have to dig through logs.
 - **Timeouts per task.** A hung test fails the run after the limit you set instead of blocking CI forever.
 - **Everything stops when the run ends.** Whether it passes, fails, times out or you press Ctrl-C, Task stops every task and the programs they started.
 
 ## API
 
-- `Task.make(name, body, { timeout?, cleanup? })` makes a task from an Effect. `cleanup` is how long the task may take to stop, and it defaults to 5 seconds.
-- `Task.exec(command, args, { env?, cwd?, stdin?, secret? })` runs a command, returns its output and fails if it exits with an error. The command sees only `HOME`, `PATH` and `TMPDIR` from your environment, so pass anything else it needs in `env`. With `secret: true`, the output comes back as a `Redacted` value and stays out of logs.
+- `Task.make({ name, run, output?, flags?, timeout?, cleanup?, isolated? })` makes a task from an Effect. `output` is the schema of the value the task returns or serves. Without it, `run` must return nothing, so wrap a value you don't need in `Effect.asVoid`. `flags` is a `Schema.Struct` of the command-line flags the task reads; with it, `run` is a function of their values. Every task that reads a flag gets the value you pass. `timeout` is how long the task's own work may take, not counting time it waits for a task it uses. `cleanup` is how long the task may take to stop, and it defaults to 5 seconds. `isolated: true` runs the task on its own worker, so globals it changes cannot reach later tasks.
+
+  ```ts
+  // bun scripts/deploy.ts --stage prod --dry-run
+  export default Task.make({
+    name: "deploy",
+    flags: Schema.Struct({
+      stage: Schema.Literals(["dev", "prod"]),
+      dryRun: Schema.optional(Schema.Boolean),
+    }),
+    run: ({ stage, dryRun }) =>
+      Effect.asVoid(Task.exec("./deploy.sh", dryRun ? [stage, "--dry-run"] : [stage])),
+  });
+  ```
+
+- `Task.exec(command, args, { env?, cwd?, stdin?, secret?, stdio? })` runs a command, returns its output and fails if it exits with an error. The command sees only `HOME`, `PATH` and `TMPDIR` from your environment, so pass anything else it needs in `env`. It runs in the folder of the `package.json` nearest the task's file, or nearest the file the run started with when the task is imported from an installed package, and `cwd` starts from there. With `secret: true`, the output comes back as a `Redacted` value and stays out of logs. With `stdio: "inherit"`, the command reads from and writes to your terminal directly, so interactive programs work, and nothing is returned. Only the task the run starts with can do this.
 - `return yield* Task.serve(value)` ends a task's body but keeps the task running, such as a dev server, and hands `value` to the tasks that use it.
-- `Task.main(task)` runs a task and everything it uses, then exits.
 - `Task.all(tasks)` runs tasks in parallel and stops at the first failure. `Task.allSettled(tasks)` lets every task finish, then reports each failure.
+- `bun scripts/ci.ts` runs the file's default export and everything it uses.
+- `bun scripts/ci.ts "e2e"` runs only that task and the tasks it uses.
+- `bun scripts/ci.ts --help` prints the task the file runs and the flags each task reads, without starting a task.
+- `SSHKEDA_TASK_LOG=error` makes Task print only errors.
 
 ## Get started
 
@@ -101,29 +119,31 @@ Task needs Bun 1.4.4 or newer.
    "types": ["bun"]
    ```
 
-3. Write your tasks in a TypeScript file, such as `scripts/ci.ts`.
+3. Write a task in a TypeScript file, such as `scripts/typecheck.ts`, and export it as the default.
 
    ```ts
    import { Task } from "@sshkeda/task";
+   import { Effect } from "effect";
 
-   export const test = Task.make("test", Task.exec("bun", ["test"]));
-
-   if (import.meta.main) {
-     Task.main(test);
-   }
+   export default Task.make({
+     name: "typecheck",
+     run: Effect.asVoid(Task.exec("bunx", ["tsc", "--noEmit"])),
+   });
    ```
 
 4. Run the file.
 
    ```bash
-   bun scripts/ci.ts
+   bun scripts/typecheck.ts
    ```
 
 ## Limits
 
-- Task runs only on Bun. Your commands can use any runtime, but your task files run on Bun.
-- Task bodies are Effect, so every step gets typed errors, retries and timeouts. If you haven't used Effect, your agent has.
+- Task runs only on Bun.
+- Task runs on macOS and on Linux with glibc. It does not run on Windows or on musl Linux such as Alpine.
+- Task bodies are Effect, so every step gets typed errors, retries and timeouts.
 - Task has no caching. Every run runs every task it reaches.
+- Task loads your task file more than once in a run, so keep work inside a task's `run`.
 
 ## Development
 

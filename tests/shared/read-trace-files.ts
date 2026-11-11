@@ -82,7 +82,16 @@ export const readTraceDirectory = (
 ) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
-    const directory = `${project.home}/${TASK_STATE_DIRECTORY_NAME}/traces/project`;
+    const stateDirectory = `${project.home}/${TASK_STATE_DIRECTORY_NAME}`;
+    const directory = `${stateDirectory}/traces/project`;
+    const directoryModes = yield* Effect.forEach(
+      [stateDirectory, `${stateDirectory}/traces`, directory],
+      (path) =>
+        Effect.map(
+          fileSystem.stat(path),
+          (directoryInformation) => directoryInformation.mode & PERMISSION_BITS,
+        ),
+    );
     const files = yield* Effect.forEach(
       (yield* fileSystem.readDirectory(directory, { recursive: true })).toSorted(),
       (path) =>
@@ -101,7 +110,13 @@ export const readTraceDirectory = (
           ];
         }),
     );
-    return { home: project.home, directory: project.directory, ...ran, files: files.flat() };
+    return {
+      home: project.home,
+      directory: project.directory,
+      ...ran,
+      directoryModes,
+      files: files.flat(),
+    };
   });
 
 export const readTraces = (traceDirectory: Effect.Success<ReturnType<typeof readTraceDirectory>>) =>

@@ -1,6 +1,6 @@
 {
   "name": "@sshkeda/task",
-  "version": "1.0.2",
+  "version": "2.0.0",
   "homepage": "https://github.com/sshkeda/task#readme",
   "bugs": {
     "url": "https://github.com/sshkeda/task/issues"
@@ -23,12 +23,11 @@
     "registry": "https://registry.npmjs.org"
   },
   "dependencies": {
-    "@effect/platform-bun": "4.1.0",
-    "oxc-parser": "0.153.0"
+    "@effect/platform-bun": "^4.1.0"
   },
   "devDependencies": {
-    "@effect/tsgo": "0.55.0",
-    "@sshkeda/check": "^1.0.1",
+    "@effect/tsgo": "0.67.4",
+    "@sshkeda/check": "3.0.0",
     "@sshkeda/task": "file:.",
     "@types/bun": "1.4.3",
     "effect": "4.1.0",

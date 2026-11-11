@@ -1,11 +1,11 @@
 import { expect } from "bun:test";
 
-import { Task } from "@sshkeda/task";
 import { Effect, Exit, FileSystem, Scope } from "effect";
 
 import { failTestCleanup } from "../shared/fail-test-cleanup.ts";
 import { exitAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
+import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 import { ChildStillRunning } from "../shared/test-errors.ts";
 
@@ -13,19 +13,21 @@ const RUN_COUNT = 2;
 
 const CHILD_TASK_FILE_SOURCE = `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const main = Task.make("child", Effect.gen(function* () {
+export const main = Task.make({ name: "child", run: Effect.gen(function* () {
   yield* Effect.log("child trace marker");
   yield* Effect.sync(() => { process.stdout.write("partial stdout"); process.stderr.write("partial stderr"); });
-}));
-if (import.meta.main) Task.main(main);`;
+}) });`;
 
-export const assertionFailure = Task.make(
+const CHILD_ENTRY_SOURCE = `${CHILD_TASK_FILE_SOURCE}
+export default main;`;
+
+export const assertionFailure = makeTest(
   "an assertion failure after child exit retains each child's output and traces",
   Effect.scoped(
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
       const projectScope = yield* Scope.make();
-      const project = yield* makeProject({ "main.ts": CHILD_TASK_FILE_SOURCE }).pipe(
+      const project = yield* makeProject({ "main.ts": CHILD_ENTRY_SOURCE }).pipe(
         Scope.provide(projectScope),
       );
       yield* Effect.addFinalizer(() =>
@@ -56,7 +58,6 @@ export const assertionFailure = Task.make(
       expect(contents).toContain("child trace marker");
     }),
   ),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
 const interruptedChild = (interrupt: boolean) =>
@@ -65,13 +66,13 @@ const interruptedChild = (interrupt: boolean) =>
       const fileSystem = yield* FileSystem.FileSystem;
       const projectScope = yield* Scope.make();
       const project = yield* makeProject({
-        "main.ts": `${CHILD_TASK_FILE_SOURCE.replace("if (import.meta.main) Task.main(main);", "")}
-export const hanging = Task.make("hanging", Effect.gen(function* () {
+        "main.ts": `${CHILD_TASK_FILE_SOURCE}
+export const hanging = Task.make({ name: "hanging", run: Effect.gen(function* () {
   yield* main;
   yield* Effect.log("ready to interrupt");
   yield* Effect.never;
-}));
-if (import.meta.main) Task.main(hanging);`,
+}) });
+export default hanging;`,
       }).pipe(Scope.provide(projectScope));
       yield* Effect.addFinalizer(() =>
         Effect.all([
@@ -104,23 +105,21 @@ if (import.meta.main) Task.main(hanging);`,
     }),
   );
 
-export const failedWhileChildRuns = Task.make(
+export const failedWhileChildRuns = makeTest(
   "a test that fails while its child runs preserves partial output and traces",
   interruptedChild(false),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
-export const interrupted = Task.make(
+export const interrupted = makeTest(
   "an interrupted child preserves partial output and traces",
   interruptedChild(true),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );
 
-export const successful = Task.make(
+export const successful = makeTest(
   "a successful test removes its project and child trace directories",
   Effect.gen(function* () {
     const project = yield* Effect.scoped(
       Effect.gen(function* () {
-        const childProject = yield* makeProject({ "main.ts": CHILD_TASK_FILE_SOURCE });
+        const childProject = yield* makeProject({ "main.ts": CHILD_ENTRY_SOURCE });
         const result = yield* runTaskProcess(childProject, "main.ts");
         expect(result.exitCode, result.standardError).toBe(0);
         return childProject;
@@ -130,5 +129,4 @@ export const successful = Task.make(
     expect(yield* fileSystem.exists(project.directory)).toBe(false);
     expect(yield* fileSystem.exists(project.home)).toBe(false);
   }),
-  { timeout: "1 minute", cleanup: "5 seconds" },
 );

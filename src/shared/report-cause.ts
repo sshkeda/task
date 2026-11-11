@@ -30,6 +30,100 @@ const userTagOf = (failureValue: unknown) =>
     Option.liftPredicate(_tag, Predicate.isString),
   );
 
+const describeOwnFields = (failureValue: unknown, tag: string) => {
+  const fields = Object.entries(
+    Option.getOrElse(Schema.decodeUnknownOption(ErrorFields)(failureValue), () => ({})),
+  ).filter(([name]) => name !== "_tag");
+  return fields.length === 0 ? tag : describeCauseMessage(Object.fromEntries(fields));
+};
+
+const MOST_FOLLOWED_CAUSES = 5;
+
+const ErrorWithCause = Schema.Struct({ cause: Schema.Unknown });
+
+const MOST_PRINTED_INNER_ERRORS = 5;
+
+const ErrorWithInnerErrors = Schema.Struct({ errors: Schema.Array(Schema.Unknown) });
+
+const AggregateErrorValue = Schema.instanceOf(AggregateError);
+
+const withInnerErrors = (
+  innerErrors: Option.Option<typeof ErrorWithInnerErrors.Type>,
+  printedText: string,
+) =>
+  Option.match(innerErrors, {
+    onNone: () => printedText,
+    onSome: ({ errors }) => {
+      const innerLines = errors.slice(0, MOST_PRINTED_INNER_ERRORS).map((innerError) =>
+        Option.match(Schema.decodeUnknownOption(UserError)(innerError), {
+          onSome: (userError) => {
+            const innerTag = Option.getOrElse(userTagOf(innerError), () => userError.name);
+            return userError.message === ""
+              ? `  ${innerTag}`
+              : `  ${innerTag}: ${userError.message}`;
+          },
+          onNone: () => `  ${describeCauseMessage(innerError)}`,
+        }),
+      );
+      const unprintedCount = errors.length - innerLines.length;
+      const moreLines = unprintedCount > 0 ? [`  and ${unprintedCount} more`] : [];
+      return [printedText, ...innerLines, ...moreLines].join("\n");
+    },
+  });
+
+const withCauseChain = (
+  failureValue: unknown,
+  causePrintedText: string,
+  followedValues: readonly unknown[],
+): string => {
+  const printedText = withInnerErrors(
+    Option.flatMap(
+      Schema.decodeUnknownOption(AggregateErrorValue)(failureValue),
+      Schema.decodeUnknownOption(ErrorWithInnerErrors),
+    ),
+    causePrintedText,
+  );
+  const followableCause = Option.filter(
+    Option.map(Schema.decodeUnknownOption(ErrorWithCause)(failureValue), ({ cause }) => cause),
+    (cause) => {
+      const isWithinDepth = followedValues.length <= MOST_FOLLOWED_CAUSES;
+      const isUnfollowed = !followedValues.includes(cause);
+      return isWithinDepth && isUnfollowed;
+    },
+  );
+  return Option.match(
+    Option.flatMap(followableCause, (cause) =>
+      Option.map(Schema.decodeUnknownOption(UserError)(cause), (causeError) => ({
+        cause,
+        causeError,
+      })),
+    ),
+    {
+      onNone: () => printedText,
+      onSome: ({ cause, causeError }) => {
+        const causeTag = Option.getOrElse(userTagOf(cause), () => causeError.name);
+        const causeLine =
+          causeError.message === ""
+            ? `caused by ${causeTag}`
+            : `caused by ${causeTag}: ${causeError.message}`;
+        const isRestated =
+          causeError.message !== "" &&
+          printedText
+            .split("\n")
+            .some(
+              (printedLine) =>
+                printedLine === causeError.message ||
+                printedLine.endsWith(`: ${causeError.message}`),
+            );
+        return withCauseChain(cause, isRestated ? printedText : `${printedText}\n${causeLine}`, [
+          ...followedValues,
+          cause,
+        ]);
+      },
+    },
+  );
+};
+
 const ErrorCausedByCommandRefusal = Schema.Struct({ cause: CommandRefusal });
 
 const ENGINE_ERROR_NAMES = new Set(["TypeError", "ReferenceError"]);
@@ -88,7 +182,11 @@ const reportReason = (
                     return [
                       {
                         tag,
-                        message: `${foreignMessagePrefix}${message === "" ? tag : message}`,
+                        message: withCauseChain(
+                          failureValue,
+                          `${foreignMessagePrefix}${message === "" ? describeOwnFields(failureValue, tag) : message}`,
+                          [failureValue],
+                        ),
                         ...userLocation,
                       },
                     ];
@@ -96,7 +194,11 @@ const reportReason = (
                   onNone: () => [
                     reportError(
                       new UntaggedFailure({
-                        failureMessage: `${foreignMessagePrefix}${describeCauseMessage(failureValue)}`,
+                        failureMessage: withCauseChain(
+                          failureValue,
+                          `${foreignMessagePrefix}${describeCauseMessage(failureValue)}`,
+                          [failureValue],
+                        ),
                         ...userLocation,
                       }),
                     ),

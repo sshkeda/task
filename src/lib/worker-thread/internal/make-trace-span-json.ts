@@ -1,6 +1,8 @@
-import { Cause, Exit, Option, Schema } from "effect";
+import { Cause, Exit, Option } from "effect";
 import type { Tracer } from "effect";
 import { OtlpResource } from "effect/observability";
+
+import { encodeTraceJson } from "../shared/encode-trace-json.ts";
 
 const TRACE_ID_LENGTH = 32;
 
@@ -14,15 +16,6 @@ const SPAN_KINDS = {
   producer: 4,
   consumer: 5,
 } as const;
-
-const writeNonFiniteNumbersAsStrings = (_key: string, value: Schema.Json) => {
-  const isNonFiniteNumber = typeof value === "number" && !Number.isFinite(value);
-  return isNonFiniteNumber ? String(value) : value;
-};
-
-const encodeJson = Schema.encodeOption(
-  Schema.fromJsonString(Schema.Unknown, { replacer: writeNonFiniteNumbersAsStrings }),
-);
 
 const describeExit = (exit: Exit.Exit<unknown, unknown>, endTimeUnixNano: string) => {
   if (Exit.isSuccess(exit)) {
@@ -67,7 +60,7 @@ export const makeTraceSpanJson = (
   const endTimeUnixNano = String(endTime);
   const ended = describeExit(exit, endTimeUnixNano);
   return Option.getOrUndefined(
-    encodeJson({
+    encodeTraceJson({
       traceId: span.traceId.padStart(TRACE_ID_LENGTH, "0"),
       spanId: span.spanId,
       parentSpanId: Option.getOrUndefined(span.parent)?.spanId,
