@@ -21,17 +21,18 @@ import { printTaskLines } from "../../../../../../../shared/print-to-standard-er
 import { WorkerExited } from "../../../../../../../shared/process-errors.ts";
 import { TaskSetupTimedOut, TaskTimedOut } from "../../../../../../../shared/task-errors.ts";
 import { failRun, failTask } from "../../../../../shared/fail-run.ts";
+import { WorkerTerminatedForAnotherTask } from "../../../../../shared/main-thread-errors.ts";
 import { RunRootTaskConfig } from "../../../../../shared/provide-run-root-task-config.ts";
 import { StopState } from "../../../../../shared/provide-stop-state.ts";
 import { FromWorker, WorkerPool } from "../../../../../shared/provide-worker-pool.ts";
 import { reportTaskFailure } from "../../../../../shared/report-task-failure.ts";
 import {
-  formatTaskRunStatusForTrace,
-  findAssignedWorkerId,
   findTaskNamesOccupyingWorker,
+  formatTaskRunForTrace,
   formatWaitingForWorker,
 } from "../../../shared/define-task-run-state.ts";
 import type { makeTaskRunsState } from "../../../shared/define-task-run-state.ts";
+import { isBeforeBody, isOnWorker, TaskRunStatus } from "../../../shared/define-task-run-status.ts";
 import type { makeStopwatch } from "../../../shared/make-stopwatch.ts";
 import { stopTask } from "../../../shared/stop-task.ts";
 import { awaitWithinCountedLimit } from "./await-within-counted-limit.ts";
@@ -87,7 +88,9 @@ const failRunWhenCleanupOutlastsTimeout = Effect.fn("failRunWhenCleanupOutlastsT
   }
 });
 
-const endsRunDirectly = Schema.is(Schema.Union([TaskSetupTimedOut, WorkerExited]));
+const endsRunDirectly = Schema.is(
+  Schema.Union([TaskSetupTimedOut, WorkerExited, WorkerTerminatedForAnotherTask]),
+);
 
 export const executeTask = Effect.fn("executeTaskFiber")(
   function* (taskRunsState: Effect.Success<typeof makeTaskRunsState>, taskName: string) {
@@ -114,11 +117,11 @@ export const executeTask = Effect.fn("executeTaskFiber")(
     const waitingForWorkerIdRef = yield* Ref.make<number | null>(null);
     const describeStepBeforeBody = (isWorkerHeldByOtherTasks: boolean) => {
       const waitingForWorkerId = Ref.getUnsafe(waitingForWorkerIdRef);
-      if (waitingForWorkerId === null) {
-        return taskRun.stepBeforeBody;
-      }
-      if (Deferred.isDoneUnsafe(taskRun.bodyStartedAtMillisecondsDeferred)) {
+      if (!isBeforeBody(taskRun.status)) {
         return null;
+      }
+      if (waitingForWorkerId === null) {
+        return "starting a worker";
       }
       const occupyingTaskNames = findTaskNamesOccupyingWorker(
         taskRunsState.runsByTaskName,
@@ -130,7 +133,7 @@ export const executeTask = Effect.fn("executeTaskFiber")(
       if (isWaitingOnAnOccupyingTask) {
         return formatWaitingForWorker(waitingForWorkerId, longestOccupyingTaskName, otherTaskNames);
       }
-      return Deferred.isDoneUnsafe(taskRun.bodyLoadingDeferred)
+      return TaskRunStatus.guards.Loading(taskRun.status)
         ? `loading ${rootTaskFilePath}`
         : `waiting for worker ${waitingForWorkerId} to take it`;
     };
@@ -138,7 +141,6 @@ export const executeTask = Effect.fn("executeTaskFiber")(
       yield* printTaskLines("Info", taskName, "started");
 
       const workerPool = yield* WorkerPool;
-      taskRun.stepBeforeBody = "starting a worker";
       const workerId = yield* workerPool.selectWorkerIdForTask(
         taskRunsState.readWorkerLoad,
         (selectedWorkerId) => taskRunsState.recordWorkerAssignment(taskName, selectedWorkerId),
@@ -214,8 +216,7 @@ export const executeTask = Effect.fn("executeTaskFiber")(
         const cleanupMayOutlastTimeout =
           Exit.isFailure(outcomeExit) &&
           timeoutDuration !== null &&
-          findAssignedWorkerId(taskRun.status) !== null &&
-          !Deferred.isDoneUnsafe(taskRun.bodyFinishedDeferred) &&
+          isOnWorker(taskRun.status) &&
           !Option.exists(
             Exit.findErrorOption(outcomeExit),
             (failure) => isTaskTimedOut(failure) || isTaskSetupTimedOut(failure),
@@ -259,7 +260,7 @@ export const executeTask = Effect.fn("executeTaskFiber")(
           taskRunsState.markEndedFromExit(taskName, taskExit);
           yield* Effect.annotateCurrentSpan(
             `${TASK_TRACE_LABEL_PREFIX}.state`,
-            formatTaskRunStatusForTrace(taskRun.status),
+            formatTaskRunForTrace(taskRun),
           );
           const failure = Exit.findErrorOption(taskExit);
           const failedUnreportedWithMoreThanInterrupts =

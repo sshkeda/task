@@ -26,14 +26,18 @@ import {
   TaskBodyFailed,
 } from "../../../../../shared/task-errors.ts";
 import type { AwaitedTasksFailure, TaskRequestFailure } from "../../../../../shared/task-errors.ts";
+import { WorkerEnding } from "../../../shared/define-worker-stage.ts";
 import { failRun, failTask } from "../../../shared/fail-run.ts";
+import { WorkerTerminatedForAnotherTask } from "../../../shared/main-thread-errors.ts";
 import { ProcessGroups } from "../../../shared/provide-process-groups.ts";
 import { StopState } from "../../../shared/provide-stop-state.ts";
 import { FromWorker, WorkerEvent, WorkerPool } from "../../../shared/provide-worker-pool.ts";
 import { reportFailure } from "../../../shared/report-task-failure.ts";
 import { TraceFile } from "../../../shared/write-trace-file.ts";
-import { findAssignedWorkerId, TaskRunStatus } from "../shared/define-task-run-state.ts";
+import { findAssignedWorkerId, isUnfinishedOnWorker } from "../shared/define-task-run-state.ts";
 import type { makeTaskRunsState } from "../shared/define-task-run-state.ts";
+import { isEndedByTheRun, TaskRunEvent, TaskRunOutcome } from "../shared/define-task-run-status.ts";
+import { TaskStopEvent } from "../shared/define-task-stop-stage.ts";
 
 const sendDependencyResultToWorker = Effect.fn("sendDependencyResultToWorker")(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
@@ -52,10 +56,6 @@ const sendDependencyResultToWorker = Effect.fn("sendDependencyResultToWorker")(f
   const requestingTaskRun = yield* Effect.fromNullishOr(
     taskRunsState.runsByTaskName.get(messageFromWorker.taskName),
   ).pipe(dieOnInvariantFailure("task requests", "a task that requests another task has a run"));
-  const awaitRequesterCleanup = Effect.raceFirst(
-    Deferred.await(requestingTaskRun.bodyCleanupStartedDeferred),
-    Deferred.await(requestingTaskRun.bodyFailedBeforeCleanupDeferred),
-  );
   const answer = yield* requestDependencyTaskResult(
     messageFromWorker.dependencyTaskName,
     messageFromWorker.taskName,
@@ -66,24 +66,14 @@ const sendDependencyResultToWorker = Effect.fn("sendDependencyResultToWorker")(f
     Effect.tap((dependencyExit) => {
       const dependencyWasStopped =
         Exit.isFailure(dependencyExit) && Cause.hasInterruptsOnly(dependencyExit.cause);
-      return dependencyWasStopped ? awaitRequesterCleanup : Effect.void;
+      return dependencyWasStopped ? requestingTaskRun.stop.awaitCleanupStarted : Effect.void;
     }),
     Effect.raceFirst(
       Deferred.await(requestingTaskRun.bodyFinishedDeferred).pipe(Effect.andThen(Effect.interrupt)),
     ),
-    Effect.onInterrupt(() => {
-      const isRequesterCleaningUp =
-        Deferred.isDoneUnsafe(requestingTaskRun.bodyCleanupStartedDeferred) ||
-        Deferred.isDoneUnsafe(requestingTaskRun.bodyFailedBeforeCleanupDeferred);
-      return isRequesterCleaningUp
-        ? WorkerPool.use((workerPool) =>
-            workerPool.answerDependencyRequest(
-              messageFromWorker.dependencyRequestId,
-              Exit.interrupt(),
-            ),
-          )
-        : Effect.void;
-    }),
+  );
+  requestingTaskRun.dependencyRequestIdsAwaitingAnswer.delete(
+    messageFromWorker.dependencyRequestId,
   );
   const workerId = findAssignedWorkerId(requestingTaskRun.status);
   if (workerId === null) {
@@ -99,7 +89,7 @@ const isWorkerExited = Schema.is(WorkerExited);
 
 const isTaskCleanupFailed = Schema.is(TaskCleanupFailed);
 
-const isTaskEnded = TaskRunStatus.isAnyOf(["Failed", "Cancelled"]);
+const isWorkerTerminatedForAnotherTask = Schema.is(WorkerTerminatedForAnotherTask);
 
 const bodyEnding = (taskName: string, result: typeof TaskFiberResult.Type) =>
   TaskFiberResult.match(result, {
@@ -107,7 +97,11 @@ const bodyEnding = (taskName: string, result: typeof TaskFiberResult.Type) =>
       returned,
     ): Exit.Exit<
       typeof returned,
-      TaskBodyFailed | TaskCleanupFailed | WorkerExited | typeof AwaitedTasksFailure.Type
+      | TaskBodyFailed
+      | TaskCleanupFailed
+      | WorkerExited
+      | WorkerTerminatedForAnotherTask
+      | typeof AwaitedTasksFailure.Type
     > => Exit.succeed(returned),
     Failed: (failed) =>
       Exit.fail(
@@ -139,54 +133,47 @@ const settleBodyOutcome = Effect.fn("settleBodyOutcome")(function* (
   >,
 ) {
   const taskRun = taskRunsState.runsByTaskName.get(taskName);
-  const isOutcomeAlreadySettled =
-    taskRun === undefined || Deferred.isDoneUnsafe(taskRun.bodyOutcomeDeferred);
-  if (isOutcomeAlreadySettled) {
+  if (taskRun === undefined) {
     return;
   }
-  const failedAfterTaskEnded = isTaskEnded(taskRun.status)
-    ? Option.filter(Exit.findErrorOption(ending), isTaskBodyFailed)
-    : Option.none();
+  const failure = Exit.findErrorOption(ending);
+  const failedAfterTaskEnded = TaskRunOutcome.guards.Cancelled(taskRun.outcome)
+    ? Option.filter(
+        failure,
+        (bodyFailure) =>
+          isTaskBodyFailed(bodyFailure) || isWorkerTerminatedForAnotherTask(bodyFailure),
+      )
+    : Option.filter(failure, (bodyFailure) =>
+        isEndedByTheRun(taskRun.outcome) ? isTaskBodyFailed(bodyFailure) : false,
+      );
   Deferred.doneUnsafe(taskRun.bodyOutcomeDeferred, ending);
   if (Option.isSome(failedAfterTaskEnded)) {
     yield* failTask(failedAfterTaskEnded.value, taskRunsState.markFailed);
   }
 });
 
-const endTask = Effect.fn("endTask")(function* (
+const reportFailureAfterOutcome = Effect.fn("reportFailureAfterOutcome")(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   ending: Exit.Exit<
     Effect.Success<ReturnType<typeof bodyEnding>>,
     Effect.Error<ReturnType<typeof bodyEnding>>
   >,
+  served: boolean,
 ) {
-  const taskRun = taskRunsState.runsByTaskName.get(taskName);
-  const isBodyAlreadyFinished =
-    taskRun === undefined || Deferred.isDoneUnsafe(taskRun.bodyFinishedDeferred);
-  if (isBodyAlreadyFinished) {
-    return;
-  }
-
-  Deferred.doneUnsafe(taskRun.bodyFinishedDeferred, Exit.void);
-  taskRunsState.refreshBodyClocks(taskName, yield* Clock.currentTimeMillis);
-  const servedBeforeEnding = taskRunsState.markClosed(taskName);
-  if (servedBeforeEnding) {
-    yield* printTaskLines("Info", taskName, "closed");
-  }
-  if (!Deferred.isDoneUnsafe(taskRun.bodyOutcomeDeferred)) {
-    return yield* settleBodyOutcome(taskRunsState, taskName, ending);
-  }
   const failure = Exit.findErrorOption(ending);
   if (Option.isNone(failure)) {
     return;
   }
-  const failureEndsRun = isTaskCleanupFailed(failure.value) || isWorkerExited(failure.value);
+  const failureEndsRun =
+    isTaskCleanupFailed(failure.value) ||
+    isWorkerExited(failure.value) ||
+    isWorkerTerminatedForAnotherTask(failure.value);
   if (failureEndsRun) {
     yield* (yield* StopState).recordFirstFailure(failure.value);
     return yield* failTask(failure.value, taskRunsState.markFailed);
   }
-  if (!servedBeforeEnding) {
+  if (!served) {
     return;
   }
 
@@ -202,43 +189,85 @@ const endTask = Effect.fn("endTask")(function* (
   );
 });
 
+const endTask = Effect.fn("endTask")(function* (
+  taskRunsState: Effect.Success<typeof makeTaskRunsState>,
+  taskName: string,
+  ending: Exit.Exit<
+    Effect.Success<ReturnType<typeof bodyEnding>>,
+    Effect.Error<ReturnType<typeof bodyEnding>>
+  >,
+) {
+  const action = yield* taskRunsState.moveTaskRun(taskName, TaskRunEvent.cases.End.make({}));
+  if (action === "ignored") {
+    return;
+  }
+  taskRunsState.refreshBodyClocks(taskName, yield* Clock.currentTimeMillis);
+  if (action === "close") {
+    yield* printTaskLines("Info", taskName, "closed");
+  }
+  yield* action === "settleOutcome"
+    ? settleBodyOutcome(taskRunsState, taskName, ending)
+    : reportFailureAfterOutcome(taskRunsState, taskName, ending, action === "close");
+  const taskRun = taskRunsState.runsByTaskName.get(taskName);
+  const workerId = taskRun === undefined ? null : findAssignedWorkerId(taskRun.status);
+  if (workerId !== null) {
+    yield* WorkerPool.use((workerPool) => workerPool.recordTaskEnded(workerId));
+  }
+});
+
+const failTasksOnWorker = Effect.fn("failTasksOnWorker")(function* (
+  taskRunsState: Effect.Success<typeof makeTaskRunsState>,
+  taskNames: readonly string[],
+  makeFailure: (taskName: string) => WorkerExited | WorkerTerminatedForAnotherTask,
+) {
+  const processGroups = yield* ProcessGroups;
+  yield* Effect.forEach(taskNames, processGroups.killForTask, { discard: true });
+  yield* Effect.forEach(
+    taskNames,
+    (taskName) => endTask(taskRunsState, taskName, Exit.fail(makeFailure(taskName))),
+    { discard: true },
+  );
+});
+
 const endTasksOfExitedWorker = Effect.fn("endTasksOfExitedWorker")(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   workerEvent: typeof WorkerEvent.cases.ExitedWithCode.Type,
 ) {
-  const processGroups = yield* ProcessGroups;
-  const unfinished = [...taskRunsState.runsByTaskName].filter(
-    ([, taskRun]) =>
-      findAssignedWorkerId(taskRun.status) === workerEvent.workerId &&
-      !Deferred.isDoneUnsafe(taskRun.bodyFinishedDeferred),
-  );
-  if (!workerEvent.terminationRequested) {
-    for (const [taskName] of unfinished) {
-      yield* processGroups.killForTask(taskName);
-    }
-  }
+  const unfinishedTaskNames = [...taskRunsState.runsByTaskName]
+    .filter(([, taskRun]) => isUnfinishedOnWorker(taskRun, workerEvent.workerId))
+    .map(([taskName]) => taskName);
   const workerExit = {
     workerId: workerEvent.workerId,
     exitCode: workerEvent.exitCode,
     uncaughtError: workerEvent.uncaughtError,
   };
-  const exitedUnexpectedlyWithoutTasks =
-    !workerEvent.terminationRequested && unfinished.length === 0;
-  if (exitedUnexpectedlyWithoutTasks) {
-    return yield* failRun(
-      new WorkerExited({ taskName: null, ...workerExit }),
-      taskRunsState.markFailed,
-    );
-  }
-  for (const [taskName] of unfinished) {
-    yield* endTask(
-      taskRunsState,
-      taskName,
-      workerEvent.terminationRequested
-        ? Exit.interrupt()
-        : Exit.fail(new WorkerExited({ taskName, ...workerExit })),
-    );
-  }
+  const stopTasks = (taskNames: readonly string[]) =>
+    Effect.forEach(taskNames, (taskName) => endTask(taskRunsState, taskName, Exit.interrupt()), {
+      discard: true,
+    });
+  yield* WorkerEnding.match(workerEvent.ending, {
+    Crashed: () =>
+      unfinishedTaskNames.length === 0
+        ? failRun(new WorkerExited({ taskName: null, ...workerExit }), taskRunsState.markFailed)
+        : failTasksOnWorker(
+            taskRunsState,
+            unfinishedTaskNames,
+            (taskName) => new WorkerExited({ taskName, ...workerExit }),
+          ),
+    ExitedOnRequest: () => stopTasks(unfinishedTaskNames),
+    Terminated: ({ terminatingTaskName }) =>
+      terminatingTaskName === null
+        ? stopTasks(unfinishedTaskNames)
+        : failTasksOnWorker(
+            taskRunsState,
+            unfinishedTaskNames.filter((taskName) => taskName !== terminatingTaskName),
+            (taskName) => new WorkerTerminatedForAnotherTask({ taskName, terminatingTaskName }),
+          ).pipe(
+            Effect.andThen(
+              stopTasks(unfinishedTaskNames.filter((taskName) => taskName === terminatingTaskName)),
+            ),
+          ),
+  });
 });
 
 const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
@@ -279,17 +308,19 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
               ),
             ),
           ),
-      TaskFiberLoading: () => Deferred.done(taskRun.bodyLoadingDeferred, Exit.void),
-      TaskFiberStarted: () => {
-        taskRun.stepBeforeBody = null;
-        return Deferred.complete(
-          taskRun.bodyStartedAtMillisecondsDeferred,
-          Clock.currentTimeMillis,
-        );
-      },
-      TaskFiberStartedCleanUp: () => Deferred.done(taskRun.bodyCleanupStartedDeferred, Exit.void),
+      TaskFiberLoading: () =>
+        taskRunsState.moveTaskRun(messageFromWorker.taskName, TaskRunEvent.cases.Load.make({})),
+      TaskFiberStarted: () =>
+        taskRunsState.moveTaskRun(
+          messageFromWorker.taskName,
+          TaskRunEvent.cases.StartBody.make({}),
+        ),
+      TaskFiberStartedCleanUp: () => taskRun.stop.move(TaskStopEvent.cases.StartCleanup.make({})),
+      TaskFiberStoppedBeforeBody: () =>
+        taskRun.stop.move(TaskStopEvent.cases.StopBeforeBody.make({})),
       TaskFiberRequestedTask: (requested) => {
         taskRun.bodyRequestedTaskNames.add(requested.dependencyTaskName);
+        taskRun.dependencyRequestIdsAwaitingAnswer.add(requested.dependencyRequestId);
         return FiberSet.run(
           taskRunsState.taskFibers,
           sendDependencyResultToWorker(taskRunsState, requestDependencyTaskResult, requested),
@@ -313,7 +344,7 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
         );
       },
       TaskFiberRequestedStandardInput: (requested) =>
-        taskRunsState.rootTaskStandardInput.answerNextRead((read) =>
+        taskRunsState.rootTaskStandardInput.answerNextRead(requested.taskName, (read) =>
           WorkerPool.use((workerPool) =>
             workerPool.answerStandardInputRead(requested.readId, read),
           ),
@@ -323,20 +354,34 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
           taskRunsState.recordFailureReachedAwaitingTask(received.awaitedTaskName);
         }),
       TaskFiberCancelledRequest: (cancelled) => {
+        taskRun.dependencyRequestIdsAwaitingAnswer.delete(cancelled.dependencyRequestId);
         const requestFiber = taskRun.requestFibersByDependencyRequestId.get(
           cancelled.dependencyRequestId,
         );
         return requestFiber === undefined ? Effect.void : Fiber.interrupt(requestFiber);
       },
       TaskFiberFailedBeforeCleanup: (failed) =>
-        Deferred.done(taskRun.bodyFailedBeforeCleanupDeferred, Exit.void).pipe(
-          Effect.andThen(Effect.exit(bodyEnding(failed.taskName, failed.failure))),
-          Effect.flatMap((ending) => settleBodyOutcome(taskRunsState, failed.taskName, ending)),
-        ),
+        Effect.gen(function* () {
+          yield* taskRun.stop.move(TaskStopEvent.cases.FailBeforeCleanup.make({}));
+          const action = yield* taskRunsState.moveTaskRun(
+            failed.taskName,
+            TaskRunEvent.cases.FailBeforeCleanup.make({}),
+          );
+          if (action === "settleOutcome") {
+            const ending = yield* Effect.exit(bodyEnding(failed.taskName, failed.failure));
+            yield* settleBodyOutcome(taskRunsState, failed.taskName, ending);
+          }
+        }),
       TaskFiberServed: (served) =>
-        Effect.sync(() => {
-          taskRunsState.markServing(served.taskName);
-          Deferred.doneUnsafe(taskRun.bodyOutcomeDeferred, Exit.succeed(served));
+        Effect.gen(function* () {
+          const action = yield* taskRunsState.moveTaskRun(
+            served.taskName,
+            TaskRunEvent.cases.Serve.make({}),
+          );
+          if (action === "settleOutcome") {
+            yield* taskRunsState.markServed(served.taskName);
+            Deferred.doneUnsafe(taskRun.bodyOutcomeDeferred, Exit.succeed(served));
+          }
         }),
       TaskFiberEnded: (ended) =>
         Effect.exit(bodyEnding(ended.taskName, ended.result)).pipe(
@@ -390,12 +435,6 @@ const handleWorkerEventInSpan = Effect.fn("handleWorkerEvent")(function* (
   yield* onMessageAboutTask(taskRunsState, requestDependencyTaskResult, messageFromWorker);
   if (FromWorker.guards.TaskFiberStarted(messageFromWorker)) {
     yield* WorkerPool.use((workerPool) => workerPool.recordBodyStartHandled(workerEvent.workerId));
-  }
-  if (FromWorker.guards.TaskFiberEnded(messageFromWorker)) {
-    const workerLoad = taskRunsState.readWorkerLoad(workerEvent.workerId);
-    if (workerLoad.unfinishedTaskCount === 0) {
-      yield* WorkerPool.use((workerPool) => workerPool.discardIsolatedWorker(workerEvent.workerId));
-    }
   }
 });
 

@@ -63,6 +63,7 @@ export const runTaskBody = Effect.fn("runTaskBody")(
       });
     }
     body.startedAtMilliseconds = yield* Clock.currentTimeMillis;
+    yield* workerState.recordBodyStarted(startMessage.taskName);
     yield* workerState.reportBodyStarted(startMessage.taskName);
     return yield* Effect.uninterruptibleMask((restore) =>
       restore(task[TASK_BODY]).pipe(

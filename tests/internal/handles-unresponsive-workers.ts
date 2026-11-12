@@ -4,6 +4,7 @@ import { Effect } from "effect";
 
 import { exists } from "../shared/access-files.ts";
 import { EXIT_CODE_AFTER_SIGINT } from "../shared/exit-codes-after-stop-signals.ts";
+import { findKilledProcesses } from "../shared/find-killed-processes.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
 import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
@@ -72,7 +73,7 @@ export default Task.make({ name: "main", run: Effect.andThen(Effect.andThen(slow
 );
 
 export const frozenFibers = makeTest(
-  "a worker frozen by one task's synchronous loop is terminated when that task times out and its cleanup duration runs out, its other fibers are stopped with it, and the run fails",
+  "a worker frozen by one task's synchronous loop is terminated when that task times out and its cleanup duration runs out, the tasks still on it fail naming that task, and the run fails",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -97,9 +98,15 @@ export default Task.make({ name: "main", run: other });`,
       expect(ran.standardError).toContain(
         "[waiter] error TaskCleanupNotStarted: its worker did not start its cleanup within 1s, so task terminated that worker",
       );
-      expect(ran.standardError).not.toContain("[other] error");
+      for (const taskName of ["other", "main"]) {
+        expect(ran.standardError).toContain(
+          `[${taskName}] error WorkerTerminatedForAnotherTask: its worker was terminated because "waiter" ran past its cleanup limit on it\n`,
+        );
+      }
       expect(ran.standardError).not.toContain("cleaned up");
-      expect(ran.standardError).toMatch(/^failed: waiter \(1 of 3 tasks\), 2 stopped, [\d.]+s$/mu);
+      expect(ran.standardError).toMatch(
+        /^failed: waiter, other, main \(3 of 3 tasks\), [\d.]+s$/mu,
+      );
     }),
   ),
 );
@@ -203,6 +210,44 @@ export default Task.make({ name: "main", run: Effect.andThen(Effect.andThen(wait
   ),
 );
 
+export const bystanderOnTerminatedWorker = makeTest(
+  "a task still running a command on a shared worker that is terminated because another task hung past its timeout fails, naming that task, and has its commands killed before it fails",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { existsSync } from "node:fs";
+import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const runner = Task.make({ name: "runner", run: Task.exec("sh", ["-c", "touch runner-started; sleep 1000"]) });
+export const hanger = Task.make({ name: "hanger", run: Effect.gen(function* () {
+  yield* Effect.sleep("50 millis").pipe(Effect.repeat({ until: () => existsSync("runner-started") }));
+  yield* Effect.log("hanging");
+  yield* Effect.sync(() => { while (true) {} });
+}), timeout: "1 second", cleanup: "1 second" });
+export default Task.make({ name: "main", run: Task.allSettled([runner, hanger]) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
+      expect(ran.exitCode).toBe(1);
+      expect(ran.standardError).toContain("[hanger] hanging");
+      expect(ran.standardError).toContain(
+        "[hanger] error TaskCleanupNotStarted: its worker did not start its cleanup within 1s, so task terminated that worker",
+      );
+      const runnerFailure =
+        '[runner] error WorkerTerminatedForAnotherTask: its worker was terminated because "hanger" ran past its cleanup limit on it\n';
+      expect(ran.standardError).toContain(runnerFailure);
+      const runnerKills = findKilledProcesses(ran.standardError).filter(
+        (killed) => killed.by === '"runner"',
+      );
+      expect(runnerKills.map((killed) => killed.command).toSorted()).toEqual(["sh", "sleep"]);
+      const lastRunnerKill = ran.standardError.lastIndexOf('started by "runner"');
+      expect(lastRunnerKill).toBeLessThan(ran.standardError.indexOf(runnerFailure));
+      expect(ran.standardError).toMatch(
+        /^failed: runner, hanger, main \(3 of 3 tasks\), [\d.]+s$/mu,
+      );
+    }),
+  ),
+);
+
 export const longSynchronousCleanupWithinItsLimit = makeTest(
   "a task's synchronous cleanup that blocks its worker within its own cleanup limit finishes even when another task on that worker runs past a shorter limit",
   Effect.scoped(
@@ -296,6 +341,52 @@ export default Task.make({ name: "main", run: freezer });`,
   ),
 );
 
+const makeServerWithEndlessCleanup = (isolated: boolean) =>
+  makeProject({
+    "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+import { TaskError } from "@sshkeda/task/errors";
+const server = Task.make({
+  name: "server",
+  isolated: ${String(isolated)},
+  run: Effect.gen(function* () {
+    yield* Effect.addFinalizer(() => Effect.never);
+    return yield* Task.serve("up");
+  }),
+  cleanup: "1 second",
+});
+export default Task.make({
+  name: "main",
+  run: Effect.andThen(server, Effect.fail(new TaskError({ message: "boom" }))),
+});
+`,
+  });
+
+export const terminatedAtShutdownStillEndsItsTasks = makeTest(
+  "a shared or isolated worker terminated at the end of the run because it did not exit in time still ends the serving task left on it, so that task prints closed",
+  Effect.scoped(
+    Effect.gen(function* () {
+      for (const isolated of [false, true]) {
+        const project = yield* makeServerWithEndlessCleanup(isolated);
+        const ran = yield* runTaskProcess(project, "main.ts");
+        expect(ran.exitCode).toBe(1);
+        expect(ran.standardError).toContain(
+          "[server] error TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it\n",
+        );
+        expect(ran.standardError, `isolated: ${String(isolated)}`).toContain("[server] closed\n");
+        const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+        expect(
+          (trace?.logs ?? []).some(
+            (log) =>
+              log.body.stringValue ===
+              "worker terminated because it did not exit within 2s of being asked to",
+          ),
+        ).toBe(true);
+      }
+    }),
+  ),
+);
+
 const WAITER_CLEANUP_SECONDS = 30;
 
 const MAXIMUM_ELAPSED_SECONDS = 15;
@@ -335,13 +426,57 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       ].filter((line) => ran.standardError.includes(line));
       expect(workerTerminations, ran.standardError).not.toEqual([]);
       expect(ran.standardError).not.toContain("waiter cleaned up");
-      expect(ran.standardError).not.toContain("[waiter] error");
+      expect(ran.standardError).toMatch(
+        /^\[waiter\] error WorkerTerminatedForAnotherTask: its worker was terminated because "(?:freezer|main)" ran past its cleanup limit on it$/mu,
+      );
       const summary = ran.standardError.includes(mainCleanupNotStarted)
-        ? /^failed: freezer, main \(2 of 3 tasks\), (?<seconds>[\d.]+)s$/mu
-        : /^failed: freezer \(1 of 3 tasks\), (?<seconds>[\d.]+)s$/mu;
+        ? /^failed: waiter, freezer, main \(3 of 3 tasks\), (?<seconds>[\d.]+)s$/mu
+        : /^failed: waiter, freezer \(2 of 3 tasks\), (?<seconds>[\d.]+)s$/mu;
       const { seconds } = summary.exec(ran.standardError)?.groups ?? {};
       const elapsedSeconds = Number(seconds);
       expect(elapsedSeconds).toBeLessThan(MAXIMUM_ELAPSED_SECONDS);
+    }),
+  ),
+);
+
+export const frozenWhileLoading = makeTest(
+  "a task stopped while still loading whose worker then freezes fails with TaskCleanupNotStarted, since no body started, and its worker is terminated when the cleanup limit runs out",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "loading.ts": `import { isMainThread, parentPort } from "node:worker_threads";
+if (!isMainThread) {
+  parentPort?.on("message", () => {
+    while (true) {}
+  });
+  console.error("worker loading");
+  await new Promise(() => {});
+}
+export const greeting = "hello";`,
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+import { greeting } from "./loading.ts";
+export default Task.make({ name: "main", run: Effect.log(greeting), cleanup: "1 second" });`,
+      });
+      const command = yield* startTaskProcess(project, "main.ts");
+      yield* command.waitForLine("worker loading");
+      yield* command.sendSignal("INT");
+      const exited = yield* command.waitForExit;
+      expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
+      expect(exited.standardError).toContain(
+        "[main] error TaskCleanupNotStarted: its worker did not start its cleanup within 1s, so task terminated that worker",
+      );
+      expect(exited.standardError).not.toContain("TaskCleanupTimedOut");
+      expect(exited.standardError).not.toContain("TaskCleanupFrozeWorker");
+      expect(exited.standardError).toMatch(
+        /^failed: main \(1 of 1 task\), [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+      );
+      const [trace] = yield* readTraces(yield* readTraceDirectory(project, exited));
+      expect(
+        (trace?.logs ?? [])
+          .map((log) => String(log.body.stringValue))
+          .filter((body) => body.startsWith("worker terminated")),
+      ).toEqual(['worker terminated because it did not stop loading "main" within 1s']);
     }),
   ),
 );

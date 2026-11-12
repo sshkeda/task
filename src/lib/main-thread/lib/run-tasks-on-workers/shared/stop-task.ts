@@ -13,8 +13,11 @@ import {
 import { ProcessGroups } from "../../../shared/provide-process-groups.ts";
 import { StopState } from "../../../shared/provide-stop-state.ts";
 import { WorkerPool } from "../../../shared/provide-worker-pool.ts";
-import { findAssignedWorkerId, isUnfinishedOnWorker } from "./define-task-run-state.ts";
-import type { makeTaskRunsState } from "./define-task-run-state.ts";
+import { isUnfinishedOnWorker } from "./define-task-run-state.ts";
+import type { makeTaskRun, makeTaskRunsState } from "./define-task-run-state.ts";
+import { isOnWorker } from "./define-task-run-status.ts";
+import { findStopRequestedAt, hasCleanupStarted, TaskStopEvent } from "./define-task-stop-stage.ts";
+import type { moveTaskStopStage } from "./define-task-stop-stage.ts";
 
 const STILL_STOPPING_NOTICE_SECONDS = 2;
 
@@ -37,6 +40,47 @@ const findCleanupDuration = (
     Effect.map((discoveredTask) => discoveredTask.cleanupDuration),
   );
 
+export const interruptDependencyRequests = (taskRun: ReturnType<typeof makeTaskRun>) =>
+  WorkerPool.use((workerPool) => {
+    const dependencyRequestIds = [...taskRun.dependencyRequestIdsAwaitingAnswer];
+    taskRun.dependencyRequestIdsAwaitingAnswer.clear();
+    return Effect.forEach(
+      dependencyRequestIds,
+      (dependencyRequestId) =>
+        workerPool.answerDependencyRequest(dependencyRequestId, Exit.interrupt()),
+      { discard: true },
+    );
+  });
+
+const awaitBodyFinishedWithinLimit = (
+  taskRun: ReturnType<typeof makeTaskRun>,
+  taskName: string,
+  cleanupDuration: Duration.Duration,
+  sinceStopRequested: Duration.Duration,
+) =>
+  Effect.gen(function* () {
+    const isBeforeNotice = Duration.isLessThan(sinceStopRequested, STILL_STOPPING_NOTICE_AFTER);
+    if (!isBeforeNotice) {
+      return yield* Deferred.await(taskRun.bodyFinishedDeferred);
+    }
+    const finishedBeforeNotice = yield* Deferred.await(taskRun.bodyFinishedDeferred).pipe(
+      Effect.timeoutOption(Duration.subtract(STILL_STOPPING_NOTICE_AFTER, sinceStopRequested)),
+    );
+    if (Option.isSome(finishedBeforeNotice)) {
+      return;
+    }
+    yield* printTaskLines(
+      "Warn",
+      taskName,
+      `still stopping after ${Duration.format(STILL_STOPPING_NOTICE_AFTER)}; ${TASK_PACKAGE.name} kills its commands and stops waiting for it when its ${Duration.format(cleanupDuration)} cleanup limit passes`,
+    );
+    yield* Deferred.await(taskRun.bodyFinishedDeferred);
+  }).pipe(
+    Effect.timeoutOption(
+      Duration.max(Duration.subtract(cleanupDuration, sinceStopRequested), Duration.zero),
+    ),
+  );
+
 const watchWorkerOfCleanupPastItsLimit = Effect.fn("watchWorkerOfCleanupPastItsLimit")(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
@@ -55,8 +99,7 @@ const watchWorkerOfCleanupPastItsLimit = Effect.fn("watchWorkerOfCleanupPastItsL
       [...taskRunsState.runsByTaskName].filter(
         ([, otherTaskRun]) =>
           isUnfinishedOnWorker(otherTaskRun, workerId) &&
-          (Deferred.isDoneUnsafe(otherTaskRun.bodyCleanupStartedDeferred) ||
-            Deferred.isDoneUnsafe(otherTaskRun.bodyFailedBeforeCleanupDeferred)),
+          hasCleanupStarted(otherTaskRun.stop.readStage()),
       ),
       ([otherTaskName]) => findCleanupDuration(taskRunsState, otherTaskName),
     );
@@ -84,6 +127,7 @@ const watchWorkerOfCleanupPastItsLimit = Effect.fn("watchWorkerOfCleanupPastItsL
   yield* workerPool.requestWorkerTermination(
     workerId,
     `because its cleanup of "${taskName}" ran past its ${Duration.format(cleanupDuration)} limit and then it stopped answering`,
+    taskName,
   );
   yield* failCleanup(
     taskRunsState,
@@ -109,82 +153,75 @@ export const stopTask = Effect.fn("stopTask")(function* (
   if (isTaskNotStarted) {
     return;
   }
-  const workerId = findAssignedWorkerId(taskRun.status);
-  const hasNoBodyToStop = workerId === null || Deferred.isDoneUnsafe(taskRun.bodyFinishedDeferred);
-  if (hasNoBodyToStop) {
+  const status = taskRun.status;
+  if (!isOnWorker(status)) {
     return;
   }
+  const workerId = status.workerId;
 
   const workerPool = yield* WorkerPool;
-  const nowMilliseconds = yield* Clock.currentTimeMillis;
-  const isFirstStop = yield* Deferred.succeed(
-    taskRun.stopRequestedAtMillisecondsDeferred,
-    nowMilliseconds,
-  );
-  if (isFirstStop) {
-    yield* workerPool.stopTaskFiber(workerId, taskName);
-  }
-  const sinceStopRequested = Duration.millis(
-    nowMilliseconds - (yield* Deferred.await(taskRun.stopRequestedAtMillisecondsDeferred)),
-  );
   const cleanupDuration = discoveredTask.cleanupDuration;
-  const awaitBodyFinished = Effect.gen(function* () {
-    const isBeforeNotice = Duration.isLessThan(sinceStopRequested, STILL_STOPPING_NOTICE_AFTER);
-    if (!isBeforeNotice) {
-      return yield* Deferred.await(taskRun.bodyFinishedDeferred);
-    }
-    const finishedBeforeNotice = yield* Deferred.await(taskRun.bodyFinishedDeferred).pipe(
-      Effect.timeoutOption(Duration.subtract(STILL_STOPPING_NOTICE_AFTER, sinceStopRequested)),
+  const cleanupMilliseconds = Duration.toMillis(cleanupDuration);
+  const notAnsweredReason = `because it did not answer the stop of "${taskName}" within ${Duration.format(cleanupDuration)}`;
+  const failPastLimit = (
+    terminationReason: string,
+    failure: TaskCleanupNotStarted | TaskCleanupTimedOut,
+  ) =>
+    workerPool
+      .requestWorkerTermination(workerId, terminationReason, taskName)
+      .pipe(
+        Effect.andThen(processGroups.killForTask(taskName)),
+        Effect.andThen(failCleanup(taskRunsState, failure)),
+      );
+  const watchWorker = watchUntilStopsEnd(
+    watchWorkerOfCleanupPastItsLimit(taskRunsState, taskName, workerId, cleanupDuration),
+  );
+  const act = (action: ReturnType<typeof moveTaskStopStage>[1]) =>
+    ({
+      none: Effect.void,
+      sendStop: workerPool.stopTaskFiber(workerId, taskName),
+      failNotAnswered: failPastLimit(
+        notAnsweredReason,
+        new TaskCleanupNotStarted({ taskName, cleanupMilliseconds }),
+      ),
+      failStillLoading: failPastLimit(
+        `because it did not stop loading "${taskName}" within ${Duration.format(cleanupDuration)}`,
+        new TaskCleanupNotStarted({ taskName, cleanupMilliseconds }),
+      ),
+      failTimedOutNotAnswered: failPastLimit(
+        notAnsweredReason,
+        new TaskCleanupTimedOut({ taskName, cleanupMilliseconds }),
+      ),
+      failTimedOutAndWatch: processGroups
+        .killForTask(taskName)
+        .pipe(
+          Effect.andThen(
+            failCleanup(taskRunsState, new TaskCleanupTimedOut({ taskName, cleanupMilliseconds })),
+          ),
+          Effect.andThen(watchWorker),
+        ),
+      watch: watchWorker,
+      interruptRequests: interruptDependencyRequests(taskRun),
+    })[action];
+  const nowMilliseconds = yield* Clock.currentTimeMillis;
+  const [stage, requestAction] = yield* taskRun.stop.move(
+    TaskStopEvent.cases.RequestStop.make({ stopRequestedAtMilliseconds: nowMilliseconds }),
+  );
+  yield* act(requestAction);
+  const stopRequestedAtMilliseconds = findStopRequestedAt(stage);
+  if (stopRequestedAtMilliseconds !== null) {
+    const ended = yield* awaitBodyFinishedWithinLimit(
+      taskRun,
+      taskName,
+      cleanupDuration,
+      Duration.millis(nowMilliseconds - stopRequestedAtMilliseconds),
     );
-    if (Option.isSome(finishedBeforeNotice)) {
+    if (Option.isSome(ended)) {
       return;
     }
-    yield* printTaskLines(
-      "Warn",
-      taskName,
-      `still stopping after ${Duration.format(STILL_STOPPING_NOTICE_AFTER)}; ${TASK_PACKAGE.name} kills its commands and stops waiting for it when its ${Duration.format(cleanupDuration)} cleanup limit passes`,
-    );
-    yield* Deferred.await(taskRun.bodyFinishedDeferred);
-  });
-  const ended = yield* awaitBodyFinished.pipe(
-    Effect.timeoutOption(
-      Duration.max(Duration.subtract(cleanupDuration, sinceStopRequested), Duration.zero),
-    ),
-  );
-  if (Option.isSome(ended)) {
-    return;
   }
-
-  yield* Effect.uninterruptible(
-    Effect.gen(function* () {
-      const workerAnsweredStop = Deferred.isDoneUnsafe(taskRun.bodyCleanupStartedDeferred);
-      const isFirstToPassCleanupLimit = yield* Deferred.done(
-        taskRun.cleanupLimitPassedDeferred,
-        Exit.void,
-      );
-      if (isFirstToPassCleanupLimit) {
-        if (!workerAnsweredStop) {
-          yield* workerPool.requestWorkerTermination(
-            workerId,
-            `because it did not answer the stop of "${taskName}" within ${Duration.format(cleanupDuration)}`,
-          );
-        }
-        yield* processGroups.killForTask(taskName);
-        const cleanupMilliseconds = Duration.toMillis(cleanupDuration);
-        const cleanupStarted =
-          workerAnsweredStop || Deferred.isDoneUnsafe(taskRun.bodyFailedBeforeCleanupDeferred);
-        yield* failCleanup(
-          taskRunsState,
-          cleanupStarted
-            ? new TaskCleanupTimedOut({ taskName, cleanupMilliseconds })
-            : new TaskCleanupNotStarted({ taskName, cleanupMilliseconds }),
-        );
-      }
-      if (workerAnsweredStop) {
-        yield* watchUntilStopsEnd(
-          watchWorkerOfCleanupPastItsLimit(taskRunsState, taskName, workerId, cleanupDuration),
-        );
-      }
-    }),
+  yield* taskRun.stop.move(TaskStopEvent.cases.PassLimit.make({})).pipe(
+    Effect.flatMap(([, limitAction]) => act(limitAction)),
+    Effect.uninterruptible,
   );
 });

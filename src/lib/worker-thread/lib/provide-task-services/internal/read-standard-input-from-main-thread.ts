@@ -10,17 +10,17 @@ import type { WorkerState } from "../../../shared/provide-worker-state.ts";
 
 const pullOfStandardInputAnswer = (
   read: typeof StandardInputRead.Type,
-): Pull.Pull<Arrays.NonEmptyReadonlyArray<Uint8Array>, PlatformError> => {
-  if (StandardInputRead.guards.Chunks(read)) {
-    return Effect.succeed(read.chunks);
-  }
-  if (StandardInputRead.guards.Ended(read)) {
-    return Cause.done();
-  }
-  return Effect.fail(
-    systemError({ _tag: "Unknown", module: "Stdio", method: "stdin", description: read.reason }),
-  );
-};
+): Pull.Pull<Arrays.NonEmptyReadonlyArray<Uint8Array>, PlatformError> =>
+  StandardInputRead.match(read, {
+    Chunks: ({ chunks }) => Effect.succeed(chunks),
+    Ended: () => Cause.done(),
+    Failed: ({ reason }) =>
+      Effect.fail(
+        systemError({ _tag: "Unknown", module: "Stdio", method: "stdin", description: reason }),
+      ),
+    Refused: ({ rootTaskName, taskName }) =>
+      Effect.die(new StandardInputReadOutsideRootTask({ rootTaskName, taskName })),
+  });
 
 const readNextChunksFromMainThread = (taskName: string, workerState: WorkerState["Service"]) =>
   workerState.requestStandardInputRead(taskName).pipe(Effect.flatMap(pullOfStandardInputAnswer));

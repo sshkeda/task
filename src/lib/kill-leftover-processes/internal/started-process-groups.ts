@@ -1,7 +1,13 @@
 import { Effect } from "effect";
 
+import {
+  lifeStageOf,
+  moveProcessGroupStage,
+  ProcessGroupEvent,
+  ProcessGroupStage,
+} from "./define-process-group-stage.ts";
+import type { ListedIdentity } from "./define-process-group-stage.ts";
 import { listProcesses } from "./list-processes.ts";
-import type { isStillListedAs } from "./list-processes.ts";
 import { sendSignal } from "./send-signal.ts";
 
 export const startedProcessGroup = (
@@ -19,17 +25,21 @@ export const recordLeaderExit = (
   if (startedGroup === undefined) {
     return;
   }
-  if (latestMemberStartTime === null) {
-    startedProcessGroups.delete(processId);
-  } else {
+  const [next] = moveProcessGroupStage(
+    lifeStageOf(startedGroup),
+    ProcessGroupEvent.cases.ExitLeader.make({ latestMemberStartTime }),
+  );
+  if (ProcessGroupStage.guards.LeaderExited(next)) {
     startedProcessGroups.set(
       processId,
       startedProcessGroup(
         startedGroup.taskName,
         startedGroup.leaderStartTime,
-        latestMemberStartTime,
+        next.latestMemberStartTime,
       ),
     );
+  } else {
+    startedProcessGroups.delete(processId);
   }
 };
 
@@ -58,9 +68,10 @@ export const findStartedGroupWitness = (
   listedProcesses: Effect.Success<ReturnType<typeof listProcesses>>,
   processGroupId: number,
   startedGroup: Omit<ReturnType<typeof startedProcessGroup>, "taskName">,
-): Parameters<typeof isStillListedAs>[1] | null => {
-  const { leaderStartTime, latestMemberStartTimeAtLeaderExit } = startedGroup;
-  if (latestMemberStartTimeAtLeaderExit === null) {
+): typeof ListedIdentity.Type | null => {
+  const { leaderStartTime } = startedGroup;
+  const lifeStage = lifeStageOf(startedGroup);
+  if (!ProcessGroupStage.guards.LeaderExited(lifeStage)) {
     const leader = listedProcesses.get(processGroupId);
     const isTheLeaderTaskStarted =
       leader?.processGroupId === processGroupId && leader.startTime === leaderStartTime;
@@ -73,7 +84,7 @@ export const findStartedGroupWitness = (
       listedProcess.processGroupId === processGroupId &&
       !listedProcess.hasEnded &&
       orderOfStartTime(listedProcess.startTime) <=
-        orderOfStartTime(latestMemberStartTimeAtLeaderExit) &&
+        orderOfStartTime(lifeStage.latestMemberStartTime) &&
       (leaderStartTime === null ||
         orderOfStartTime(listedProcess.startTime) >= orderOfStartTime(leaderStartTime)),
   );

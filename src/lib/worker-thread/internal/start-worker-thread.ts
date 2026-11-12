@@ -3,7 +3,7 @@ import { parentPort } from "node:worker_threads";
 import * as BunCrypto from "@effect/platform-bun/BunCrypto";
 import * as BunServices from "@effect/platform-bun/BunServices";
 import * as BunStdio from "@effect/platform-bun/BunStdio";
-import { Layer, Effect, Exit, Stdio, Stream } from "effect";
+import { Cause, Layer, Effect, Exit, Stdio, Stream } from "effect";
 import { FetchHttpClient } from "effect/http";
 import { OtlpExporter, OtlpSerialization } from "effect/observability";
 import { RpcServer } from "effect/rpc";
@@ -41,7 +41,13 @@ export const startWorkerThread = () => {
         Effect.scoped,
         Effect.onExit((exit) =>
           endStandardOutput.pipe(
-            Effect.andThen(Effect.sync(() => process.exit(Exit.isSuccess(exit) ? 0 : 1))),
+            Effect.andThen(
+              Effect.sync(() => {
+                const isStoppedCleanly =
+                  Exit.isSuccess(exit) || Cause.hasInterruptsOnly(exit.cause);
+                process.exit(isStoppedCleanly ? 0 : 1);
+              }),
+            ),
           ),
         ),
         Effect.provide(BunStdio.layer),

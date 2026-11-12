@@ -54,7 +54,6 @@ const stopOnClosedPipe = (hangUpHeard: Deferred.Deferred<void>) =>
       yield* shutdown.requestStop("SIGPIPE");
     }
     const forcedOrHungUp = yield* shutdown.awaitForcedStop.pipe(
-      Effect.asVoid,
       Effect.raceFirst(Deferred.await(hangUpHeard)),
       Effect.timeoutOption(GRACE_AFTER_STANDARD_ERROR_CLOSED),
     );

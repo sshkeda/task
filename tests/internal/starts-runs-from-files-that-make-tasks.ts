@@ -362,3 +362,23 @@ console.log(\`imported \${build.name}\`);`,
     }),
   ),
 );
+
+export const entryFileThrows = makeTest(
+  "a file Bun starts that throws after making its default-exported task leaves Bun's own error and starts no run",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "tasks.ts": TASKS_FILE,
+        "main.ts": `import { build } from "./tasks.ts";
+export default build;
+throw new Error("entry file broke");`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.standardError).toContain("entry file broke");
+      expect(ran.standardError).not.toContain("[build]");
+      expect(ran.standardOutput).toBe("");
+      expect(ran.exitCode).toBe(1);
+      expect(yield* exists(`${project.directory}/build-ran`)).toBe(false);
+    }),
+  ),
+);

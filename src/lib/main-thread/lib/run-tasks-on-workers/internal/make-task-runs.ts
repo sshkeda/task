@@ -20,8 +20,10 @@ import {
   runRequestedTask,
   runRequestedDependencyTask,
 } from "../lib/run-requested-task-once/index.ts";
-import { makeTaskRunsState, TaskRunStatus } from "../shared/define-task-run-state.ts";
-import { stopTask } from "../shared/stop-task.ts";
+import { makeTaskRunsState } from "../shared/define-task-run-state.ts";
+import { isInBody, TaskRunOutcome, TaskRunStatus } from "../shared/define-task-run-status.ts";
+import { hasCleanupLimitPassed, TaskStopEvent } from "../shared/define-task-stop-stage.ts";
+import { interruptDependencyRequests, stopTask } from "../shared/stop-task.ts";
 import { handleWorkerEvent } from "./handle-worker-events.ts";
 
 export const makeTaskRuns = Effect.gen(function* () {
@@ -83,19 +85,27 @@ export const makeTaskRuns = Effect.gen(function* () {
       yield* stopState.begin;
       const unfinishedTaskNames = new Set(
         [...taskRunsByName]
-          .filter(
-            ([, taskRun]) =>
-              TaskRunStatus.guards.Preparing(taskRun.status) ||
-              TaskRunStatus.guards.Running(taskRun.status),
-          )
+          .filter(([, taskRun]) => TaskRunOutcome.guards.Pending(taskRun.outcome))
           .map(([taskName]) => taskName),
       );
       yield* FiberSet.clear(taskRunsState.taskFibers);
+      yield* Effect.forEach(
+        taskRunsByName.values(),
+        (taskRun) =>
+          taskRun.stop
+            .move(TaskStopEvent.cases.EndRun.make({}))
+            .pipe(
+              Effect.flatMap(([, action]) =>
+                action === "interruptRequests" ? interruptDependencyRequests(taskRun) : Effect.void,
+              ),
+            ),
+        { discard: true },
+      );
       const workerWatches = yield* FiberSet.make<void, never>();
       const unorderedStops = Array.from(taskRunsByName, ([taskName, taskRun]) => ({
         taskName,
         isServing: TaskRunStatus.guards.Serving(taskRun.status),
-        isCompleted: TaskRunStatus.guards.Passed(taskRun.status),
+        isCompleted: TaskRunOutcome.guards.Passed(taskRun.outcome),
         requestedTaskNames: taskRun.bodyRequestedTaskNames,
         stopped: Deferred.makeUnsafe<void>(),
       }));
@@ -222,12 +232,10 @@ export const makeTaskRuns = Effect.gen(function* () {
       }),
     findTaskNamesStillInBodyOrCleanup: Effect.sync(() =>
       [...taskRunsByName]
-        .filter(([, taskRun]) => {
-          const isBodyUnfinished =
-            Deferred.isDoneUnsafe(taskRun.bodyStartedAtMillisecondsDeferred) &&
-            !Deferred.isDoneUnsafe(taskRun.bodyFinishedDeferred);
-          return isBodyUnfinished && !Deferred.isDoneUnsafe(taskRun.cleanupLimitPassedDeferred);
-        })
+        .filter(
+          ([, taskRun]) =>
+            isInBody(taskRun.status) && !hasCleanupLimitPassed(taskRun.stop.readStage()),
+        )
         .map(([taskName]) => taskName),
     ),
     reportCleanupsCutOff: (taskNames: readonly string[]) =>
@@ -251,16 +259,16 @@ export const makeTaskRuns = Effect.gen(function* () {
           const taskRun = taskRunsByName.get(taskName);
           return (
             taskRun !== undefined &&
-            TaskRunStatus.guards.Failed(taskRun.status) &&
-            !taskRun.status.causedByAwaitedTasks
+            TaskRunOutcome.guards.Failed(taskRun.outcome) &&
+            !taskRun.outcome.causedByAwaitedTasks
           );
         }),
-        stopped: taskRuns.filter(([, taskRun]) => TaskRunStatus.guards.Cancelled(taskRun.status))
+        stopped: taskRuns.filter(([, taskRun]) => TaskRunOutcome.guards.Cancelled(taskRun.outcome))
           .length,
         unawaitedFailedTaskNames: taskRuns
           .filter(
             ([taskName, taskRun]) =>
-              TaskRunStatus.guards.Failed(taskRun.status) &&
+              TaskRunOutcome.guards.Failed(taskRun.outcome) &&
               !taskNamesWhoseFailureReachedAnAwaitingTask.has(taskName),
           )
           .map(([taskName]) => taskName),

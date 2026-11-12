@@ -17,6 +17,15 @@ const definitionsNotGiven = new WeakMap<
   { readonly given: string; readonly location: string | undefined }
 >();
 
+const listsMade = new WeakSet();
+
+export const recordListMade = <List extends WeakKey>(list: List) => {
+  listsMade.add(list);
+  return list;
+};
+
+export const isListMadeByThisCopy = (value: WeakKey) => listsMade.has(value);
+
 export const recordDefinitionNotGiven = (
   madeTask: Task,
   given: string,

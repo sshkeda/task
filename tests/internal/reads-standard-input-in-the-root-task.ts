@@ -307,3 +307,66 @@ export const readAfterInterruptedRead = makeTest(
     }),
   ),
 );
+
+export const readAfterEnd = makeTest(
+  "the root task reads standard input again after it ended and receives an ended stream at once",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect, Stdio, Stream } from "effect";
+import { Task } from "@sshkeda/task";
+export const hook = Task.make({ name: "hook", run: Effect.gen(function* () {
+  const stdio = yield* Stdio.Stdio;
+  const readAll = Stream.mkString(Stream.decodeText(stdio.stdin));
+  const first = yield* readAll;
+  yield* Effect.log(\`first read \${JSON.stringify(first)}\`);
+  const second = yield* readAll;
+  yield* Effect.log(\`second read \${JSON.stringify(second)}\`);
+}) });
+export default hook;`,
+      });
+      const ran = yield* runTaskProcess(
+        project,
+        "main.ts",
+        {},
+        project.directory,
+        [],
+        Stream.make(encodeText("once")),
+      );
+      expect(ran.standardError).toContain('[hook] first read "once"');
+      expect(ran.standardError).toContain('[hook] second read ""');
+      expect(ran.exitCode).toBe(0);
+    }),
+  ),
+);
+
+const CONCURRENT_INPUT = "every byte once";
+
+export const concurrentReads = makeTest(
+  "two fibers in the root task reading standard input at once share its bytes without losing or repeating any",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect, Stdio, Stream } from "effect";
+import { Task } from "@sshkeda/task";
+export const hook = Task.make({ name: "hook", run: Effect.gen(function* () {
+  const stdio = yield* Stdio.Stdio;
+  const readAll = Stream.mkString(Stream.decodeText(stdio.stdin));
+  const [first, second] = yield* Effect.all([readAll, readAll], { concurrency: "unbounded" });
+  yield* Effect.log(\`read \${first.length + second.length} characters\`);
+}) });
+export default hook;`,
+      });
+      const ran = yield* runTaskProcess(
+        project,
+        "main.ts",
+        {},
+        project.directory,
+        [],
+        Stream.make(encodeText(CONCURRENT_INPUT)),
+      );
+      expect(ran.standardError).toContain(`[hook] read ${CONCURRENT_INPUT.length} characters`);
+      expect(ran.exitCode).toBe(0);
+    }),
+  ),
+);

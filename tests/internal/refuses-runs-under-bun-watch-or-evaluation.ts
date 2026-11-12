@@ -7,7 +7,7 @@ import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
-const expectRefusedUnderBunWatchMode = (flag: string) =>
+const expectRefusedUnderBunWatchMode = (flag: string, runArguments: readonly string[] = []) =>
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -15,9 +15,15 @@ const expectRefusedUnderBunWatchMode = (flag: string) =>
 import { Task } from "@sshkeda/task";
 export default Task.make({ name: "main", run: Effect.promise(() => Bun.write("main-started", "")) });`,
       });
-      const ran = yield* runTaskProcess(project, "main.ts", {}, project.directory, [], "ignore", [
-        flag,
-      ]);
+      const ran = yield* runTaskProcess(
+        project,
+        "main.ts",
+        {},
+        project.directory,
+        runArguments,
+        "ignore",
+        [flag],
+      );
       expect(ran.standardError).toBe(
         `error RunCalledInBunWatchMode: @sshkeda/task doesn't run under bun ${flag}`,
       );
@@ -35,6 +41,11 @@ export const runUnderBunWatch = makeTest(
 export const runUnderBunHot = makeTest(
   "a file whose default export starts a run under bun --hot fails with RunCalledInBunWatchMode before any task starts",
   expectRefusedUnderBunWatchMode("--hot"),
+);
+
+export const helpUnderBunWatch = makeTest(
+  "asking for help under bun --watch fails with RunCalledInBunWatchMode instead of printing the flags",
+  expectRefusedUnderBunWatchMode("--watch", ["--help"]),
 );
 
 const expectRefusedUnderBunEvaluation = (flag: string, printedFlag: string) =>

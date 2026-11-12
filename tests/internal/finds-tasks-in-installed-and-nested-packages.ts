@@ -90,6 +90,61 @@ export default Task.make({ name: "main", run: Effect.andThen(runAll([lint]), che
   ),
 );
 
+const runWithALibraryCopy = (mainFile: string) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const repository = yield* REPOSITORY_DIRECTORY;
+    const project = yield* makeProject({
+      "library/package.json": yield* encodeJson({
+        name: "library",
+        type: "module",
+        dependencies: { "@sshkeda/task": "*" },
+      }),
+      "library/tasks.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const other = Task.make({ name: "other", run: Effect.log("other ran") });`,
+      "main.ts": mainFile,
+    });
+    const secondCopy = `${project.directory}/library/node_modules/@sshkeda/task`;
+    yield* fileSystem.makeDirectory(secondCopy, { recursive: true });
+    yield* fileSystem.copy(`${repository}/src`, `${secondCopy}/src`);
+    yield* fileSystem.copyFile(`${repository}/package.json`, `${secondCopy}/package.json`);
+    yield* fileSystem.symlink(`${repository}/node_modules`, `${secondCopy}/node_modules`);
+    return yield* runTaskProcess(project, "main.ts");
+  });
+
+export const exportsATaskOfAnotherCopy = makeTest(
+  "a file whose default export is a task runs it when it also exports a task made with a library's own copy of the task package",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const ran = yield* runWithALibraryCopy(`import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export { other } from "./library/tasks.ts";
+export default Task.make({ name: "main", run: Effect.log("main ran") });`);
+      expect(ran.standardError).toContain("[main] main ran");
+      expect(ran.standardError).not.toContain("DefaultExportNotRunnable");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+    }),
+  ),
+);
+
+export const listsBesideAnotherCopy = makeTest(
+  "a file whose default export is a Task.all() list starts one run when a library it imports makes tasks with its own copy of the task package",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const ran = yield* runWithALibraryCopy(`import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+import "./library/tasks.ts";
+const build = Task.make({ name: "build", run: Effect.log("build ran") });
+export default Task.all([build]);`);
+      expect(
+        ran.standardError.split("\n").filter((line) => line === "[build] build ran"),
+      ).toHaveLength(1);
+      expect(ran.exitCode, ran.standardError).toBe(0);
+    }),
+  ),
+);
+
 export const installedFilesNeverLoaded = makeTest(
   "a task runs when an installed package it imports holds a file that does not parse and is never loaded",
   Effect.scoped(
