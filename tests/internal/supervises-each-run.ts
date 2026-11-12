@@ -3,7 +3,7 @@ import { expect } from "bun:test";
 import { Task } from "@sshkeda/task";
 import { Effect, Queue, Ref, Schedule, Schema, Stream } from "effect";
 
-import { exists, read } from "../shared/access-files.ts";
+import { exists, read, write } from "../shared/access-files.ts";
 import {
   EXIT_CODE_AFTER_SIGHUP,
   EXIT_CODE_AFTER_SIGINT,
@@ -19,6 +19,7 @@ import {
   runTaskProcess,
   startTaskProcess,
 } from "../shared/run-task-processes.ts";
+import { startTerminalCommand } from "../shared/start-terminal-commands.ts";
 
 const RUN_AND_SPAWNED_PROCESS_ID_COUNT = 2;
 
@@ -56,6 +57,37 @@ const STOPPING_AFTER_A_HANGUP = "stopping, send SIGTERM or press ctrl-c to force
 
 const SLOW_LOADING_SERVER = `console.error(\`loading \${process.pid}\`);
 await Bun.sleep(1000);
+${SPAWNING_SERVER("spawned")}`;
+
+const RECORDING_STOPS_UNTIL_GO = `import { appendFileSync, existsSync } from "node:fs";
+const isRunProcess = Bun.main.endsWith("start-the-run.ts");
+if (Bun.isMainThread) {
+  for (const signal of ["SIGINT", "SIGTERM"]) {
+    process.on(signal, () => {
+      if (isRunProcess) {
+        appendFileSync("received", \`\${signal}\\n\`);
+      } else {
+        console.error(\`supervisor got \${signal}\`);
+      }
+    });
+  }
+  if (isRunProcess) {
+    console.error(\`starting \${process.pid}\`);
+    while (!existsSync("go")) {
+      Bun.sleepSync(50);
+    }
+  }
+}`;
+
+const REFUSING_TO_CONTINUE = `if (import.meta.main) {
+  const kill = process.kill.bind(process);
+  process.kill = (processId, signal) => {
+    if (signal === "SIGCONT" && processId !== process.pid) {
+      throw Object.assign(new Error("continue refused"), { code: "EINVAL" });
+    }
+    return kill(processId, signal);
+  };
+}
 ${SPAWNING_SERVER("spawned")}`;
 
 const LAUNCHER = (
@@ -131,25 +163,15 @@ const startOnTerminal = (
     const screen = yield* Ref.make("");
     const decoder = new TextDecoder();
     const environment = yield* makeTaskProcessEnvironment(project, { PS1: "$ ", ENV: "" });
-    const started = yield* Effect.acquireRelease(
-      Effect.sync(() =>
-        Bun.spawn([...command], {
-          cwd: project.directory,
-          env: environment,
-          terminal: {
-            data: (_terminal, data) => {
-              Queue.offerUnsafe(chunks, decoder.decode(data, { stream: true }));
-            },
-          },
-        }),
-      ),
-      (subprocess) =>
-        Effect.promise(() => {
-          subprocess.kill("SIGKILL");
-          subprocess.terminal?.close();
-          return subprocess.exited;
-        }),
-    );
+    const started = yield* startTerminalCommand(command, {
+      workingDirectory: project.directory,
+      environment,
+      terminal: {
+        data: (_terminal, data) => {
+          Queue.offerUnsafe(chunks, decoder.decode(data, { stream: true }));
+        },
+      },
+    });
     const takeUntilShown = (wanted: RegExp) =>
       Stream.fromEffectRepeat(Queue.take(chunks)).pipe(
         Stream.mapEffect((chunk) => Ref.updateAndGet(screen, (text) => text + chunk)),
@@ -295,6 +317,65 @@ export const terminalSuspend = makeTest(
       yield* terminal.waitFor(/exit 130\r\n/u);
       yield* terminal.type("exit\n");
       yield* terminal.exited;
+      for (const processId of started) {
+        yield* waitUntilEnded(processId);
+      }
+    }),
+  ),
+);
+
+export const stopsInOrderBeforeReady = makeTest(
+  "SIGINT then SIGTERM to a run whose process is still starting are held until it is ready, and the run never receives SIGTERM before SIGINT",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "bunfig.toml": 'preload = ["./record-stops.ts"]\n',
+        "record-stops.ts": RECORDING_STOPS_UNTIL_GO,
+        "main.ts": SPAWNING_SERVER("spawned"),
+      });
+      const command = yield* startTaskProcess(project, "main.ts");
+      const [starting] = yield* decodeProcessId(
+        parseProcessIds(yield* command.waitForLine("starting")),
+      );
+      yield* killWhenDone([starting]);
+      yield* command.sendSignal("INT");
+      yield* command.waitForLine("supervisor got SIGINT");
+      yield* command.sendSignal("TERM");
+      yield* command.waitForLine("supervisor got SIGTERM");
+      yield* write(`${project.directory}/go`, "");
+      const exited = yield* command.waitForExit;
+      const received = yield* read(`${project.directory}/received`);
+      const endedOnSigterm = exited.exitCode === EXIT_CODE_AFTER_SIGTERM;
+      expect(received).toBe(endedOnSigterm ? "SIGINT\nSIGTERM\n" : received);
+      expect(["SIGINT\n", "SIGINT\nSIGTERM\n"]).toContain(received);
+      expect(endedOnSigterm ? EXIT_CODE_AFTER_SIGTERM : EXIT_CODE_AFTER_SIGINT).toBe(
+        exited.exitCode,
+      );
+      expect(exited.standardError).toEndWith(
+        `StopRequested: received ${endedOnSigterm ? "SIGTERM" : "SIGINT"}`,
+      );
+      yield* waitUntilEnded(starting);
+    }),
+  ),
+);
+
+export const continueRefused = makeTest(
+  "a supervisor that fails to continue the run's processes after SIGTSTP and SIGCONT prints the failure, exits 1 and kills the run's stopped processes",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({ "main.ts": REFUSING_TO_CONTINUE });
+      const command = yield* startTaskProcess(project, "main.ts");
+      const started = parseProcessIds(yield* command.waitForLine("[main] run"));
+      yield* killWhenDone(started);
+      expect(started).toHaveLength(RUN_AND_SPAWNED_PROCESS_ID_COUNT);
+      yield* Effect.sync(() => process.kill(command.processId, "SIGTSTP"));
+      for (const processId of [...started, command.processId]) {
+        yield* pollProcessState(processId, isStopped);
+      }
+      yield* Effect.sync(() => process.kill(command.processId, "SIGCONT"));
+      const exited = yield* command.waitForExit;
+      expect(exited.exitCode).toBe(1);
+      expect(exited.standardError).toContain("ProcessNotSignaled");
       for (const processId of started) {
         yield* waitUntilEnded(processId);
       }

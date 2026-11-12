@@ -1,5 +1,5 @@
-import { Cause, Deferred, Effect, Exit, FiberSet, Option, Schema } from "effect";
-import type { Fiber } from "effect";
+import { Cause, Clock, Deferred, Effect, Exit, FiberSet, Option, Ref } from "effect";
+import type { Fiber, Schema } from "effect";
 
 import {
   dieOnInvariantFailure,
@@ -14,41 +14,60 @@ import type {
   TaskCleanupFailed,
 } from "../../../../../shared/task-errors.ts";
 import type { findTasksMadeByRootTaskFile } from "../../../shared/find-tasks-made-by-root-task-file.ts";
+import type { WorkerTerminatedForAnotherTask } from "../../../shared/main-thread-errors.ts";
+import {
+  isOnWorker,
+  moveTaskRunOutcome,
+  moveTaskRunStatus,
+  TaskRunOutcome,
+  TaskRunEvent,
+  TaskRunOutcomeEvent,
+  TaskRunStatus,
+} from "./define-task-run-status.ts";
+import { hasCleanupStarted, moveTaskStopStage, TaskStopStage } from "./define-task-stop-stage.ts";
+import type { TaskStopEvent } from "./define-task-stop-stage.ts";
 import { makeStopwatch } from "./make-stopwatch.ts";
 import { makeRootTaskStandardInput } from "./share-standard-input-with-root-task.ts";
 
-export const TaskRunStatus = Schema.TaggedUnion({
-  Preparing: {},
-  Running: { workerId: Schema.Int },
-  Serving: { workerId: Schema.Int },
-  Closed: { workerId: Schema.Int },
-  Passed: { workerId: Schema.Int },
-  Failed: {
-    workerId: Schema.NullOr(Schema.Int),
-    causedByAwaitedTasks: Schema.Boolean,
-  },
-  Cancelled: { workerId: Schema.NullOr(Schema.Int) },
-});
+const makeTaskStop = () => {
+  const stage = Ref.makeUnsafe<typeof TaskStopStage.Type>(TaskStopStage.cases.NotAsked.make({}));
+  const cleanupStartedDeferred = Deferred.makeUnsafe<void>();
+  return {
+    readStage: () => Ref.getUnsafe(stage),
+    awaitCleanupStarted: Deferred.await(cleanupStartedDeferred),
+    move: (event: typeof TaskStopEvent.Type) =>
+      Ref.modify(stage, (current) => {
+        const moved = moveTaskStopStage(current, event);
+        return [moved, moved[0]];
+      }).pipe(
+        Effect.tap(([next]) =>
+          hasCleanupStarted(next) ? Deferred.done(cleanupStartedDeferred, Exit.void) : Effect.void,
+        ),
+        Effect.uninterruptible,
+      ),
+  };
+};
 
 export const makeTaskRun = (initial: {
   readonly status: typeof TaskRunStatus.Type;
-  readonly stepBeforeBody: string | null;
+  readonly outcome: typeof TaskRunOutcome.Type;
 }) => ({
   ...initial,
   awaitedTaskNames: new Array<string>(),
   requestFibersByDependencyRequestId: new Map<number, Fiber.Fiber<unknown, unknown>>(),
+  dependencyRequestIdsAwaitingAnswer: new Set<number>(),
   bodyRequestedTaskNames: new Set<string>(),
   bodyWaitingOnRequestedTasks: makeStopwatch(),
   bodyOutcomeDeferred: Deferred.makeUnsafe<
     typeof TaskEvent.cases.TaskFiberServed.Type | typeof TaskFiberResult.cases.Returned.Type,
-    TaskBodyFailed | TaskCleanupFailed | WorkerExited | typeof AwaitedTasksFailure.Type
+    | TaskBodyFailed
+    | TaskCleanupFailed
+    | WorkerExited
+    | WorkerTerminatedForAnotherTask
+    | typeof AwaitedTasksFailure.Type
   >(),
-  bodyLoadingDeferred: Deferred.makeUnsafe<void>(),
   bodyStartedAtMillisecondsDeferred: Deferred.makeUnsafe<number>(),
-  bodyCleanupStartedDeferred: Deferred.makeUnsafe<void>(),
-  bodyFailedBeforeCleanupDeferred: Deferred.makeUnsafe<void>(),
-  stopRequestedAtMillisecondsDeferred: Deferred.makeUnsafe<number>(),
-  cleanupLimitPassedDeferred: Deferred.makeUnsafe<void>(),
+  stop: makeTaskStop(),
   bodyFinishedDeferred: Deferred.makeUnsafe<void>(),
 });
 
@@ -56,12 +75,10 @@ export const findAssignedWorkerId = (status: typeof TaskRunStatus.Type) =>
   "workerId" in status ? status.workerId : null;
 
 export const isUnfinishedOnWorker = (taskRun: ReturnType<typeof makeTaskRun>, workerId: number) =>
-  findAssignedWorkerId(taskRun.status) === workerId &&
-  !Deferred.isDoneUnsafe(taskRun.bodyFinishedDeferred);
+  isOnWorker(taskRun.status) && taskRun.status.workerId === workerId;
 
-const isServingStatus = TaskRunStatus.isAnyOf(["Serving"]);
-
-const isServing = (taskRun: ReturnType<typeof makeTaskRun>) => isServingStatus(taskRun.status);
+const isServing = (taskRun: ReturnType<typeof makeTaskRun>) =>
+  TaskRunStatus.guards.Serving(taskRun.status);
 
 const isOccupyingWorker = (taskRun: ReturnType<typeof makeTaskRun>) =>
   !isServing(taskRun) && taskRun.requestFibersByDependencyRequestId.size === 0;
@@ -92,16 +109,28 @@ export const countWorkerLoad = (
   occupyingTaskCount: unfinishedTaskRunsOnWorker.filter((taskRun) => isOccupyingWorker(taskRun))
     .length,
   servingTaskCount: unfinishedTaskRunsOnWorker.filter((taskRun) => isServing(taskRun)).length,
-  unfinishedTaskCount: unfinishedTaskRunsOnWorker.length,
 });
 
-export const formatTaskRunStatusForTrace = (status: typeof TaskRunStatus.Type) =>
-  TaskRunStatus.guards.Preparing(status) ? "running" : status._tag.toLowerCase();
+const formatServedForTrace = (status: typeof TaskRunStatus.Type) =>
+  TaskRunStatus.guards.Closed(status) ? "closed" : "serving";
+
+export const formatTaskRunForTrace = (taskRun: {
+  readonly status: typeof TaskRunStatus.Type;
+  readonly outcome: typeof TaskRunOutcome.Type;
+}) =>
+  TaskRunOutcome.match(taskRun.outcome, {
+    Pending: () => "running",
+    Served: () => formatServedForTrace(taskRun.status),
+    Passed: () => "passed",
+    Failed: () => "failed",
+    Cancelled: () => "cancelled",
+  });
 
 const withReadOnlyStatus = (
   taskRun: ReturnType<typeof makeTaskRun>,
-): Omit<ReturnType<typeof makeTaskRun>, "status"> & {
+): Omit<ReturnType<typeof makeTaskRun>, "outcome" | "status"> & {
   readonly status: typeof TaskRunStatus.Type;
+  readonly outcome: typeof TaskRunOutcome.Type;
 } => taskRun;
 
 const requireAssignedWorkerId = (taskName: string, status: typeof TaskRunStatus.Type) => {
@@ -116,6 +145,8 @@ const requireAssignedWorkerId = (taskName: string, status: typeof TaskRunStatus.
     : Effect.succeed(workerId);
 };
 
+const hasBodyFinished = TaskRunStatus.isAnyOf(["Closed", "Finished"]);
+
 export const makeTaskRunsState = Effect.gen(function* () {
   const discoveredTasksByName: Effect.Success<ReturnType<typeof findTasksMadeByRootTaskFile>> =
     new Map();
@@ -127,6 +158,31 @@ export const makeTaskRunsState = Effect.gen(function* () {
   > = taskRunsByName;
   const taskNamesAssignedToWorker = new Map<number, Set<string>>();
   const workerLoad = { changed: Deferred.makeUnsafe<void>() };
+  const moveTaskRun = (taskName: string, event: typeof TaskRunEvent.Type) =>
+    Effect.gen(function* () {
+      const taskRun = taskRunsByName.get(taskName);
+      if (taskRun === undefined) {
+        return "ignored" as const;
+      }
+      const [next, action] = moveTaskRunStatus(taskRun.status, event);
+      taskRun.status = next;
+      if (action === "recordBodyStart") {
+        yield* Deferred.succeed(
+          taskRun.bodyStartedAtMillisecondsDeferred,
+          yield* Clock.currentTimeMillis,
+        );
+      }
+      if (hasBodyFinished(next)) {
+        yield* Deferred.done(taskRun.bodyFinishedDeferred, Exit.void);
+      }
+      return action;
+    }).pipe(Effect.uninterruptible);
+  const moveOutcome = (taskName: string, event: typeof TaskRunOutcomeEvent.Type) => {
+    const taskRun = taskRunsByName.get(taskName);
+    if (taskRun !== undefined) {
+      taskRun.outcome = moveTaskRunOutcome(taskRun.outcome, event)[0];
+    }
+  };
   return {
     discoveredTasksByName,
     taskNamesWhoseFailureReachedAnAwaitingTask,
@@ -139,17 +195,16 @@ export const makeTaskRunsState = Effect.gen(function* () {
     createRecord: (taskName: string) => {
       const taskRun = makeTaskRun({
         status: TaskRunStatus.cases.Preparing.make({}),
-        stepBeforeBody: null,
+        outcome: TaskRunOutcome.cases.Pending.make({}),
       });
       taskRunsByName.set(taskName, taskRun);
       return withReadOnlyStatus(taskRun);
     },
+    moveTaskRun,
     recordWorkerAssignment: (taskName: string, workerId: number) =>
       Effect.gen(function* () {
-        const taskRun = taskRunsByName.get(taskName);
-        const isNotAwaitingWorker =
-          taskRun === undefined || !TaskRunStatus.guards.Preparing(taskRun.status);
-        if (isNotAwaitingWorker) {
+        const action = yield* moveTaskRun(taskName, TaskRunEvent.cases.Assign.make({ workerId }));
+        if (action === "ignored") {
           return yield* Effect.die(
             new InternalInvariantBroken({
               area: "task lifecycle",
@@ -157,7 +212,6 @@ export const makeTaskRunsState = Effect.gen(function* () {
             }),
           );
         }
-        taskRun.status = TaskRunStatus.cases.Running.make({ workerId });
         const assignedTaskNames = taskNamesAssignedToWorker.get(workerId) ?? new Set();
         taskNamesAssignedToWorker.set(workerId, assignedTaskNames.add(taskName));
       }),
@@ -189,75 +243,45 @@ export const makeTaskRunsState = Effect.gen(function* () {
         nowMilliseconds,
       );
     },
-    markServing: (taskName: string) => {
-      const taskRun = taskRunsByName.get(taskName);
-      if (taskRun === undefined) {
-        return;
-      }
-      if (TaskRunStatus.guards.Running(taskRun.status)) {
-        taskRun.status = TaskRunStatus.cases.Serving.make({
-          workerId: taskRun.status.workerId,
-        });
-      }
-    },
-    markClosed: (taskName: string) => {
-      const taskRun = taskRunsByName.get(taskName);
-      if (taskRun === undefined) {
-        return false;
-      }
-      if (!TaskRunStatus.guards.Serving(taskRun.status)) {
-        return false;
-      }
-      taskRun.status = TaskRunStatus.cases.Closed.make({
-        workerId: taskRun.status.workerId,
-      });
-      return true;
-    },
+    markServed: (taskName: string) =>
+      Effect.sync(() => {
+        moveOutcome(taskName, TaskRunOutcomeEvent.cases.Serve.make({}));
+      }),
     markPassed: (taskName: string) =>
       Effect.gen(function* () {
         const taskRun = taskRunsByName.get(taskName);
         if (taskRun !== undefined) {
-          taskRun.status = TaskRunStatus.cases.Passed.make({
-            workerId: yield* requireAssignedWorkerId(taskName, taskRun.status),
-          });
+          yield* requireAssignedWorkerId(taskName, taskRun.status);
+          moveOutcome(taskName, TaskRunOutcomeEvent.cases.Pass.make({}));
         }
       }),
     markEndedFromExit: (
       taskName: string,
       taskExit: Exit.Exit<Schema.Json | undefined, unknown>,
     ) => {
-      const taskRun = taskRunsByName.get(taskName);
-      const isNotEndingFromFailure =
-        taskRun === undefined ||
-        (!TaskRunStatus.guards.Preparing(taskRun.status) &&
-          !TaskRunStatus.guards.Running(taskRun.status)) ||
-        !Exit.isFailure(taskExit);
-      if (isNotEndingFromFailure) {
+      if (Exit.isSuccess(taskExit)) {
         return;
       }
-      const workerId = findAssignedWorkerId(taskRun.status);
       if (Cause.hasInterruptsOnly(taskExit.cause)) {
-        taskRun.status = TaskRunStatus.cases.Cancelled.make({ workerId });
+        moveOutcome(taskName, TaskRunOutcomeEvent.cases.Cancel.make({}));
         return;
       }
-      const failure = Cause.findErrorOption(taskExit.cause);
-      taskRun.status = TaskRunStatus.cases.Failed.make({
-        workerId,
-        causedByAwaitedTasks: Option.exists(failure, isAwaitedTasksFailure),
-      });
+      moveOutcome(
+        taskName,
+        TaskRunOutcomeEvent.cases.FailOnExit.make({
+          causedByAwaitedTasks: Option.exists(
+            Cause.findErrorOption(taskExit.cause),
+            isAwaitedTasksFailure,
+          ),
+        }),
+      );
     },
     recordFailureReachedAwaitingTask: (taskName: string) => {
       taskNamesWhoseFailureReachedAnAwaitingTask.add(taskName);
     },
     markFailed: (taskName: string) =>
       Effect.sync(() => {
-        const taskRun = taskRunsByName.get(taskName);
-        if (taskRun !== undefined) {
-          taskRun.status = TaskRunStatus.cases.Failed.make({
-            workerId: findAssignedWorkerId(taskRun.status),
-            causedByAwaitedTasks: false,
-          });
-        }
+        moveOutcome(taskName, TaskRunOutcomeEvent.cases.Fail.make({}));
       }),
   };
 });

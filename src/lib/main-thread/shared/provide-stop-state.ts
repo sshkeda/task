@@ -1,4 +1,4 @@
-import { Context, Deferred, Effect, Exit, Layer, Schema } from "effect";
+import { Context, Deferred, Effect, Exit, Layer, Ref } from "effect";
 import type { Cause } from "effect";
 
 import {
@@ -6,83 +6,45 @@ import {
   formatFailureReasonLine,
 } from "../../../shared/format-error-lines.ts";
 import { holdTaskLogsDuring, makeTaskLogHold } from "../../../shared/hold-task-logs.ts";
-import type { StandardErrorWriteFailed } from "../../../shared/print-to-standard-error.ts";
-import type { WorkerExited } from "../../../shared/process-errors.ts";
 import type { STOP_REASONS } from "../../../shared/stop-signals.ts";
-import type {
-  ServedTaskFailed,
-  TaskBodyFailed,
-  TaskCleanupFailed,
-  TaskSetupTimedOut,
-  TaskTimedOut,
-} from "../../../shared/task-errors.ts";
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
-import type {
-  AwaitedTaskFailed,
-  SettledTasksFailed,
-  TaskNotMadeWhileLoading,
-  TaskWaitsOnItself,
-} from "../../errors/index.ts";
-import type { killAllProcessGroups } from "../../kill-leftover-processes/index.ts";
+import {
+  findFirstFailure,
+  moveRunStopStage,
+  RunStopEvent,
+  RunStopStage,
+} from "./define-run-stop-stage.ts";
+import type { RunFailure } from "./define-run-stop-stage.ts";
 import { findFailureReason } from "./find-failure-reason.ts";
-import { FailureReasonNotFormatted, StopRequested } from "./main-thread-errors.ts";
-import type {
-  BrokenTasksFound,
-  ServingTaskRequestsItself,
-  TaskCleanupCutOff,
-  TaskCleanupFrozeWorker,
-  TaskCleanupNotStarted,
-  TaskCleanupTimedOut,
-} from "./main-thread-errors.ts";
-
-const isStopRequested = Schema.is(StopRequested);
+import { FailureReasonNotFormatted } from "./main-thread-errors.ts";
 
 const makeShutdown = Effect.gen(function* () {
-  const shutdownStartedDeferred = yield* Deferred.make<void>();
-  const firstFailureDeferred = yield* Deferred.make<
-    | AwaitedTaskFailed
-    | BrokenTasksFound
-    | Effect.Error<ReturnType<typeof killAllProcessGroups>>
-    | ServedTaskFailed
-    | ServingTaskRequestsItself
-    | SettledTasksFailed
-    | StandardErrorWriteFailed
-    | StopRequested
-    | TaskBodyFailed
-    | TaskCleanupCutOff
-    | TaskCleanupFailed
-    | TaskCleanupFrozeWorker
-    | TaskCleanupNotStarted
-    | TaskCleanupTimedOut
-    | TaskNotMadeWhileLoading
-    | TaskSetupTimedOut
-    | TaskTimedOut
-    | TaskWaitsOnItself
-    | WorkerExited
-  >();
-  const awaitFailure = Deferred.await(firstFailureDeferred);
-
-  const forcedStopDeferred = yield* Deferred.make<Effect.Success<typeof awaitFailure>>();
-  const failedBeforeForcedStopDeferred = yield* Deferred.make<boolean>();
-  const forceStopWith = (failure: Effect.Success<typeof awaitFailure>) => {
-    const failedBeforeForcedStop = Deferred.isDoneUnsafe(firstFailureDeferred);
-    if (Deferred.doneUnsafe(forcedStopDeferred, Exit.succeed(failure))) {
-      Deferred.doneUnsafe(failedBeforeForcedStopDeferred, Exit.succeed(failedBeforeForcedStop));
-    }
-  };
-  const printedFailures = new Set<Effect.Success<typeof awaitFailure>>();
-  const failureCauseByTaskName = new Map<
-    string,
-    Cause.Cause<Effect.Success<typeof awaitFailure>>
-  >();
+  const stage = yield* Ref.make<typeof RunStopStage.Type>(RunStopStage.cases.Running.make({}));
+  const failed = yield* Deferred.make<typeof RunFailure.Type>();
+  const forced = yield* Deferred.make<void>();
+  const move = (event: typeof RunStopEvent.Type) =>
+    Effect.gen(function* () {
+      const [next, action] = yield* Ref.modify(stage, (current) => {
+        const moved = moveRunStopStage(current, event);
+        return [moved, moved[0]];
+      });
+      const firstFailure = findFirstFailure(next);
+      if (firstFailure !== null) {
+        yield* Deferred.succeed(failed, firstFailure);
+      }
+      if (RunStopStage.guards.Forced(next)) {
+        yield* Deferred.done(forced, Exit.void);
+      }
+      return action;
+    }).pipe(Effect.uninterruptible);
+  const awaitFailure = Deferred.await(failed);
+  const printedFailures = new Set<typeof RunFailure.Type>();
+  const failureCauseByTaskName = new Map<string, Cause.Cause<typeof RunFailure.Type>>();
   const taskLogHold = makeTaskLogHold();
   return {
     taskLogHold,
     holdTaskLogsDuring: holdTaskLogsDuring(taskLogHold),
-    recordTaskFailureCause: (
-      taskName: string,
-      cause: Cause.Cause<Effect.Success<typeof awaitFailure>>,
-    ) =>
+    recordTaskFailureCause: (taskName: string, cause: Cause.Cause<typeof RunFailure.Type>) =>
       Effect.sync(() => {
         if (!failureCauseByTaskName.has(taskName)) {
           failureCauseByTaskName.set(taskName, cause);
@@ -102,61 +64,31 @@ const makeShutdown = Effect.gen(function* () {
           Effect.succeed(`${failure._tag}: ${failure.message}`),
         ),
       ),
-    recordFirstFailure: (failure: Effect.Success<typeof awaitFailure>) =>
-      Deferred.succeed(firstFailureDeferred, failure),
-    recordPrintedFailure: (failure: Effect.Success<typeof awaitFailure>) =>
+    recordFirstFailure: (failure: typeof RunFailure.Type) =>
+      move(RunStopEvent.cases.Fail.make({ failure })).pipe(
+        Effect.map((action) => action === "reportFailure"),
+      ),
+    recordPrintedFailure: (failure: typeof RunFailure.Type) =>
       Effect.sync(() => {
         printedFailures.add(failure);
       }),
-    wasPrinted: (failure: Effect.Success<typeof awaitFailure>) =>
+    wasPrinted: (failure: typeof RunFailure.Type) =>
       Effect.sync(() => printedFailures.has(failure)),
     requestStop: (signal: (typeof STOP_REASONS)[number]) =>
-      Effect.sync(() => {
-        const stopRequested = new StopRequested({ signal });
-        const stopBecameFirstFailure =
-          !Deferred.isDoneUnsafe(shutdownStartedDeferred) &&
-          Deferred.doneUnsafe(firstFailureDeferred, Exit.succeed(stopRequested));
-        if (stopBecameFirstFailure) {
-          return true;
-        }
-        if (signal !== "SIGHUP") {
-          forceStopWith(stopRequested);
-        }
-        return false;
-      }),
-    forceStop: (failure: Effect.Success<typeof awaitFailure>) =>
-      Effect.sync(() => {
-        forceStopWith(failure);
-        Deferred.doneUnsafe(firstFailureDeferred, Exit.succeed(failure));
-      }),
-    begin: Effect.sync(() => {
-      Deferred.doneUnsafe(shutdownStartedDeferred, Exit.void);
-      return Deferred.isDoneUnsafe(firstFailureDeferred);
-    }),
-    isStopping: Effect.sync(
-      () =>
-        Deferred.isDoneUnsafe(shutdownStartedDeferred) ||
-        Deferred.isDoneUnsafe(firstFailureDeferred),
-    ),
-    hasFailed: Deferred.isDone(firstFailureDeferred),
+      move(RunStopEvent.cases.Signal.make({ signal })).pipe(
+        Effect.map((action) => action === "announceStop"),
+      ),
+    forceStop: (failure: typeof RunFailure.Type) =>
+      Effect.asVoid(move(RunStopEvent.cases.Force.make({ failure }))),
+    begin: Effect.asVoid(move(RunStopEvent.cases.BeginEnding.make({}))),
+    isStopping: Effect.map(Ref.get(stage), (current) => !RunStopStage.guards.Running(current)),
+    hasFailed: Effect.map(Ref.get(stage), (current) => findFirstFailure(current) !== null),
     awaitFailure,
-    awaitForcedStop: Deferred.await(forcedStopDeferred),
-    isForced: Deferred.isDone(forcedStopDeferred),
-    outcome: Effect.gen(function* () {
-      const firstFailure = Deferred.isDoneUnsafe(firstFailureDeferred)
-        ? yield* Deferred.await(firstFailureDeferred)
-        : null;
-      if (Deferred.isDoneUnsafe(forcedStopDeferred)) {
-        const forcedStop = yield* Deferred.await(forcedStopDeferred);
-        const isSignalAfterTaskFailure =
-          isStopRequested(forcedStop) &&
-          (yield* Deferred.await(failedBeforeForcedStopDeferred)) &&
-          firstFailure !== null &&
-          !isStopRequested(firstFailure);
-        return isSignalAfterTaskFailure ? firstFailure : forcedStop;
-      }
-      return firstFailure;
-    }),
+    awaitForcedStop: Deferred.await(forced),
+    isForced: Effect.map(Ref.get(stage), RunStopStage.guards.Forced),
+    outcome: Effect.map(Ref.get(stage), (current) =>
+      RunStopStage.guards.Forced(current) ? current.outcome : findFirstFailure(current),
+    ),
   };
 });
 

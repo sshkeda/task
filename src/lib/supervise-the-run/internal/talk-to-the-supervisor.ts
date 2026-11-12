@@ -9,6 +9,7 @@ import {
   TerminalCommandEnded,
   TerminalCommandId,
 } from "../../../shared/run-in-terminal.ts";
+import { STOP_SIGNALS } from "../../../shared/stop-signals.ts";
 
 export const ProcessGroupShared = Schema.Struct({
   processGroupId: Schema.Int,
@@ -23,6 +24,7 @@ export const ProcessGroupShared = Schema.Struct({
 
 export const SupervisorRpcs = RpcGroup.make(
   Rpc.make("ReportReady"),
+  Rpc.make("AcknowledgeStop", { payload: { signal: Schema.Literals(STOP_SIGNALS) } }),
   Rpc.make("ShareProcessGroup", { payload: ProcessGroupShared }),
   Rpc.make("RunInTerminal", { payload: TerminalCommand, success: TerminalCommandEnded }),
   Rpc.make("AwaitTerminalCommandExit", { payload: TerminalCommandId }),

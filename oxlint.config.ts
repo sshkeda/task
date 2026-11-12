@@ -13,12 +13,12 @@ export default lintConfig({
   "tests/shared/run-task-processes.ts": {
     allow: ["readsConfig", "spawnsCommands", "handlesEveryFailure"],
   },
-  "tests/internal/supervises-each-run.ts": { allow: ["spawnsCommands", "pollsWithADeadline"] },
+  "tests/internal/supervises-each-run.ts": { allow: ["pollsWithADeadline"] },
+  "tests/shared/start-terminal-commands.ts": { allow: ["spawnsCommands", "pollsWithADeadline"] },
   "tests/internal/terminates-leftover-process-groups.ts": {
     allow: ["pollsWithADeadline", "spawnsCommands"],
   },
   "tests/internal/kills-processes-that-leave-their-session.ts": { allow: ["pollsWithADeadline"] },
-  "tests/internal/passes-the-terminal-to-commands.ts": { allow: ["spawnsCommands"] },
   "src/lib/task/internal/run-root-task.ts": {
     allow: ["exitsTheProcess", "importsDynamically", "writesToTheTerminal", "handlesEveryFailure"],
   },
@@ -101,6 +101,9 @@ export default lintConfig({
     allow: ["handlesEveryFailure"],
   },
   "src/lib/worker-thread/internal/answer-main-thread-messages.ts": {
+    allow: ["handlesEveryFailure"],
+  },
+  "src/lib/supervise-the-run/internal/acknowledge-stops.ts": {
     allow: ["handlesEveryFailure"],
   },
   "src/lib/supervise-the-run/internal/complete-discarded-calls-once-sent.ts": {

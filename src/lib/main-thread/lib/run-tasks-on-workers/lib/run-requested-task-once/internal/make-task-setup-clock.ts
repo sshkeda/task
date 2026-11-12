@@ -1,4 +1,4 @@
-import { Cause, Clock, Deferred, Duration, Effect, Exit, Fiber, Option, Ref } from "effect";
+import { Cause, Clock, Duration, Effect, Exit, Fiber, Option, Ref } from "effect";
 
 import { TaskSetupTimedOut } from "../../../../../../../shared/task-errors.ts";
 import { failRun } from "../../../../../shared/fail-run.ts";
@@ -8,6 +8,7 @@ import type { StopState } from "../../../../../shared/provide-stop-state.ts";
 import { WorkerPool } from "../../../../../shared/provide-worker-pool.ts";
 import { findTaskNamesOccupyingWorker } from "../../../shared/define-task-run-state.ts";
 import type { makeTaskRunsState } from "../../../shared/define-task-run-state.ts";
+import { isInBody } from "../../../shared/define-task-run-status.ts";
 import { awaitWithinCountedLimit } from "./await-within-counted-limit.ts";
 
 const WORKER_ANSWERS_WITHIN_MILLISECONDS = 200;
@@ -39,9 +40,7 @@ export const makeTaskSetupClock = Effect.fn("makeTaskSetupClock")(function* (
         workerId,
       ).some((occupyingTaskName) => {
         const occupyingTaskRun = taskRunsState.runsByTaskName.get(occupyingTaskName);
-        const hasStartedBody =
-          occupyingTaskRun !== undefined &&
-          Deferred.isDoneUnsafe(occupyingTaskRun.bodyStartedAtMillisecondsDeferred);
+        const hasStartedBody = occupyingTaskRun !== undefined && isInBody(occupyingTaskRun.status);
         return occupyingTaskName !== taskName && hasStartedBody;
       });
       if (!isOccupiedByOtherTasks) {

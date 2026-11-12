@@ -2,6 +2,7 @@ import { Ref } from "effect";
 
 import { supervisorProcessId, supervisorRunMarker } from "./internal/watch-the-supervisor.ts";
 
+export { acknowledgeStops } from "./internal/acknowledge-stops.ts";
 export { reportReady } from "./internal/report-ready.ts";
 export {
   processGroupsSharedWithTheSupervisor,

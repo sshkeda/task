@@ -6,77 +6,113 @@ import { formatFailureLines } from "../../../shared/format-error-lines.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
 import { printLine } from "../../../shared/print-to-standard-error.ts";
 import type { RunMarker } from "../../../shared/run-marker.ts";
+import {
+  LeftoverProcessEvent,
+  LeftoverProcessStage,
+  moveLeftoverProcessStage,
+} from "./define-leftover-process-stage.ts";
+import {
+  lifeStageOf,
+  moveProcessGroupStage,
+  ProcessGroupEvent,
+  ProcessGroupStage,
+} from "./define-process-group-stage.ts";
 import { findDescendantProcessIds, findSessionProcessIds } from "./find-process-ids.ts";
-import { isStillListedAs, listProcesses } from "./list-processes.ts";
+import {
+  isStillListedAs,
+  listProcesses,
+  processGroupHasOnlyEndedMembers,
+} from "./list-processes.ts";
 import { findMarkedProcesses } from "./mark-run-processes.ts";
 import { ProcessNotKillable } from "./process-cleanup-errors.ts";
-import { sendSignal, signalUnlessReplaced } from "./send-signal.ts";
+import { sendSignal } from "./send-signal.ts";
 import { findStartedGroupWitness } from "./started-process-groups.ts";
 import type { startedProcessGroup } from "./started-process-groups.ts";
+
+const PROBE_SIGNAL = 0;
 
 const reportKilledProcesses = (
   reportedResults: readonly {
     readonly processId: number;
     readonly command: string;
     readonly ownerTaskName: string | null;
-    readonly result: "EPERM" | "ESRCH" | "sent";
+    readonly action: "reportKilled" | "reportNotKillable";
   }[],
 ) =>
-  Effect.gen(function* () {
-    for (const killResult of reportedResults) {
-      const startedBy = `started by ${killResult.ownerTaskName === null ? "no known task" : `"${killResult.ownerTaskName}"`}`;
-      yield* killResult.result === "sent"
-        ? printLine("Info", `killed ${killResult.processId} (${killResult.command}), ${startedBy}`)
-        : printLine(
-            "Error",
-            formatFailureLines(
-              new ProcessNotKillable({
-                processId: killResult.processId,
-                command: killResult.command,
-                ownerTaskName: killResult.ownerTaskName,
-              }),
-              null,
-            ),
-          );
-      yield* Effect.logInfo(
-        killResult.result === "sent" ? "process killed" : "process could not be killed",
-      ).pipe(
-        Effect.annotateLogs({
-          "process.pid": killResult.processId,
-          "process.executable.name": killResult.command,
-          ...(killResult.ownerTaskName === null
-            ? {}
-            : { [`${TASK_TRACE_LABEL_PREFIX}.task`]: killResult.ownerTaskName }),
-        }),
-      );
-    }
-  });
+  Effect.forEach(
+    reportedResults,
+    (killResult) =>
+      Effect.gen(function* () {
+        const isKilled = killResult.action === "reportKilled";
+        const startedBy = `started by ${killResult.ownerTaskName === null ? "no known task" : `"${killResult.ownerTaskName}"`}`;
+        yield* isKilled
+          ? printLine(
+              "Info",
+              `killed ${killResult.processId} (${killResult.command}), ${startedBy}`,
+            )
+          : printLine(
+              "Error",
+              formatFailureLines(
+                new ProcessNotKillable({
+                  processId: killResult.processId,
+                  command: killResult.command,
+                  ownerTaskName: killResult.ownerTaskName,
+                }),
+                null,
+              ),
+            );
+        yield* Effect.logInfo(isKilled ? "process killed" : "process could not be killed").pipe(
+          Effect.annotateLogs({
+            "process.pid": killResult.processId,
+            "process.executable.name": killResult.command,
+            ...(killResult.ownerTaskName === null
+              ? {}
+              : { [`${TASK_TRACE_LABEL_PREFIX}.task`]: killResult.ownerTaskName }),
+          }),
+        );
+      }),
+    { discard: true },
+  );
 
-const findLiveProcessGroups = Effect.fn("findLiveProcessGroups")(function* (
+const probeProcessGroups = Effect.fn("probeProcessGroups")(function* (
   taskName: string | null,
   selectedProcessGroups: ReadonlyMap<number, ReturnType<typeof startedProcessGroup>>,
+  sendSignalNow: typeof sendSignal,
 ) {
-  const liveProcessGroups = new Map<number, ReturnType<typeof startedProcessGroup>>();
-  const endedProcessGroupIds = new Set<number>();
-  for (const [processGroupId, startedGroup] of selectedProcessGroups) {
-    if ((yield* sendSignal(taskName, -processGroupId, 0)) === "sent") {
-      liveProcessGroups.set(processGroupId, startedGroup);
-    } else {
-      endedProcessGroupIds.add(processGroupId);
-    }
-  }
-  return { liveProcessGroups, endedProcessGroupIds };
+  return yield* Effect.forEach([...selectedProcessGroups], ([processGroupId, startedGroup]) =>
+    Effect.map(sendSignalNow(taskName, -processGroupId, PROBE_SIGNAL), (result) => ({
+      processGroupId,
+      startedGroup,
+      stage: moveProcessGroupStage(
+        lifeStageOf(startedGroup),
+        ProcessGroupEvent.cases.Probe.make({ result }),
+      )[0],
+    })),
+  );
 });
+
+const findEndedProcessGroupIds = (
+  groups: readonly {
+    readonly processGroupId: number;
+    readonly stage: typeof ProcessGroupStage.Type;
+  }[],
+) =>
+  new Set(
+    groups
+      .filter((group) => ProcessGroupStage.guards.Ended(group.stage))
+      .map((group) => group.processGroupId),
+  );
 
 const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(function* (input: {
   readonly startedProcessGroups: ReadonlyMap<number, ReturnType<typeof startedProcessGroup>>;
-  readonly liveProcessGroups: ReadonlyMap<number, ReturnType<typeof startedProcessGroup>>;
+  readonly probedGroups: Effect.Success<ReturnType<typeof probeProcessGroups>>;
   readonly ownsProcess: (ownerTaskName: string | null) => boolean;
   readonly taskName: string | null;
   readonly sessionId: number | null;
   readonly runMarker: typeof RunMarker.Type | null;
   readonly adoptingProcessId: number | null;
   readonly listProcessesNow: typeof listProcesses;
+  readonly sendSignalNow: typeof sendSignal;
   readonly claimProcessesToReport: (
     processes: readonly (typeof ProcessIdentity.Type)[],
   ) => Effect.Effect<readonly (typeof ProcessIdentity.Type)[]>;
@@ -93,18 +129,22 @@ const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(funct
       : findChildProcessIds([input.adoptingProcessId]).filter(
           (processId) => processId !== process.pid,
         );
-  const killableGroups = new Map<number, string>();
-  const groupWitnesses = new Map<number, Parameters<typeof isStillListedAs>[1]>();
-  const endedProcessGroupIds = new Set<number>();
-  for (const [group, startedGroup] of input.liveProcessGroups) {
-    const witness = findStartedGroupWitness(listedProcesses, group, startedGroup);
-    if (witness === null) {
-      endedProcessGroupIds.add(group);
-    } else {
-      killableGroups.set(group, startedGroup.taskName);
-      groupWitnesses.set(group, witness);
-    }
-  }
+  const witnessedGroups = input.probedGroups.map((group) => ({
+    ...group,
+    stage: moveProcessGroupStage(
+      group.stage,
+      ProcessGroupEvent.cases.FindWitness.make({
+        witness: ProcessGroupStage.guards.ProbedAlive(group.stage)
+          ? findStartedGroupWitness(listedProcesses, group.processGroupId, group.startedGroup)
+          : null,
+      }),
+    )[0],
+  }));
+  const killableGroups = new Map(
+    witnessedGroups
+      .filter((group) => ProcessGroupStage.guards.WitnessFound(group.stage))
+      .map((group) => [group.processGroupId, group.startedGroup.taskName] as const),
+  );
 
   const markedProcesses = yield* findMarkedProcesses(input.runMarker, listedProcesses.keys());
   const processIds = [
@@ -145,41 +185,103 @@ const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(funct
     [...new Set(processIds)].flatMap((processId) => {
       const row = processRows.get(processId);
       const ownerTaskName = findOwner(processId);
-      const isGoneOrNotOwned = row === undefined || !input.ownsProcess(ownerTaskName);
-      return isGoneOrNotOwned ? [] : [{ processId, row, ownerTaskName }];
+      const [stage] = moveLeftoverProcessStage(
+        LeftoverProcessStage.cases.Listed.make({}),
+        LeftoverProcessEvent.cases.Inspect.make({
+          isListed: row !== undefined,
+          isOwned: input.ownsProcess(ownerTaskName),
+        }),
+      );
+      const isOwnedAndListed = row !== undefined && LeftoverProcessStage.guards.Owned(stage);
+      return isOwnedAndListed ? [{ processId, row, ownerTaskName, stage }] : [];
     }),
     (leftover) =>
       Effect.gen(function* () {
         const command = yield* leftover.row.readCommandLineUnlessGone;
-        return command === null
-          ? []
-          : [
+        const [stage] = moveLeftoverProcessStage(
+          leftover.stage,
+          LeftoverProcessEvent.cases.ReadCommand.make({ hasCommand: command !== null }),
+        );
+        const hasReadCommand = command !== null && LeftoverProcessStage.guards.CommandRead(stage);
+        return hasReadCommand
+          ? [
               {
                 processId: leftover.processId,
                 startTime: leftover.row.startTime,
                 processGroupId: leftover.row.processGroupId,
                 command,
                 ownerTaskName: leftover.ownerTaskName,
+                stage,
               },
-            ];
+            ]
+          : [];
       }),
   )).flat();
-  const groupsStillStarted = yield* Effect.filter([...groupWitnesses], ([, witness]) =>
-    isStillListedAs(input.taskName, witness),
+  const recheckedGroups = yield* Effect.forEach(witnessedGroups, (group) =>
+    ProcessGroupStage.guards.WitnessFound(group.stage)
+      ? Effect.map(isStillListedAs(input.taskName, group.stage.witness), (isStillTheSame) => ({
+          ...group,
+          stage: moveProcessGroupStage(
+            group.stage,
+            ProcessGroupEvent.cases.Recheck.make({ isStillTheSame }),
+          )[0],
+        }))
+      : Effect.succeed(group),
   );
-  const killResults = yield* Effect.forEach(leftovers, (leftover) =>
-    Effect.map(signalUnlessReplaced(input.taskName, leftover, "SIGKILL"), (result) => ({
-      ...leftover,
-      result,
-    })),
+  const signalledLeftovers = yield* Effect.forEach(leftovers, (leftover) =>
+    Effect.gen(function* () {
+      const [rechecked] = moveLeftoverProcessStage(
+        leftover.stage,
+        LeftoverProcessEvent.cases.Recheck.make({
+          isStillTheSame: yield* isStillListedAs(input.taskName, leftover),
+        }),
+      );
+      if (!LeftoverProcessStage.guards.StillTheSame(rechecked)) {
+        return { ...leftover, stage: rechecked };
+      }
+      const result = yield* input.sendSignalNow(input.taskName, leftover.processId, "SIGKILL");
+      return {
+        ...leftover,
+        stage: moveLeftoverProcessStage(
+          rechecked,
+          LeftoverProcessEvent.cases.Signal.make({ result }),
+        )[0],
+      };
+    }),
   );
-  for (const [group] of groupsStillStarted) {
-    yield* sendSignal(input.taskName, -group, "SIGKILL");
-  }
-  for (const group of killableGroups.keys()) {
-    endedProcessGroupIds.add(group);
-  }
-  const signaledResults = killResults.filter((killResult) => killResult.result !== "ESRCH");
+  const killedGroups = yield* Effect.forEach(recheckedGroups, (group) =>
+    ProcessGroupStage.guards.StillTheSame(group.stage)
+      ? Effect.map(
+          input.sendSignalNow(input.taskName, -group.processGroupId, "SIGKILL"),
+          (result) => ({
+            ...group,
+            stage: moveProcessGroupStage(
+              group.stage,
+              ProcessGroupEvent.cases.KillGroup.make({ result }),
+            )[0],
+          }),
+        )
+      : Effect.succeed(group),
+  );
+  const checkedGroups = yield* Effect.forEach(killedGroups, (group) =>
+    ProcessGroupStage.guards.KillDenied(group.stage)
+      ? Effect.map(
+          processGroupHasOnlyEndedMembers(input.taskName, group.processGroupId),
+          (hasOnlyEndedMembers) => ({
+            ...group,
+            stage: moveProcessGroupStage(
+              group.stage,
+              ProcessGroupEvent.cases.CheckMembers.make({ hasOnlyEndedMembers }),
+            )[0],
+          }),
+        )
+      : Effect.succeed(group),
+  );
+  const signaledResults = signalledLeftovers.flatMap((leftover) =>
+    LeftoverProcessStage.guards.Signalled(leftover.stage)
+      ? [{ ...leftover, stage: leftover.stage }]
+      : [],
+  );
   const firstReportedProcessKeys = new Set(
     (yield* input.claimProcessesToReport(
       signaledResults.map((killResult) => ({
@@ -188,10 +290,17 @@ const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(funct
       })),
     )).map((identity) => processIdentityKey(identity)),
   );
-  const reportedResults = signaledResults.filter((killResult) =>
-    firstReportedProcessKeys.has(processIdentityKey(killResult)),
-  );
-  const killed = reportedResults.filter((killResult) => killResult.result === "sent");
+  const reportedResults = signaledResults.flatMap((killResult) => {
+    const [, action] = moveLeftoverProcessStage(
+      killResult.stage,
+      LeftoverProcessEvent.cases.Claim.make({
+        isFirstReport: firstReportedProcessKeys.has(processIdentityKey(killResult)),
+      }),
+    );
+    const isReported = action === "reportKilled" || action === "reportNotKillable";
+    return isReported ? [{ ...killResult, action }] : [];
+  });
+  const killed = reportedResults.filter((killResult) => killResult.action === "reportKilled");
   yield* Effect.annotateCurrentSpan({
     [`${TASK_TRACE_LABEL_PREFIX}.processes.killed`]: killed.length,
     [`${TASK_TRACE_LABEL_PREFIX}.processes.killed.executable_names`]: killed.map(
@@ -199,7 +308,7 @@ const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(funct
     ),
   });
   yield* reportKilledProcesses(reportedResults);
-  return endedProcessGroupIds;
+  return findEndedProcessGroupIds(checkedGroups);
 });
 
 export const forgetEndedProcessGroups =
@@ -218,27 +327,33 @@ export const killTaskProcessGroups = Effect.fn("killTaskProcessGroups")(function
     typeof terminateSelectedProcesses
   >[0]["claimProcessesToReport"],
   listProcessesNow: typeof listProcesses = listProcesses,
+  sendSignalNow: typeof sendSignal = sendSignal,
 ) {
   yield* Effect.annotateCurrentSpan(`${TASK_TRACE_LABEL_PREFIX}.task`, taskName);
-  const selectedProcessGroups = new Map(
-    [...startedProcessGroups].filter(([, startedGroup]) => startedGroup.taskName === taskName),
-  );
-  const { liveProcessGroups, endedProcessGroupIds } = yield* findLiveProcessGroups(
+  const probedGroups = yield* probeProcessGroups(
     taskName,
-    selectedProcessGroups,
+    new Map(
+      [...startedProcessGroups].filter(([, startedGroup]) => startedGroup.taskName === taskName),
+    ),
+    sendSignalNow,
   );
-  if (liveProcessGroups.size === 0) {
+  const endedProcessGroupIds = findEndedProcessGroupIds(probedGroups);
+  const liveGroups = probedGroups.filter((group) =>
+    ProcessGroupStage.guards.ProbedAlive(group.stage),
+  );
+  if (liveGroups.length === 0) {
     return endedProcessGroupIds;
   }
   const terminatedProcessGroupIds = yield* terminateSelectedProcesses({
     startedProcessGroups,
-    liveProcessGroups,
+    probedGroups: liveGroups,
     ownsProcess: (ownerTaskName) => ownerTaskName === taskName,
     taskName,
     sessionId: null,
     runMarker: null,
     adoptingProcessId: null,
     listProcessesNow,
+    sendSignalNow,
     claimProcessesToReport,
   });
   return new Set([...endedProcessGroupIds, ...terminatedProcessGroupIds]);
@@ -253,20 +368,18 @@ export const killAllProcessGroups = Effect.fn("killAllProcessGroups")(function* 
   runMarker: typeof RunMarker.Type | null,
   adoptingProcessId: number | null,
 ) {
-  const { liveProcessGroups, endedProcessGroupIds } = yield* findLiveProcessGroups(
-    null,
-    startedProcessGroups,
-  );
+  const probedGroups = yield* probeProcessGroups(null, startedProcessGroups, sendSignal);
   const terminatedProcessGroupIds = yield* terminateSelectedProcesses({
     startedProcessGroups,
-    liveProcessGroups,
+    probedGroups: probedGroups.filter((group) => ProcessGroupStage.guards.ProbedAlive(group.stage)),
     ownsProcess: () => true,
     taskName: null,
     sessionId,
     runMarker,
     adoptingProcessId,
     listProcessesNow: listProcesses,
+    sendSignalNow: sendSignal,
     claimProcessesToReport,
   });
-  return new Set([...endedProcessGroupIds, ...terminatedProcessGroupIds]);
+  return new Set([...findEndedProcessGroupIds(probedGroups), ...terminatedProcessGroupIds]);
 });

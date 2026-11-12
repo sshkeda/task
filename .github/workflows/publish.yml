@@ -17,4 +17,6 @@ jobs:
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-      - run: npm stage publish --provenance --access public
+      - name: Refuse a tag that isn't this package's version
+        run: test "v$(node -p "require('./package.json').version")" = "$GITHUB_REF_NAME"
+      - run: npm stage publish --provenance --access public --tag canary

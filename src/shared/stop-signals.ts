@@ -4,6 +4,8 @@ export const STOP_SIGNAL_NUMBERS = { SIGHUP: 1, SIGINT: 2, SIGTERM: 15 } as cons
 
 export const STOP_SIGNALS = Record.keys(STOP_SIGNAL_NUMBERS);
 
+export const JOB_CONTROL_SIGNALS = ["SIGCONT", "SIGTSTP"] as const;
+
 export const STOP_GRACE_PERIOD = Duration.fromInputUnsafe("5 seconds");
 
 export const STOP_REASON_NUMBERS = { ...STOP_SIGNAL_NUMBERS, SIGPIPE: 13 } as const;

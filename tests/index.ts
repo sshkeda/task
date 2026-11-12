@@ -19,7 +19,13 @@ import * as escapedProcesses from "./internal/kills-processes-that-leave-their-s
 import * as listConcurrency from "./internal/limits-list-concurrency.ts";
 import * as processListing from "./internal/lists-processes.ts";
 import * as packageFields from "./internal/matches-its-package-json.ts";
+import * as commandEnds from "./internal/owns-command-end-decisions.ts";
+import * as leftoverProcessTransitions from "./internal/owns-leftover-process-transitions.ts";
 import * as shutdownTransitions from "./internal/owns-shutdown-transitions.ts";
+import * as standardInputTransitions from "./internal/owns-standard-input-transitions.ts";
+import * as supervisorTransitions from "./internal/owns-supervisor-transitions.ts";
+import * as taskRunTransitions from "./internal/owns-task-run-transitions.ts";
+import * as workerLifeTransitions from "./internal/owns-worker-life-transitions.ts";
 import * as redactedEnvironment from "./internal/passes-redacted-env-values-to-commands.ts";
 import * as terminalCommands from "./internal/passes-the-terminal-to-commands.ts";
 import * as failureArtifacts from "./internal/preserves-failed-test-artifacts.ts";
@@ -71,6 +77,11 @@ export const runtimeTests = Task.make({
       customStackFormatters,
       failureArtifacts,
       shutdownTransitions,
+      supervisorTransitions,
+      taskRunTransitions,
+      workerLifeTransitions,
+      leftoverProcessTransitions,
+      standardInputTransitions,
       startupCancellation,
       processObservers,
       notEffects,
@@ -79,6 +90,7 @@ export const runtimeTests = Task.make({
       stateDirectory,
       startupResources,
       commands,
+      commandEnds,
       redactedEnvironment,
       bodyConfig,
       installedAndNestedPackages,

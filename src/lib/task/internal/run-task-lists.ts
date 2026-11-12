@@ -1,6 +1,7 @@
 import { Array as Arrays, Effect, Formatter, Predicate, Result, Schema } from "effect";
 import type { Types } from "effect";
 
+import { recordListMade } from "../../../shared/record-tasks-made.ts";
 import { TASK_GROUP_KEY } from "../../../shared/root-task-group.ts";
 import { TaskListNotGiven, TaskRequestRefusal } from "../../../shared/task-errors.ts";
 import { SettledTasksFailed } from "../../errors/index.ts";
@@ -56,25 +57,24 @@ const recordedConcurrency = (concurrency: Types.Concurrency | undefined) => {
   return isUnbounded ? "unbounded" : concurrency;
 };
 
-const recordTaskGroup = <Listed>(
+const recordTaskGroup = <Listed extends WeakKey>(
   listed: Listed,
   mode: "all" | "allSettled",
   items: Parameters<typeof tasksIn>[0],
   options: { readonly concurrency?: Types.Concurrency | undefined },
 ) =>
-  isTaskList(items)
-    ? Object.defineProperty(listed, TASK_GROUP_KEY, {
-        enumerable: true,
-        value: {
-          mode,
-          taskNames: tasksIn(items).map((listedTask) => listedTask.name),
-          concurrency: recordedConcurrency(options.concurrency),
-        },
-      })
-    : Object.defineProperty(listed, TASK_GROUP_KEY, {
-        enumerable: true,
-        value: { mode, given: describeGivenValue(items) },
-      });
+  recordListMade(
+    Object.defineProperty(listed, TASK_GROUP_KEY, {
+      enumerable: true,
+      value: isTaskList(items)
+        ? {
+            mode,
+            taskNames: tasksIn(items).map((listedTask) => listedTask.name),
+            concurrency: recordedConcurrency(options.concurrency),
+          }
+        : { mode, given: describeGivenValue(items) },
+    }),
+  );
 
 export const all = (
   items: Parameters<typeof tasksIn>[0],

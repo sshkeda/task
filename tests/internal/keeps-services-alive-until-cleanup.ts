@@ -222,6 +222,9 @@ export default Task.make({ name: "main", run: Effect.andThen(server, Effect.gen(
       );
       expect(ran.standardError).toContain("[server] server down\n");
       expect(ran.standardError).toContain("[database] database down\n");
+      expect(ran.standardError).toContain("[server] closed\n");
+      expect(ran.standardError).toContain("[database] database down\n[database] closed\n");
+      expect(ran.standardError).toMatch(/^failed: database \(1 of 3 tasks\), [\d.]+s$/mu);
     }),
   ),
 );

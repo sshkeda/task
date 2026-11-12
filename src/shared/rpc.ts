@@ -14,6 +14,7 @@ export const StandardInputRead = Schema.TaggedUnion({
   Chunks: { chunks: Schema.NonEmptyArray(Schema.Uint8Array) },
   Ended: {},
   Failed: { reason: Schema.String },
+  Refused: { rootTaskName: Schema.String, taskName: Schema.String },
 });
 
 export const StartTaskFiber = Schema.Struct({
@@ -77,6 +78,7 @@ export const TASK_EVENT_FIELDS = {
   },
   TaskFiberServed: { taskName: Schema.String, value: Schema.optional(Schema.Json) },
   TaskFiberStartedCleanUp: { taskName: Schema.String },
+  TaskFiberStoppedBeforeBody: { taskName: Schema.String },
   TaskFiberEnded: {
     taskName: Schema.String,
     result: TaskFiberResult,

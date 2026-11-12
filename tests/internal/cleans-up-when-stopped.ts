@@ -701,7 +701,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
 );
 
 export const forcedAfterFailure = makeTest(
-  "Ctrl-C while the run cleans up after a task failed kills what the finalizers are still running, but still exits 1 and ends with that failure",
+  "a second Ctrl-C while the run cleans up after a task failed kills what the finalizers are still running, but still exits 1 and ends with that failure",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -725,6 +725,8 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const command = yield* startTaskProcess(project, "main.ts");
       yield* command.waitForLine("[server] cleaning up");
       yield* command.sendSignal("INT");
+      yield* command.waitForLine("stopping, press ctrl-c again to force");
+      yield* command.sendSignal("INT");
 
       const exited = yield* command.waitForExit;
       expect(exited.exitCode, exited.standardError).toBe(1);
@@ -734,6 +736,87 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
         "[main] error TaskBodyFailed: its body failed with broken build\n",
       );
       expect(findCutOffLines(exited.standardError)).toEqual([`[server] ${CLEANUP_CUT_OFF}`]);
+      expect(exited.standardError).not.toContain("StopRequested");
+      expect(exited.standardError).toEndWith("\nTaskBodyFailed: its body failed with broken build");
+    }),
+  ),
+);
+
+const SERVER_WITH_SLOW_CLEANUP = `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const server = Task.make({ name: "server", run: Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.log("cleaning up").pipe(
+    Effect.andThen(Effect.sleep("2 seconds")),
+    Effect.andThen(Effect.promise(() => Bun.write("released", ""))),
+  ));
+  return yield* Task.serve("up");
+}) });`;
+
+const stopWhilePassedRunCloses = (
+  signal: "HUP" | "INT",
+  stoppingLine: string,
+  exitCode: number,
+  reason: string,
+) =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `${SERVER_WITH_SLOW_CLEANUP}
+export default Task.make({ name: "main", run: Effect.asVoid(server) });`,
+      });
+      const command = yield* startTaskProcess(project, "main.ts");
+      yield* command.waitForLine("[server] cleaning up");
+      yield* command.sendSignal(signal);
+      const exited = yield* command.waitForExit;
+      expect(exited.exitCode, exited.standardError).toBe(exitCode);
+      expect(exited.standardError).toContain(`[server] cleaning up\n${stoppingLine}`);
+      expect(yield* exists(`${project.directory}/released`)).toBe(true);
+      expect(findCutOffLines(exited.standardError)).toEqual([]);
+      expect(exited.standardError).toMatch(new RegExp(`^error StopRequested: ${reason}$`, "mu"));
+    }),
+  );
+
+export const interruptWhilePassedRunCloses = makeTest(
+  "one Ctrl-C while a passed run closes its serving tasks is a first stop, so it prints the stopping line, lets a 2s cleanup finish and exits 130",
+  stopWhilePassedRunCloses(
+    "INT",
+    "stopping, press ctrl-c again to force",
+    EXIT_CODE_AFTER_SIGINT,
+    "received SIGINT",
+  ),
+);
+
+export const hangUpWhilePassedRunCloses = makeTest(
+  "SIGHUP while a passed run closes its serving tasks is a first stop, so it prints the stopping line, lets a 2s cleanup finish and exits 129",
+  stopWhilePassedRunCloses(
+    "HUP",
+    STOPPING_AFTER_A_HANGUP,
+    EXIT_CODE_AFTER_SIGHUP,
+    "received SIGHUP",
+  ),
+);
+
+export const interruptAfterFailure = makeTest(
+  "one Ctrl-C while the run cleans up after a task failed is a first stop, so it prints the stopping line, lets a 2s cleanup finish and still exits 1 with that failure",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `${SERVER_WITH_SLOW_CLEANUP}
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  yield* server;
+  return yield* Effect.fail("broken build");
+}) });`,
+      });
+      const command = yield* startTaskProcess(project, "main.ts");
+      yield* command.waitForLine("[server] cleaning up");
+      yield* command.sendSignal("INT");
+      const exited = yield* command.waitForExit;
+      expect(exited.exitCode, exited.standardError).toBe(1);
+      expect(exited.standardError).toContain(
+        "[server] cleaning up\nstopping, press ctrl-c again to force",
+      );
+      expect(yield* exists(`${project.directory}/released`)).toBe(true);
+      expect(findCutOffLines(exited.standardError)).toEqual([]);
       expect(exited.standardError).not.toContain("StopRequested");
       expect(exited.standardError).toEndWith("\nTaskBodyFailed: its body failed with broken build");
     }),

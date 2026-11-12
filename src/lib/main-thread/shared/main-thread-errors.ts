@@ -227,6 +227,15 @@ export class TaskCleanupFrozeWorker extends Schema.TaggedError<TaskCleanupFrozeW
   }
 }
 
+export class WorkerTerminatedForAnotherTask extends Schema.TaggedError<WorkerTerminatedForAnotherTask>()(
+  "WorkerTerminatedForAnotherTask",
+  { ...TASK_ERROR_FIELDS, taskName: Schema.String, terminatingTaskName: Schema.String },
+) {
+  public override get message() {
+    return `its worker was terminated because "${this.terminatingTaskName}" ran past its cleanup limit on it`;
+  }
+}
+
 export class UnawaitedTasksFailed extends Schema.TaggedError<UnawaitedTasksFailed>()(
   "UnawaitedTasksFailed",
   {

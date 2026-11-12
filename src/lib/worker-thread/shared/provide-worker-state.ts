@@ -82,6 +82,7 @@ const makeTaskBodyFiberTracker = (
   Effect.gen(function* () {
     const taskBodyFibersByTaskName = yield* FiberMap.make<string>();
     const taskNamesAskedToStop = new Set<string>();
+    const taskNamesWithStartedBody = new Set<string>();
     const lifetimeScope = yield* Effect.scope;
     return {
       startTaskBodyFiber: <Success, Failure, Services>(
@@ -91,13 +92,21 @@ const makeTaskBodyFiberTracker = (
       requestTaskBodyInterruption: (taskName: string) =>
         Effect.gen(function* () {
           taskNamesAskedToStop.add(taskName);
-          yield* reportToMainThread(TaskEvent.cases.TaskFiberStartedCleanUp.make({ taskName }));
+          yield* reportToMainThread(
+            taskNamesWithStartedBody.has(taskName)
+              ? TaskEvent.cases.TaskFiberStartedCleanUp.make({ taskName })
+              : TaskEvent.cases.TaskFiberStoppedBeforeBody.make({ taskName }),
+          );
           const bodyFiber = FiberMap.getUnsafe(taskBodyFibersByTaskName, taskName);
           if (Option.isSome(bodyFiber)) {
             yield* Effect.forkIn(Fiber.interrupt(bodyFiber.value), lifetimeScope);
           }
         }),
       wasAskedToStop: (taskName: string) => Effect.sync(() => taskNamesAskedToStop.has(taskName)),
+      recordBodyStarted: (taskName: string) =>
+        Effect.sync(() => {
+          taskNamesWithStartedBody.add(taskName);
+        }),
       forkInWorkerScope: <Success, Failure, Services>(
         effect: Effect.Effect<Success, Failure, Services>,
       ) => Effect.forkIn(effect, lifetimeScope),

@@ -13,6 +13,7 @@ import {
   listProcessesFromProcDirectory,
 } from "../../src/lib/kill-leftover-processes/internal/list-linux-processes-from-proc.ts";
 import { listProcesses } from "../../src/lib/kill-leftover-processes/internal/list-processes.ts";
+import { sendSignal } from "../../src/lib/kill-leftover-processes/internal/send-signal.ts";
 import { makeProcessReportClaimer } from "../../src/shared/claim-processes-to-report.ts";
 import type { ProcessIdentity } from "../../src/shared/claim-processes-to-report.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../src/shared/names-from-package-json.ts";
@@ -38,22 +39,42 @@ const startLeftoverGroupLeader = Effect.gen(function* () {
   return { processId: sleep.pid, startTime: listedSleep.startTime };
 });
 
-const killAsTaskCollectingReports = (
+const sweepAsTask = (
   leftover: typeof ProcessIdentity.Type,
   claimProcessesToReport: ReturnType<typeof makeProcessReportClaimer>["claimProcessesToReport"],
+  sendSignalNow: typeof sendSignal = sendSignal,
 ) =>
   Effect.gen(function* () {
     const reported = yield* Ref.make<readonly (typeof ProcessIdentity.Type)[]>([]);
-    yield* killTaskProcessGroups(
+    const endedProcessGroupIds = yield* killTaskProcessGroups(
       new Map([[leftover.processId, startedProcessGroup("leaver", leftover.startTime, null)]]),
       "leaver",
       (processes) =>
         claimProcessesToReport(processes).pipe(
           Effect.tap((firstReports) => Ref.set(reported, firstReports)),
         ),
+      listProcesses,
+      sendSignalNow,
     );
-    return yield* Ref.get(reported);
+    return {
+      reported: yield* Ref.get(reported),
+      isForgotten: endedProcessGroupIds.has(leftover.processId),
+    };
   });
+
+const killAsTaskCollectingReports = (
+  leftover: typeof ProcessIdentity.Type,
+  claimProcessesToReport: ReturnType<typeof makeProcessReportClaimer>["claimProcessesToReport"],
+) => Effect.map(sweepAsTask(leftover, claimProcessesToReport), (swept) => swept.reported);
+
+const PROBE_SIGNAL = 0;
+
+const deniedFor =
+  (isDenied: (processId: number, signal: Parameters<typeof sendSignal>[2]) => boolean) =>
+  (...[taskName, processId, signal]: Parameters<typeof sendSignal>) =>
+    isDenied(processId, signal)
+      ? Effect.succeed("EPERM" as const)
+      : sendSignal(taskName, processId, signal);
 
 export const claimedOnce = makeTest(
   "a run's record of reported kills grants each process, keyed by pid and start time, once",
@@ -97,6 +118,48 @@ export const interruptedPass = makeTest(
       expect(yield* killAsTaskCollectingReports(leftover, claimProcessesToReport)).toEqual([
         leftover,
       ]);
+      expect(yield* isProcessAlive(leftover.processId)).toBe(false);
+    }),
+  ),
+);
+
+export const probeDenied = makeTest(
+  "a recorded process group whose existence probe returns EPERM is still swept, so its leftover is killed and reported, and the group is forgotten only once it is killed",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const leftover = yield* startLeftoverGroupLeader;
+      const { claimProcessesToReport } = makeProcessReportClaimer();
+      const swept = yield* sweepAsTask(
+        leftover,
+        claimProcessesToReport,
+        deniedFor((processId, signal) => processId < 0 && signal === PROBE_SIGNAL),
+      );
+      expect(yield* isProcessAlive(leftover.processId)).toBe(false);
+      expect(swept).toEqual({ reported: [leftover], isForgotten: true });
+    }),
+  ),
+);
+
+export const groupKillDenied = makeTest(
+  "a process group whose kill returns EPERM stays recorded while its member lives, and the member is reported as not killable once across sweeps",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const leftover = yield* startLeftoverGroupLeader;
+      const { claimProcessesToReport } = makeProcessReportClaimer();
+      const denyEveryKill = deniedFor((_processId, signal) => signal === "SIGKILL");
+      expect(yield* sweepAsTask(leftover, claimProcessesToReport, denyEveryKill)).toEqual({
+        reported: [leftover],
+        isForgotten: false,
+      });
+      expect(yield* sweepAsTask(leftover, claimProcessesToReport, denyEveryKill)).toEqual({
+        reported: [],
+        isForgotten: false,
+      });
+      expect(yield* isProcessAlive(leftover.processId)).toBe(true);
+      expect(yield* sweepAsTask(leftover, claimProcessesToReport)).toEqual({
+        reported: [],
+        isForgotten: true,
+      });
       expect(yield* isProcessAlive(leftover.processId)).toBe(false);
     }),
   ),

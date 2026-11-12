@@ -8,7 +8,6 @@ import {
   Duration,
   Effect,
   Exit,
-  Fiber,
   FiberSet,
   Layer,
   Option,
@@ -50,6 +49,13 @@ import {
   awaitTheSupervisorTerminalCommandExit,
   runInTheSupervisorTerminal,
 } from "../../supervise-the-run/index.ts";
+import {
+  isUsable,
+  moveWorkerStage,
+  WorkerEnding,
+  WorkerStage,
+  WorkerStageEvent,
+} from "./define-worker-stage.ts";
 import { StopRequested } from "./main-thread-errors.ts";
 import { DiscoveredTasks } from "./provide-discovered-tasks.ts";
 import { RunRootTaskConfig } from "./provide-run-root-task-config.ts";
@@ -135,7 +141,7 @@ export const WorkerEvent = Schema.TaggedUnion({
   ExitedWithCode: {
     workerId: Schema.Int,
     exitCode: Schema.Int,
-    terminationRequested: Schema.Boolean,
+    ending: WorkerEnding,
     uncaughtError: Schema.NullOr(UncaughtWorkerError),
   },
 });
@@ -165,13 +171,12 @@ const makeWorkerPool = Effect.gen(function* () {
     {
       readonly thread: Worker;
       readonly client: RpcClient.FromGroup<typeof TaskWorkerRpcs, RpcClientError.RpcClientError>;
-      readonly exitDeferred: Deferred.Deferred<void>;
+      readonly stage: Ref.Ref<typeof WorkerStage.Type>;
+      readonly exitedDeferred: Deferred.Deferred<void>;
+      readonly outputDrainedDeferred: Deferred.Deferred<void>;
       readonly postedBodyStartCount: Int32Array<SharedArrayBuffer>;
       readonly handledBodyStartCount: SubscriptionRef.SubscriptionRef<number>;
-      readonly outputCopied: Fiber.Fiber<void>;
       readonly isIsolated: boolean;
-      terminationRequested: boolean;
-      terminateCalled: boolean;
       uncaughtError: Option.Option<typeof UncaughtWorkerError.Type>;
     }
   >();
@@ -179,6 +184,9 @@ const makeWorkerPool = Effect.gen(function* () {
   const workerEvents = yield* Queue.unbounded<typeof WorkerEvent.Type, Cause.Done>();
   const workerConnectionsScope = yield* Scope.fork(yield* Effect.scope);
   const callsToWorkers = yield* FiberSet.make().pipe(Scope.provide(workerConnectionsScope));
+  const runInWorkerConnectionsScope = yield* FiberSet.makeRuntime<never, void, never>().pipe(
+    Scope.provide(workerConnectionsScope),
+  );
   const workerOutput = yield* Queue.bounded<Deferred.Deferred<void> | Uint8Array>(
     WORKER_OUTPUT_CHUNKS_WAITING_TO_BE_WRITTEN,
   );
@@ -398,6 +406,44 @@ const makeWorkerPool = Effect.gen(function* () {
       dieOnInvariantFailure("worker startup", "a started worker can be called over RPC"),
     );
 
+  const moveWorker = (
+    workerThread: Parameters<typeof workersById.set>[1],
+    event: typeof WorkerStageEvent.Type,
+  ) =>
+    Ref.modify(workerThread.stage, (current) => {
+      const moved = moveWorkerStage(current, event);
+      return [moved, moved[0]];
+    });
+  const recordExit = (
+    workerId: number,
+    workerThread: Parameters<typeof workersById.set>[1],
+    exitCode: number,
+  ) =>
+    Effect.gen(function* () {
+      const uncaughtError = Option.getOrNull(workerThread.uncaughtError);
+      const [stage, action] = yield* moveWorker(
+        workerThread,
+        WorkerStageEvent.cases.Exit.make({ exitCode, uncaughtError }),
+      );
+      const isNewlyExited = action === "reportExit" && WorkerStage.guards.Exited(stage);
+      if (isNewlyExited) {
+        yield* Queue.offer(
+          workerEvents,
+          WorkerEvent.cases.ExitedWithCode.make({
+            workerId,
+            exitCode,
+            ending: stage.ending,
+            uncaughtError,
+          }),
+        );
+      }
+      yield* Deferred.done(workerThread.exitedDeferred, Exit.void);
+    }).pipe(Effect.uninterruptible);
+  const recordOutputDrained = (workerThread: Parameters<typeof workersById.set>[1]) =>
+    Deferred.await(workerThread.exitedDeferred).pipe(
+      Effect.andThen(moveWorker(workerThread, WorkerStageEvent.cases.DrainOutput.make({}))),
+      Effect.andThen(Deferred.done(workerThread.outputDrainedDeferred, Exit.void)),
+    );
   const startWorker = (workerId: number, isIsolated: boolean) =>
     Effect.gen(function* () {
       const postedBodyStartCount = new Int32Array(
@@ -424,16 +470,19 @@ const makeWorkerPool = Effect.gen(function* () {
       const workerThread = {
         thread,
         client: yield* connectToWorker(threadMessages, rpcChannel.port2),
-        exitDeferred: yield* Deferred.make<void>(),
+        stage: yield* Ref.make<typeof WorkerStage.Type>(WorkerStage.cases.Idle.make({})),
+        exitedDeferred: yield* Deferred.make<void>(),
+        outputDrainedDeferred: yield* Deferred.make<void>(),
         postedBodyStartCount,
         handledBodyStartCount: yield* SubscriptionRef.make(0),
-        outputCopied: yield* copyWorkerOutput(thread).pipe(Effect.forkIn(workerConnectionsScope)),
         isIsolated,
-        terminationRequested: false,
-        terminateCalled: false,
         uncaughtError: Option.none(),
       } satisfies Parameters<typeof workersById.set>[1];
       workersById.set(workerId, workerThread);
+      yield* copyWorkerOutput(thread).pipe(
+        Effect.andThen(recordOutputDrained(workerThread)),
+        Effect.forkIn(workerConnectionsScope),
+      );
       workerThread.thread.on("error", (error) => {
         workerThread.uncaughtError = Option.some({
           message: describeCauseMessage(error),
@@ -445,16 +494,7 @@ const makeWorkerPool = Effect.gen(function* () {
         });
       });
       workerThread.thread.on("exit", (exitCode) => {
-        Deferred.doneUnsafe(workerThread.exitDeferred, Effect.void);
-        Queue.offerUnsafe(
-          workerEvents,
-          WorkerEvent.cases.ExitedWithCode.make({
-            workerId,
-            exitCode,
-            terminationRequested: workerThread.terminationRequested,
-            uncaughtError: Option.getOrNull(workerThread.uncaughtError),
-          }),
-        );
+        runInWorkerConnectionsScope(recordExit(workerId, workerThread, exitCode));
       });
     });
   const startNextWorker = (isIsolated: boolean) =>
@@ -470,15 +510,16 @@ const makeWorkerPool = Effect.gen(function* () {
     workerId: number,
     workerThread: Parameters<typeof workersById.set>[1],
     reason: string,
+    terminatingTaskName: string | null,
   ) =>
     Effect.gen(function* () {
-      const isWorkerEnding =
-        workerThread.terminateCalled || Deferred.isDoneUnsafe(workerThread.exitDeferred);
-      if (isWorkerEnding) {
+      const [, action] = yield* moveWorker(
+        workerThread,
+        WorkerStageEvent.cases.Terminate.make({ terminatingTaskName }),
+      );
+      if (action !== "terminate") {
         return;
       }
-      workerThread.terminateCalled = true;
-      workerThread.terminationRequested = true;
       yield* Effect.logInfo(`worker terminated ${reason}`).pipe(
         Effect.annotateLogs(`${TASK_TRACE_LABEL_PREFIX}.worker`, workerId),
       );
@@ -486,45 +527,43 @@ const makeWorkerPool = Effect.gen(function* () {
     }).pipe(Effect.uninterruptible);
   const requestWorkerExit = (workerThread: Parameters<typeof workersById.set>[1]) =>
     Effect.gen(function* () {
-      const isWorkerLeaving =
-        workerThread.terminationRequested || Deferred.isDoneUnsafe(workerThread.exitDeferred);
-      if (isWorkerLeaving) {
+      const [, action] = yield* moveWorker(
+        workerThread,
+        WorkerStageEvent.cases.RequestExit.make({}),
+      );
+      if (action !== "sendExit") {
         return;
       }
-      workerThread.terminationRequested = true;
       yield* FiberSet.run(
         callsToWorkers,
         workerThread.client.ExitWorker().pipe(Effect.catchTag("RpcClientError", () => Effect.void)),
       );
-    });
+    }).pipe(Effect.uninterruptible);
   const requestExitOfAllWorkers = Effect.forEach(workersById.values(), requestWorkerExit, {
     discard: true,
   });
   const terminateAllWorkers = Effect.forEach(
     workersById,
-    ([workerId, workerThread]) => terminateWorker(workerId, workerThread, FORCED_STOP_REASON),
+    ([workerId, workerThread]) => terminateWorker(workerId, workerThread, FORCED_STOP_REASON, null),
     { discard: true },
   );
   const awaitWorkerShutdown = Effect.forEach(
     workersById,
     ([workerId, workerThread]) =>
       Effect.gen(function* () {
-        const awaitWorkerDone = workerThread.isIsolated
-          ? Fiber.join(workerThread.outputCopied)
-          : Deferred.await(workerThread.exitDeferred);
-        const done = yield* awaitWorkerDone.pipe(
+        const exited = yield* Deferred.await(workerThread.exitedDeferred).pipe(
           Effect.timeoutOption(WORKER_EXIT_GRACE),
           Effect.raceFirst(shutdown.awaitForcedStop.pipe(Effect.as(Option.none()))),
         );
-        if (Option.isSome(done)) {
-          const outputCopied = Fiber.join(workerThread.outputCopied).pipe(
+        if (Option.isSome(exited)) {
+          const outputDrained = Deferred.await(workerThread.outputDrainedDeferred).pipe(
             Effect.raceFirst(shutdown.awaitForcedStop),
           );
           const isStoppedBySignal =
             (yield* shutdown.hasFailed) && isStopRequested(yield* shutdown.awaitFailure);
           return yield* isStoppedBySignal
-            ? Effect.timeoutOption(outputCopied, OUTPUT_READER_WAIT_AFTER_A_STOP_SIGNAL)
-            : outputCopied;
+            ? Effect.timeoutOption(outputDrained, OUTPUT_READER_WAIT_AFTER_A_STOP_SIGNAL)
+            : outputDrained;
         }
         yield* terminateWorker(
           workerId,
@@ -532,21 +571,20 @@ const makeWorkerPool = Effect.gen(function* () {
           (yield* shutdown.isForced)
             ? FORCED_STOP_REASON
             : `because it did not exit within ${Duration.format(WORKER_EXIT_GRACE)} of being asked to`,
+          null,
         );
-        if (!workerThread.isIsolated) {
-          yield* Deferred.await(workerThread.exitDeferred);
-        }
+        yield* Deferred.await(workerThread.exitedDeferred);
       }),
     { concurrency: "unbounded", discard: true },
   ).pipe(Effect.andThen(Queue.end(workerEvents)));
+  const findStartedWorker = (workerId: number, invariant: string) =>
+    Effect.fromNullishOr(workersById.get(workerId)).pipe(
+      dieOnInvariantFailure("worker pool", invariant),
+    );
   const findReachableWorker = (workerId: number, rpcTag: string) =>
     Effect.gen(function* () {
-      const workerThread = yield* Effect.fromNullishOr(workersById.get(workerId)).pipe(
-        dieOnInvariantFailure("worker pool", "messages go to a started worker"),
-      );
-      const isWorkerGone =
-        workerThread.terminationRequested || Deferred.isDoneUnsafe(workerThread.exitDeferred);
-      if (isWorkerGone) {
+      const workerThread = yield* findStartedWorker(workerId, "messages go to a started worker");
+      if (!isUsable(Ref.getUnsafe(workerThread.stage))) {
         yield* Effect.logDebug(
           "message not sent because its worker is gone, and that worker's exit ends its tasks",
         ).pipe(
@@ -593,9 +631,8 @@ const makeWorkerPool = Effect.gen(function* () {
         if (yield* shutdown.isStopping) {
           return yield* Effect.interrupt;
         }
-        const usableWorkers = [...workersById].filter(
-          ([, workerThread]) =>
-            !workerThread.terminationRequested && !Deferred.isDoneUnsafe(workerThread.exitDeferred),
+        const usableWorkers = [...workersById].filter(([, workerThread]) =>
+          isUsable(Ref.getUnsafe(workerThread.stage)),
         );
         const usableWorkerIds = usableWorkers.map(([workerId]) => workerId);
         const sharedWorkerLoads = usableWorkers
@@ -635,6 +672,11 @@ const makeWorkerPool = Effect.gen(function* () {
           return yield* Effect.interrupt;
         }
         yield* recordAssignment(workerId);
+        yield* findStartedWorker(workerId, "a worker a task is assigned to was started").pipe(
+          Effect.flatMap((workerThread) =>
+            moveWorker(workerThread, WorkerStageEvent.cases.AssignTask.make({})),
+          ),
+        );
         return workerId;
       }).pipe(workerSelectionSemaphore.withPermits(1));
       if (selectedWorkerId !== null) {
@@ -655,13 +697,18 @@ const makeWorkerPool = Effect.gen(function* () {
       Stream.provideService(Tracer.ParentSpan, parentSpan),
     ),
     selectWorkerIdForTask,
-    discardIsolatedWorker: (workerId: number) =>
-      Effect.fromNullishOr(workersById.get(workerId)).pipe(
-        dieOnInvariantFailure("worker pool", "a worker whose tasks ended was started"),
-        Effect.flatMap((workerThread) =>
-          workerThread.isIsolated ? requestWorkerExit(workerThread) : Effect.void,
-        ),
-      ),
+    recordTaskEnded: (workerId: number) =>
+      Effect.gen(function* () {
+        const workerThread = yield* findStartedWorker(
+          workerId,
+          "a worker whose task ended was started",
+        );
+        const [stage] = yield* moveWorker(workerThread, WorkerStageEvent.cases.EndTask.make({}));
+        const isDiscardable = workerThread.isIsolated && WorkerStage.guards.Idle(stage);
+        if (isDiscardable) {
+          yield* requestWorkerExit(workerThread);
+        }
+      }),
     startTaskFiber: (workerId: number, start: typeof StartTaskFiber.Type) =>
       callWorker(workerId, "StartTaskFiber", (client) => client.StartTaskFiber(start)),
     stopTaskFiber: (workerId: number, taskName: string) =>
@@ -691,21 +738,21 @@ const makeWorkerPool = Effect.gen(function* () {
           Effect.as("answered" as const),
           Effect.catchTag("RpcClientError", () => Effect.succeed("gone" as const)),
           Effect.raceFirst(
-            Deferred.await(reachableWorker.exitDeferred).pipe(Effect.as("gone" as const)),
+            Deferred.await(reachableWorker.exitedDeferred).pipe(Effect.as("gone" as const)),
           ),
         );
       }),
-    requestWorkerTermination: (workerId: number, reason: string) =>
-      Effect.fromNullishOr(workersById.get(workerId)).pipe(
-        dieOnInvariantFailure("worker pool", "a worker whose termination is requested was started"),
-        Effect.flatMap((workerThread) => terminateWorker(workerId, workerThread, reason)),
+    requestWorkerTermination: (workerId: number, reason: string, terminatingTaskName: string) =>
+      findStartedWorker(workerId, "a worker whose termination is requested was started").pipe(
+        Effect.flatMap((workerThread) =>
+          terminateWorker(workerId, workerThread, reason, terminatingTaskName),
+        ),
       ),
     requestExitOfAllWorkers,
     terminateAllWorkers,
     awaitWorkerShutdown,
     recordBodyStartHandled: (workerId: number) =>
-      Effect.fromNullishOr(workersById.get(workerId)).pipe(
-        dieOnInvariantFailure("worker pool", "a body start comes from a started worker"),
+      findStartedWorker(workerId, "a body start comes from a started worker").pipe(
         Effect.flatMap((workerThread) =>
           SubscriptionRef.update(workerThread.handledBodyStartCount, (count) => count + 1),
         ),

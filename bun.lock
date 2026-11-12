@@ -9,7 +9,7 @@
       },
       "devDependencies": {
         "@effect/tsgo": "0.67.4",
-        "@sshkeda/check": "3.0.0",
+        "@sshkeda/check": "4.0.0",
         "@sshkeda/task": "file:.",
         "@types/bun": "1.4.3",
         "effect": "4.1.0",
@@ -179,7 +179,7 @@
 
     "@oxlint/plugins": ["@oxlint/plugins@1.88.0", "", {}, "sha512-G2xbfWTrbqYRhR/vfeKNMQf/sS3/ti0iKJAAkRxHuXWZH/hne/dyIb9QKk5LuR6cJLARxsL6FMoAYmfspd74MQ=="],
 
-    "@sshkeda/check": ["@sshkeda/check@3.0.0", "", { "dependencies": { "@effect/platform-bun": "4.1.0", "@effect/tsgo": "0.67.4", "@oxlint/plugins": "1.88.0", "@sshkeda/task": "1.0.2", "oxc-parser": "0.153.0", "oxc-resolver": "11.24.2", "oxlint": "1.88.0", "oxlint-tsgolint": "7.0.2005", "typescript": "7.0.2" }, "peerDependencies": { "effect": "^4.1.0" }, "bin": { "check": "scripts/check.ts" } }, "sha512-hpck+V4J9XGIJdI8AXGVuuAZlxthmodn/r0YGlLz9ego9wOc1zC+LH5mAJemMtb3zvTGpRKpu13QesMVeyjtIA=="],
+    "@sshkeda/check": ["@sshkeda/check@4.0.0", "", { "dependencies": { "@effect/platform-bun": "4.1.0", "@effect/tsgo": "0.67.4", "@oxlint/plugins": "1.88.0", "@sshkeda/task": "2.0.0", "oxc-parser": "0.153.0", "oxc-resolver": "11.24.2", "oxlint": "1.88.0", "oxlint-tsgolint": "7.0.2005", "typescript": "7.0.2" }, "peerDependencies": { "effect": "^4.1.0" }, "bin": { "check": "scripts/check.ts" } }, "sha512-2SwJXvTHpwEgUesgfLPrz9UUm34PFHfyCJlSjjEkFwQtdHhsErb/EXNxNc2z9jtiq3YljUY9NP917gpQhXRxiA=="],
 
     "@sshkeda/task": ["@sshkeda/task@root:", {}],
 
@@ -251,6 +251,6 @@
 
     "ws": ["ws@8.22.0", "", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha512-Ydggc987+RO0AnWtZ/7Wq9FtNvcrL1b/RO0ud9mWjUPgDrsAAwQSF51sm2hm1XofbU/4jkpGEsLFsZZxU+1DOg=="],
 
-    "@sshkeda/check/@sshkeda/task": ["@sshkeda/task@1.0.2", "", { "dependencies": { "@effect/platform-bun": "4.1.0", "oxc-parser": "0.153.0" }, "peerDependencies": { "effect": "^4.1.0" } }, "sha512-SoHr5HtFRSVLkq1dF9g+xHJDrVVNGJKE3DxmuYf2NRCmCbpJ+tu+obmAT/z+tHEvUFbdUWJ7XsEANp+fOD3Yug=="],
+    "@sshkeda/check/@sshkeda/task": ["@sshkeda/task@2.0.0", "", { "dependencies": { "@effect/platform-bun": "^4.1.0" }, "peerDependencies": { "effect": "^4.1.0" } }, "sha512-BvqVfW8fdNtLbzolZzA1HWiv/4P0sNc7esF3Ay68zRp5m7rt9CtoFPkfU2NFxK3S3XnWzTsVLGOqQEhSeW+KWA=="],
   }
 }

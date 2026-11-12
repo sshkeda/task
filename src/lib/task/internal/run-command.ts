@@ -15,7 +15,6 @@ import * as PlatformErrors from "effect/PlatformError";
 import { ChildProcess } from "effect/process";
 
 import { CommandOutputTooLong } from "../../../shared/command-errors.ts";
-import { signalThatKilled } from "../../../shared/killed-by-signal.ts";
 import { environmentEveryCommandSees } from "../../../shared/read-environment-config.ts";
 import { CauseWithoutFailure } from "../../../shared/report-errors.ts";
 import { TerminalCommandEnded, TerminalCommands } from "../../../shared/run-in-terminal.ts";
@@ -31,6 +30,7 @@ import {
   CommandNotStarted,
   CommandStandardInputFailed,
 } from "../../errors/index.ts";
+import { CommandEnd, decideCommandEnd } from "./decide-command-end.ts";
 import { trustOutputModeName } from "./trust-output-mode-names.ts";
 
 const logAndCapture = (output: Stream.Stream<Uint8Array, PlatformError>) =>
@@ -98,6 +98,9 @@ const outputModes: {
     ) => ReturnType<(typeof OUTPUT_MODES)[Output]["makeFailure"]>;
   };
 } = OUTPUT_MODES;
+
+const causeOfStandardInputFailures = (failures: readonly CommandStandardInputFailed[]) =>
+  Cause.fromReasons(failures.map((failure) => Cause.makeFailReason(failure)));
 
 const terminalTurns = Semaphore.makeUnsafe(1);
 
@@ -236,68 +239,61 @@ export const exec = <
         };
         const exitBeforeStandardInputFailed = yield* Effect.raceFirst(
           Effect.raceFirst(
-            Effect.exit(child.exitCode),
+            Effect.asSome(Effect.exit(child.exitCode)),
             Fiber.await(standardInputFiber).pipe(
               Effect.flatMap((standardInputExit) =>
                 describeStandardInputFailures(standardInputExit).length > 0
-                  ? Effect.succeed(null)
+                  ? Effect.succeedNone
                   : Effect.never,
               ),
             ),
           ),
           Fiber.join(outputFiber).pipe(Effect.andThen(Effect.never)),
         );
-        const exitCodeExit =
-          exitBeforeStandardInputFailed ??
-          (yield* child.kill().pipe(Effect.andThen(Effect.exit(child.exitCode))));
+        const exitCodeExit = yield* Option.match(exitBeforeStandardInputFailed, {
+          onNone: () => child.kill().pipe(Effect.andThen(Effect.exit(child.exitCode))),
+          onSome: Effect.succeed,
+        });
         yield* Fiber.interrupt(standardInputFiber);
-        const standardInputFailures = Cause.fromReasons(
-          describeStandardInputFailures(yield* Fiber.await(standardInputFiber)).map(
-            (failureValue) =>
-              Cause.makeFailReason(
-                new CommandStandardInputFailed({ command, cause: failureValue }),
+        const standardInputFailures = describeStandardInputFailures(
+          yield* Fiber.await(standardInputFiber),
+        ).map((failureValue) => new CommandStandardInputFailed({ command, cause: failureValue }));
+        const failWithOutput = (
+          code: number | null,
+          signal: string | null,
+          failures: readonly CommandStandardInputFailed[],
+        ) =>
+          Fiber.join(outputFiber).pipe(
+            Effect.flatMap(([standardOutput, standardError]) =>
+              Effect.failCause(
+                Cause.combine(
+                  Cause.fail(
+                    outputMode.makeFailure({
+                      command,
+                      code,
+                      signal,
+                      standardOutput,
+                      standardError,
+                    }),
+                  ),
+                  causeOfStandardInputFailures(failures),
+                ),
               ),
-          ),
-        );
-        const standardInputFailed = standardInputFailures.reasons.length > 0;
-        const killingSignal = Exit.isFailure(exitCodeExit)
-          ? Option.match(Cause.findErrorOption(exitCodeExit.cause), {
-              onNone: () => null,
-              onSome: signalThatKilled,
-            })
-          : null;
-        if (Exit.isFailure(exitCodeExit)) {
-          if (standardInputFailed) {
-            return yield* Effect.failCause(standardInputFailures);
-          }
-          if (killingSignal === null) {
-            yield* Fiber.await(outputFiber);
-            return yield* Effect.failCause(exitCodeExit.cause);
-          }
-        }
-        const code = Exit.isSuccess(exitCodeExit) ? exitCodeExit.value : null;
-        if (code === 0) {
-          if (standardInputFailed) {
-            return yield* Effect.failCause(standardInputFailures);
-          }
-          const [standardOutput] = yield* Fiber.join(outputFiber);
-          return outputMode.returnOutput(standardOutput);
-        }
-        const [standardOutput, standardError] = yield* Fiber.join(outputFiber);
-        return yield* Effect.failCause(
-          Cause.combine(
-            Cause.fail(
-              outputMode.makeFailure({
-                command,
-                code,
-                signal: killingSignal,
-                standardOutput,
-                standardError,
-              }),
             ),
-            standardInputFailures,
-          ),
-        );
+          );
+        return yield* CommandEnd.match(decideCommandEnd(exitCodeExit, standardInputFailures), {
+          Passed: () =>
+            Fiber.join(outputFiber).pipe(
+              Effect.map(([standardOutput]) => outputMode.returnOutput(standardOutput)),
+            ),
+          ExitedWithCode: ({ code, standardInputFailures: failures }) =>
+            failWithOutput(code, null, failures),
+          KilledBySignal: ({ signal }) => failWithOutput(null, signal, []),
+          ExitFailedWithoutSignal: ({ cause }) =>
+            Fiber.await(outputFiber).pipe(Effect.andThen(Effect.failCause(cause))),
+          StandardInputFailed: ({ standardInputFailures: failures }) =>
+            Effect.failCause(causeOfStandardInputFailures(failures)),
+        });
       }),
     );
     return options.stdio === "inherit" ? terminalTurns.withPermit(runInTerminal) : runCommand;

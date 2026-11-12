@@ -37,6 +37,15 @@ export class NeverPrinted extends Schema.TaggedError<NeverPrinted>()("NeverPrint
   }
 }
 
+export class SpawnLockNeverFreed extends Schema.TaggedError<SpawnLockNeverFreed>()(
+  "SpawnLockNeverFreed",
+  { lock: Schema.String, waited: Schema.String },
+) {
+  public override get message() {
+    return `${this.lock} was still held after ${this.waited}, so the terminal command was not started`;
+  }
+}
+
 export class PackageJsonAbove extends Schema.TaggedError<PackageJsonAbove>()("PackageJsonAbove", {
   file: Schema.String,
 }) {

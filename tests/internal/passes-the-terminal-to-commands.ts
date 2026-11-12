@@ -9,6 +9,7 @@ import { makeProject } from "../shared/make-projects.ts";
 import type { makeProjectUsingTaskFrom } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
 import { makeTaskProcessEnvironment, runTaskProcess } from "../shared/run-task-processes.ts";
+import { startTerminalCommand } from "../shared/start-terminal-commands.ts";
 import { NeverPrinted } from "../shared/test-errors.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
@@ -40,26 +41,18 @@ const startInTerminal = (
     const environment = yield* makeTaskProcessEnvironment(project);
     const chunks = yield* Queue.unbounded<string, Cause.Done>();
     const decoder = new TextDecoder();
-    const child = yield* Effect.acquireRelease(
-      Effect.sync(() =>
-        Bun.spawn([process.execPath, `${project.directory}/${file}`], {
-          cwd: project.directory,
-          env: environment,
-          terminal: {
-            data: (_terminal, data) => {
-              Queue.offerUnsafe(chunks, decoder.decode(data, { stream: true }));
-            },
-            exit: () => {
-              Queue.endUnsafe(chunks);
-            },
-          },
-        }),
-      ),
-      (spawned) =>
-        Effect.sync(() => {
-          spawned.kill("SIGKILL");
-        }).pipe(Effect.andThen(Effect.promise(() => spawned.exited))),
-    );
+    const child = yield* startTerminalCommand([process.execPath, `${project.directory}/${file}`], {
+      workingDirectory: project.directory,
+      environment,
+      terminal: {
+        data: (_terminal, data) => {
+          Queue.offerUnsafe(chunks, decoder.decode(data, { stream: true }));
+        },
+        exit: () => {
+          Queue.endUnsafe(chunks);
+        },
+      },
+    });
     const shown = yield* Ref.make("");
     const showUntil = (isDone: (text: string) => boolean): Effect.Effect<string> =>
       Effect.gen(function* () {
