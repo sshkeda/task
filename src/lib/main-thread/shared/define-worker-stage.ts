@@ -1,6 +1,6 @@
 import { Schema } from "effect";
 
-import { UncaughtWorkerError } from "../../../shared/process-errors.ts";
+import { PrintableError } from "../../errors/index.ts";
 
 const TerminatingTask = { terminatingTaskName: Schema.NullOr(Schema.String) };
 
@@ -23,7 +23,7 @@ export const WorkerStageEvent = Schema.TaggedUnion({
   AssignTask: {},
   DrainOutput: {},
   EndTask: {},
-  Exit: { exitCode: Schema.Int, uncaughtError: Schema.NullOr(UncaughtWorkerError) },
+  Exit: { exitCode: Schema.Int, uncaughtError: Schema.NullOr(PrintableError) },
   RequestExit: {},
   Terminate: TerminatingTask,
 });

@@ -4,9 +4,7 @@ import { listDirectoryPathsUpToRoot } from "./list-directory-paths-up-to-root.ts
 import { MissingPackageJson } from "./main-thread-errors.ts";
 import { PackageJsonSearchFailed } from "./package-json-errors.ts";
 
-export const findPackageJsonDirectoryPath = Effect.fn("findPackageJsonDirectoryPath")(function* (
-  start: string,
-) {
+export const findPackageJsonDirectoryPath = Effect.fn(function* (start: string) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   for (const searchDirectoryPath of listDirectoryPathsUpToRoot(path, start)) {

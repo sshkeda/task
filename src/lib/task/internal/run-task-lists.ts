@@ -1,6 +1,7 @@
 import { Array as Arrays, Effect, Formatter, Predicate, Result, Schema } from "effect";
 import type { Types } from "effect";
 
+import { nameTask } from "../../../shared/label-lines.ts";
 import { recordListMade } from "../../../shared/record-tasks-made.ts";
 import { TASK_GROUP_KEY } from "../../../shared/root-task-group.ts";
 import { TaskListNotGiven, TaskRequestRefusal } from "../../../shared/task-errors.ts";
@@ -40,8 +41,10 @@ const describeGivenValue = (given: Parameters<typeof tasksIn>[0]) => {
   if (!Effect.isEffect(given)) {
     return DESCRIPTION_OF_TYPE[typeof given];
   }
-  const isNamedTask = Predicate.hasProperty(given, "name") && Predicate.isString(given.name);
-  return isNamedTask ? `task ${Formatter.format(given.name)}` : "an effect";
+  if (!Predicate.hasProperty(given, "name")) {
+    return "an effect";
+  }
+  return Predicate.isString(given.name) ? `task ${nameTask(given.name)}` : "an effect";
 };
 
 const listTasks = (

@@ -4,8 +4,8 @@ import { Effect } from "effect";
 
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
-import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
-import { runTaskProcess } from "../shared/run-task-processes.ts";
+import { readAttribute, readProjectRunsDirectory, readTraces } from "../shared/read-trace-files.ts";
+import { runTaskProcess, TASK_ENVIRONMENT_VARIABLE_PREFIX } from "../shared/run-task-processes.ts";
 
 const FAILING_CHILD_EXIT_CODE = 3;
 
@@ -53,7 +53,7 @@ export const failedResourceObservation = makeTest(
 );
 
 export const processCleanupFailures = makeTest(
-  "worker process cleanup failures are reported while main remains the final cleanup authority",
+  "worker process cleanup failures print as errors that the error log level keeps, while main remains the final cleanup authority",
   Effect.scoped(
     Effect.gen(function* () {
       for (const childExitCode of [0, FAILING_CHILD_EXIT_CODE]) {
@@ -74,13 +74,15 @@ export default Task.make({ name: "main", run: Effect.scoped(Effect.gen(function*
   yield* child.exitCode;
 })) });`,
         });
-        const completedRun = yield* runTaskProcess(project, "main.ts");
+        const completedRun = yield* runTaskProcess(project, "main.ts", {
+          [`${TASK_ENVIRONMENT_VARIABLE_PREFIX}_LOG`]: "error",
+        });
         expect(completedRun.exitCode).toBe(0);
         expect(completedRun.standardError).toMatch(
-          /^\[main\] error ProcessGroupNotSignaledByWorker: worker could not signal process group \d+ of sh because cleanup signal invalid$/mu,
+          /^error: \[main\] (?:\S+: )?Error: cleanup signal invalid(?: \(EINVAL\))?\nerror: \[main\] worker could not signal process group \d+ of sh$/mu,
         );
         expect(completedRun.standardError).not.toContain("timed out");
-        const traces = yield* readTraces(yield* readTraceDirectory(project, completedRun));
+        const traces = yield* readTraces(yield* readProjectRunsDirectory(project, completedRun));
         expect(
           traces.some((trace) =>
             trace.logs.some(

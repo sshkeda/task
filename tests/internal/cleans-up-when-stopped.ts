@@ -13,19 +13,33 @@ import { findKilledProcesses } from "../shared/find-killed-processes.ts";
 import { isProcessAlive } from "../shared/is-process-alive.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
-import { readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
+import { readAttribute, readProjectRunsDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 
-const CLEANUP_CUT_OFF =
-  "error TaskCleanupCutOff: its cleanup was cut off because the stop was forced";
+const endedLinesOf = (standardError: string, taskName: string) =>
+  standardError.split("\n").filter((line) => line.startsWith(`ended: [${taskName}], `));
+
+const CLEANUP_CUT_OFF = "TaskCleanupCutOff: its cleanup was cut off because the stop was forced";
 
 const findCutOffLines = (standardError: string) =>
-  standardError.match(/^\[[^\]\n]+\] error TaskCleanupCutOff: .*$/gmu) ?? [];
+  standardError.match(/^error: \[[^\]\n]+\] \S+: TaskCleanupCutOff: .*$/gmu) ?? [];
 
-const STOPPING_AFTER_A_HANGUP = "stopping, send SIGTERM or press ctrl-c to force";
+const STOPPING_AFTER_A_HANGUP = "stopping: send SIGTERM or press ctrl-c to force";
+
+const STOPPED_LINE = "stopped: the run ended before it finished";
+
+const ERROR_AND_RECAP_LINES = 2;
+
+const STILL_STOPPING = "still stopping";
+
+const RUN_ENDED_EVENT = "run ended before it finished";
+
+const STOP_EVENTS_PAST_THE_CLEANUP_LIMIT = ["stop requested", "cleanup limit passed"] as const;
+
+const STOP_EVENTS_WITHIN_THE_CLEANUP_LIMIT = ["stop requested", "stop finished"] as const;
 
 export const interrupt = makeTest(
-  "Ctrl-C cancels the run, runs the finalizers, exits 130 and ends with the reason line StopRequested: received SIGINT",
+  "Ctrl-C cancels the run, runs the finalizers, exits 130 and ends with the stopped summary and the run line",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -45,14 +59,11 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(exited.standardError).toContain(
-        "[main] sleeping\nstopping, press ctrl-c again to force",
+        "[main] sleeping\nstopping: press ctrl-c again to force",
       );
       expect(exited.standardError).toContain("[main] cleaned up");
       expect(exited.standardError).toMatch(
-        /^failed: 0 of 1 task, 1 stopped, [\d.]+s\nerror StopRequested: received SIGINT$/mu,
-      );
-      expect(exited.standardError).toMatch(
-        /\nwrote the trace to \S+\nStopRequested: received SIGINT$/u,
+        /\nstopped: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
       expect(findKilledProcesses(exited.standardError)).toEqual([]);
     }),
@@ -86,8 +97,32 @@ export default Task.make({ name: "main", run: Task.allSettled([first, second]) }
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(exited.standardError).not.toContain("CauseWithoutFailure");
       expect(exited.standardError).toMatch(
-        /^failed: 0 of 5 tasks, 5 stopped, [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nstopped: \[left\] \[right\] \[first\] and 2 more \(5 of 5 tasks\), [\d.]+s\nrun: \S+\/$/u,
       );
+    }),
+  ),
+);
+
+export const interruptAfterAPassedTask = makeTest(
+  "Ctrl-C after one task passed sums the run up as stopped and counts only the tasks it stopped",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const quick = Task.make({ name: "quick", run: Effect.void });
+export const waiting = Task.make({ name: "waiting", run: Effect.andThen(Effect.log("waiting"), Effect.never) });
+export default Task.make({ name: "main", run: Effect.andThen(quick, waiting) });`,
+      });
+      const command = yield* startTaskProcess(project, "main.ts");
+      yield* command.waitForLine("[waiting] waiting");
+      yield* command.sendSignal("INT");
+      const exited = yield* command.waitForExit;
+      expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
+      expect(exited.standardError).toMatch(
+        /\nstopped: \[waiting\] \[main\] \(2 of 3 tasks\), [\d.]+s\nrun: \S+\/$/u,
+      );
+      expect(exited.standardError).not.toContain("failed:");
     }),
   ),
 );
@@ -113,11 +148,11 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGTERM);
       expect(exited.standardError).toContain(
-        "[main] sleeping\nstopping, send SIGTERM or press ctrl-c again to force",
+        "[main] sleeping\nstopping: send SIGTERM or press ctrl-c again to force",
       );
       expect(exited.standardError).toContain("[main] cleaned up");
       expect(exited.standardError).toMatch(
-        /^failed: 0 of 1 task, 1 stopped, [\d.]+s\nerror StopRequested: received SIGTERM$/mu,
+        /\nstopped: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
       expect(findKilledProcesses(exited.standardError)).toEqual([]);
     }),
@@ -150,9 +185,13 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGHUP);
       expect(exited.standardError).toContain(`[main] ready\n${STOPPING_AFTER_A_HANGUP}`);
-      expect(exited.standardError).toMatch(/^error StopRequested: received SIGHUP$/mu);
-      expect(exited.standardError).toContain("[main] stopped: the run ended before it finished");
+      expect(exited.standardError).toMatch(
+        /\nfailed: \[server\] \(1 of 2 tasks\), 1 stopped, [\d.]+s\nrun: \S+\/$/u,
+      );
+      expect(exited.standardError).not.toContain(STOPPED_LINE);
       expect(findCutOffLines(exited.standardError)).toEqual([]);
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, exited));
+      expect(trace?.findTaskEventNames("task", "main")).toContain(RUN_ENDED_EVENT);
       const serverProcessId = Number(
         /\[server\] server process (?<processId>\d+)/u.exec(exited.standardError)?.[1],
       );
@@ -185,7 +224,7 @@ export default Task.make({ name: "main", cleanup: "30 seconds", run: Effect.gen(
       expect(findCutOffLines(exited.standardError)).toEqual([]);
       expect(exited.standardError).not.toContain("TaskCleanupTimedOut");
       expect(exited.standardError).toMatch(
-        /^failed: 0 of 1 task, 1 stopped, [\d.]+s\nerror StopRequested: received SIGHUP$/mu,
+        /\nstopped: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
     }),
   ),
@@ -208,11 +247,18 @@ export default Task.make({
       yield* command.sendSignal("HUP");
       const stopped = yield* command.waitForExit;
       expect(stopped.exitCode).toBe(EXIT_CODE_AFTER_SIGHUP);
-      expect(stopped.standardError).toContain(`[main] ready\n${STOPPING_AFTER_A_HANGUP}`);
       expect(stopped.standardError).toContain(
-        "[main] still stopping after 2s; @sshkeda/task kills its commands and stops waiting for it when its 5s cleanup limit passes\n[main] error TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it",
+        `[main] ready\n${STOPPING_AFTER_A_HANGUP}\nerror: [main] main.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it\nended: [main], `,
       );
+      expect(stopped.standardError).toMatch(
+        /\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+      );
+      expect(stopped.standardError).not.toContain(STILL_STOPPING);
       expect(findCutOffLines(stopped.standardError)).toEqual([]);
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, stopped));
+      expect(trace?.findTaskEventNames("cleanup", "main")).toEqual([
+        ...STOP_EVENTS_PAST_THE_CLEANUP_LIMIT,
+      ]);
     }),
   ),
 );
@@ -239,9 +285,13 @@ export default Task.make({ name: "main", cleanup: "30 seconds", run: Effect.gen(
       yield* command.sendSignal("INT");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
-      expect(findCutOffLines(exited.standardError)).toEqual([`[main] ${CLEANUP_CUT_OFF}`]);
+      expect(findCutOffLines(exited.standardError)).toEqual([
+        `error: [main] main.ts:3:21: ${CLEANUP_CUT_OFF}`,
+      ]);
       expect(yield* exists(`${project.directory}/released`)).toBe(false);
-      expect(exited.standardError).toMatch(/^error StopRequested: received SIGINT$/mu);
+      expect(exited.standardError).toMatch(
+        /\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+      );
     }),
   ),
 );
@@ -271,9 +321,9 @@ export const hangUpTwice = makeTest(
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGHUP);
       expect(yield* exists(`${project.directory}/released`)).toBe(true);
       expect(findCutOffLines(exited.standardError)).toEqual([]);
-      expect(countOccurrences(exited.standardError, "stopping, ")).toBe(1);
+      expect(countOccurrences(exited.standardError, "stopping: ")).toBe(1);
       expect(exited.standardError).toMatch(
-        /^failed: 0 of 1 task, 1 stopped, [\d.]+s\nerror StopRequested: received SIGHUP$/mu,
+        /\nstopped: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
     }),
   ),
@@ -287,13 +337,15 @@ export const interruptThenHangUp = makeTest(
       const command = yield* startTaskProcess(project, "main.ts");
       yield* command.waitForLine("[main] holding the lock");
       yield* command.sendSignal("INT");
-      yield* command.waitForLine("stopping, press ctrl-c again to force");
+      yield* command.waitForLine("stopping: press ctrl-c again to force");
       yield* command.sendSignal("HUP");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(yield* exists(`${project.directory}/released`)).toBe(true);
       expect(findCutOffLines(exited.standardError)).toEqual([]);
-      expect(exited.standardError).toMatch(/^error StopRequested: received SIGINT$/mu);
+      expect(exited.standardError).toMatch(
+        /\nstopped: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+      );
     }),
   ),
 );
@@ -311,9 +363,13 @@ export const hangUpThenTerminate = makeTest(
       yield* command.sendSignal("TERM");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGTERM);
-      expect(findCutOffLines(exited.standardError)).toEqual([`[main] ${CLEANUP_CUT_OFF}`]);
+      expect(findCutOffLines(exited.standardError)).toEqual([
+        `error: [main] main.ts:3:21: ${CLEANUP_CUT_OFF}`,
+      ]);
       expect(yield* exists(`${project.directory}/released`)).toBe(false);
-      expect(exited.standardError).toMatch(/^error StopRequested: received SIGTERM$/mu);
+      expect(exited.standardError).toMatch(
+        /\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+      );
     }),
   ),
 );
@@ -336,8 +392,10 @@ export default Task.make({ name: "main", run: Effect.sync(() =>
       yield* command.sendSignal("TERM");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGTERM);
-      expect(exited.standardError).toContain("[main] stopped: the run ended before it finished");
-      expect(findCutOffLines(exited.standardError)).toEqual([`[main] ${CLEANUP_CUT_OFF}`]);
+      expect(exited.standardError).not.toContain("[main] stopped:");
+      expect(findCutOffLines(exited.standardError)).toEqual([
+        `error: [main] main.ts:3:21: ${CLEANUP_CUT_OFF}`,
+      ]);
       const killed = findKilledProcesses(exited.standardError);
       expect(killed.map((each) => each.by)).toEqual(["no known task"]);
       expect(killed[0]?.command).toMatch(/^(?:sh|sleep)$/u);
@@ -384,7 +442,7 @@ export default Task.make({ name: "main", run: Effect.sync(() => {
 );
 
 export const outputClosed = makeTest(
-  "when standard error closes, as in | head -n 4, the run stops, a command that ignores SIGTERM is killed after a short grace period, and the run exits 141",
+  "when standard error closes, as in | head -n 2, the run stops, a command that ignores SIGTERM is killed after a short grace period, and the run exits 141",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -393,21 +451,19 @@ import { ChildProcess } from "effect/process";
 import { Task } from "@sshkeda/task";
 export const prepare = Task.make({ name: "prepare", run: Effect.log("prepared") });
 export default Task.make({ name: "main", run: Effect.gen(function* () {
-  yield* prepare;
   const command = yield* ChildProcess.make("sh", ["-c", "trap '' TERM; echo $$ > command-pid; echo started; exec sleep 1000"]);
   yield* command.stdout.pipe(Stream.decodeText, Stream.splitLines, Stream.runHead);
+  yield* prepare;
   while (!(yield* Effect.promise(() => Bun.file("head-exited").exists()))) {
     yield* Effect.sleep("10 millis");
   }
   yield* Effect.forever(Effect.andThen(Effect.log("serving"), Effect.sleep("1 millis")));
 }) });`,
-        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`(\${process.execPath} main.ts; echo $? > exit-code) 2>&1 | while IFS= read -r line; do case "$line" in "["*"] waiting for worker "* | "["*"] loading "*) ;; *) printf '%s\\\\n' "$line" ;; esac; done | { head -n 4; exec 0<&-; touch head-exited; }\`], { stdio: ["ignore", "inherit", "inherit"] });
+        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`(\${process.execPath} main.ts; echo $? > exit-code) 2>&1 | { head -n 2; exec 0<&-; touch head-exited; }\`], { stdio: ["ignore", "inherit", "inherit"] });
 process.exitCode = await shell.exited;`,
       });
       const piped = yield* runTaskProcess(project, "piped.ts");
-      expect(piped.standardOutput).toMatch(
-        /^\[main\] started\n\[prepare\] started\n\[prepare\] prepared\n\[prepare\] passed in [\d.]+s\n$/u,
-      );
+      expect(piped.standardOutput).toMatch(/^run: \S+\/\n\[prepare\] prepared\n$/u);
       expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("141");
       const commandProcessId = Number((yield* read(`${project.directory}/command-pid`)).trim());
       expect(yield* isProcessAlive(commandProcessId)).toBe(false);
@@ -433,7 +489,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const command = yield* startTaskProcess(project, "main.ts");
       yield* command.waitForLine("[main] waiting on");
       yield* command.sendSignal("INT");
-      yield* command.waitForLine("stopping, press ctrl-c again to force");
+      yield* command.waitForLine("stopping: press ctrl-c again to force");
       yield* command.sendSignal("INT");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
@@ -441,13 +497,16 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
         /\[main\] waiting on (?<processId>\d+)/u.exec(exited.standardError)?.[1],
       );
       expect(findKilledProcesses(exited.standardError)).toEqual([
-        { processId: commandProcessId, command: "sleep", by: '"main"' },
+        { processId: commandProcessId, command: "sleep", by: "[main]" },
       ]);
       expect(yield* isProcessAlive(commandProcessId)).toBe(false);
-      expect(findCutOffLines(exited.standardError)).toEqual([`[main] ${CLEANUP_CUT_OFF}`]);
+      expect(findCutOffLines(exited.standardError)).toEqual([
+        `error: [main] main.ts:4:21: ${CLEANUP_CUT_OFF}`,
+      ]);
       expect(exited.standardError).toMatch(
-        /^failed: main \(1 of 1 task\), [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nerror: \[main\] main\.ts:4:21: TaskCleanupCutOff: its cleanup was cut off because the stop was forced\n(?:killed: \[main\] \d+ \(sleep\)\n)?(?:ended: \[main\], [\d.]+s, (?:stopped|failed)\n)?(?:killed: \[main\] \d+ \(sleep\)\n)?failed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
+      expect(endedLinesOf(exited.standardError, "main"), exited.standardError).toHaveLength(1);
     }),
   ),
 );
@@ -475,13 +534,14 @@ export default Task.make({ name: "main", run: Effect.promise(() => Bun.write("ma
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGTERM);
       const lines =
-        /^stopping, send SIGTERM or press ctrl-c again to force\n(?:wrote the trace to (?<traceFile>\S+)\n)?error StopRequested: received SIGTERM\nStopRequested: received SIGTERM$/u.exec(
+        /^(?:stopping: send SIGTERM or press ctrl-c again to force|run: (?<firstRunDirectory>\S+)\/\nstopping: send SIGTERM or press ctrl-c again to force\nstopped: 0 of 0 tasks, [\d.]+s\nrun: (?<lastRunDirectory>\S+)\/)$/u.exec(
           exited.standardError,
         );
       expect(lines, exited.standardError).not.toBeNull();
-      const { traceFile } = lines?.groups ?? {};
-      if (traceFile !== undefined) {
-        expect(yield* exists(traceFile)).toBe(true);
+      const { firstRunDirectory, lastRunDirectory } = lines?.groups ?? {};
+      expect(lastRunDirectory, exited.standardError).toBe(firstRunDirectory);
+      if (firstRunDirectory !== undefined) {
+        expect(yield* exists(`${firstRunDirectory}/trace.jsonl`)).toBe(true);
       }
       expect(findKilledProcesses(exited.standardError)).toEqual([]);
       expect(yield* isProcessAlive(command.processId)).toBe(false);
@@ -512,11 +572,11 @@ export default Task.make({ name: "main", run: Effect.log(greeting) });`,
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(exited.standardError).toMatch(
-        /^failed: 0 of 1 task, 1 stopped, [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nstopped: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
       expect(yield* isProcessAlive(command.processId)).toBe(false);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, exited));
-      expect(trace?.named("runRootTaskFiber")).toHaveLength(1);
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, exited));
+      expect(trace?.withRole("run")).toHaveLength(1);
     }),
   ),
 );
@@ -535,16 +595,17 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       });
 
       const command = yield* startTaskProcess(project, "main.ts");
-      yield* command.waitForLine("main is serving");
+      yield* command.waitForLine("serving: [main], ");
       yield* command.sendSignal("INT");
 
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
+      expect(exited.standardError).not.toContain("main is serving");
       expect(exited.standardError).toContain(
-        "stopping, press ctrl-c again to force\n[main] main stopped\n[main] closed",
+        "stopping: press ctrl-c again to force\n[main] main stopped\nclosed: [main]",
       );
       expect(exited.standardError).toMatch(
-        /^failed: 0 of 1 task, [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nstopped: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
     }),
   ),
@@ -559,7 +620,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
   return yield* Task.serve("up");
 }), timeout: "5 seconds", cleanup: "5 seconds" });`;
 
-const INTERRUPT_ONCE_SERVING_IS_READ_AND_STANDARD_ERROR_CLOSED = `const shell = Bun.spawn(["sh", "-c", \`(\${process.execPath} main.ts; echo $? > exit-code) 2>&1 | { sed '/main is serving/q'; exec 0<&-; kill -INT $(cat task-pid); }\`], { stdio: ["ignore", "inherit", "inherit"] });
+const INTERRUPT_ONCE_SERVING_IS_READ_AND_STANDARD_ERROR_CLOSED = `const shell = Bun.spawn(["sh", "-c", \`(\${process.execPath} main.ts; echo $? > exit-code) 2>&1 | { sed '/^serving: /q'; exec 0<&-; kill -INT $(cat task-pid); }\`], { stdio: ["ignore", "inherit", "inherit"] });
 process.exitCode = await shell.exited;`;
 
 export const interruptAfterOutputClosed = makeTest(
@@ -571,7 +632,7 @@ export const interruptAfterOutputClosed = makeTest(
         "piped.ts": INTERRUPT_ONCE_SERVING_IS_READ_AND_STANDARD_ERROR_CLOSED,
       });
       const piped = yield* runTaskProcess(project, "piped.ts");
-      expect(piped.standardOutput).toEndWith("main is serving\n");
+      expect(piped.standardOutput).toMatch(/^serving: \[main\], [\d.]+s\n$/mu);
       expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("130");
     }),
   ),
@@ -593,7 +654,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
         "piped.ts": INTERRUPT_ONCE_SERVING_IS_READ_AND_STANDARD_ERROR_CLOSED,
       });
       const piped = yield* runTaskProcess(project, "piped.ts");
-      expect(piped.standardOutput).toEndWith("main is serving\n");
+      expect(piped.standardOutput).toMatch(/^serving: \[main\], [\d.]+s\n$/mu);
       expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("130");
     }),
   ),
@@ -610,7 +671,7 @@ pipe(my $reader, my $writer) or die;
 fcntl($writer, F_SETFL, fcntl($writer, F_GETFL, 0) | O_NONBLOCK) or die;
 my $pid = fork();
 if ($pid == 0) { close $reader; open(STDERR, ">&", $writer) or die; exec($ARGV[0], "main.ts") or die; }
-while (my $line = <$reader>) { last if $line =~ /main is serving/; }
+while (my $line = <$reader>) { last if $line =~ /^serving: /; }
 while (defined syswrite($writer, "x" x 512)) {}
 kill "INT", $pid;
 waitpid($pid, 0);
@@ -620,6 +681,61 @@ process.exitCode = await perl.exited;`,
       });
       const full = yield* runTaskProcess(project, "full.ts");
       expect(full.standardOutput).toBe("1\n");
+    }),
+  ),
+);
+
+const HELD_BACK_LINE_COUNT = 64;
+
+export const interruptAfterAFailureWhileOutputIsHeldBack = makeTest(
+  "one Ctrl-C after a task failed, while its cleanup's console output is held back because nobody reads standard error, still ends the run without a second signal",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { writeFileSync } from "node:fs";
+import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const line = "x".repeat(1_048_576) + "\\n";
+export default Task.make({ name: "main", cleanup: "200 millis", run: Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.promise(async () => {
+    for (let written = 1; written <= ${HELD_BACK_LINE_COUNT}; written++) {
+      await new Promise<void>((resolve) => process.stdout.write(line, () => resolve()));
+      writeFileSync("written", String(written));
+    }
+  }));
+  return yield* Effect.fail(new Error("boom"));
+}) });`,
+        "unread.pl": `use strict;
+pipe(my $reader, my $writer) or die;
+my $pid = fork();
+if ($pid == 0) { close $reader; open(STDERR, ">&", $writer) or die; exec($ARGV[0], "main.ts") or die; }
+close $writer;
+while (my $line = <$reader>) { last if $line =~ /^error: /; }
+select(undef, undef, undef, 0.05) until -s "written";
+my ($seen, $same) = ("", 0);
+while ($same < 10) {
+  select(undef, undef, undef, 0.2);
+  open(my $file, "<", "written") or die;
+  my $now = <$file> // "";
+  close $file;
+  if ($now eq $seen) { $same++; } else { ($seen, $same) = ($now, 0); }
+}
+open(my $stalled, ">", "written-when-stopped") or die;
+print $stalled $seen;
+close $stalled;
+kill "INT", $pid;
+local $SIG{ALRM} = sub { kill "KILL", $pid; };
+alarm 20;
+waitpid($pid, 0);
+print $? & 127 ? "killed\\n" : ($? >> 8) . "\\n";`,
+        "unread.ts": `const perl = Bun.spawn(["perl", "unread.pl", process.execPath], { stdio: ["ignore", "inherit", "inherit"] });
+process.exitCode = await perl.exited;`,
+      });
+      const unread = yield* runTaskProcess(project, "unread.ts");
+      expect(Number(yield* read(`${project.directory}/written-when-stopped`))).toBeLessThan(
+        HELD_BACK_LINE_COUNT,
+      );
+      expect(unread.standardOutput).toBe("1\n");
     }),
   ),
 );
@@ -647,7 +763,7 @@ process.exitCode = await shell.exited;`,
       yield* runTaskProcess(project, "piped.ts");
       const output = yield* read(`${project.directory}/output`);
       expect(output).toContain("[main] 1999 ");
-      expect(output).toContain("stopping, press ctrl-c again to force\n");
+      expect(output).toContain("stopping: press ctrl-c again to force\n");
       expect(output).toContain("[main] main stopped\n");
       expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe(
         String(EXIT_CODE_AFTER_SIGINT),
@@ -688,13 +804,15 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
       const killed = findKilledProcesses(exited.standardError);
-      expect(killed.map((each) => `${each.command} by ${each.by}`)).toEqual(['sleep by "server"']);
+      expect(killed.map((each) => `${each.command} by ${each.by}`)).toEqual(["sleep by [server]"]);
       for (const each of killed) {
         expect(yield* isProcessAlive(each.processId)).toBe(false);
       }
-      expect(findCutOffLines(exited.standardError)).toEqual([`[server] ${CLEANUP_CUT_OFF}`]);
+      expect(findCutOffLines(exited.standardError)).toEqual([
+        `error: [server] main.ts:4:28: ${CLEANUP_CUT_OFF}`,
+      ]);
       expect(exited.standardError).toMatch(
-        /^failed: server \(1 of 2 tasks\), 1 stopped, [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nfailed: \[server\] \(1 of 2 tasks\), 1 stopped, [\d.]+s\nrun: \S+\/$/u,
       );
     }),
   ),
@@ -725,19 +843,23 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const command = yield* startTaskProcess(project, "main.ts");
       yield* command.waitForLine("[server] cleaning up");
       yield* command.sendSignal("INT");
-      yield* command.waitForLine("stopping, press ctrl-c again to force");
+      yield* command.waitForLine("stopping: press ctrl-c again to force");
       yield* command.sendSignal("INT");
 
       const exited = yield* command.waitForExit;
       expect(exited.exitCode, exited.standardError).toBe(1);
       const killed = findKilledProcesses(exited.standardError);
-      expect(killed.map((each) => `${each.command} by ${each.by}`)).toEqual(['sleep by "server"']);
+      expect(killed.map((each) => `${each.command} by ${each.by}`)).toEqual(["sleep by [server]"]);
       expect(exited.standardError).toContain(
-        "[main] error TaskBodyFailed: its body failed with broken build\n",
+        "\nerror: [main] main.ts:12:21: UntaggedFailure: broken build\n",
       );
-      expect(findCutOffLines(exited.standardError)).toEqual([`[server] ${CLEANUP_CUT_OFF}`]);
+      expect(findCutOffLines(exited.standardError)).toEqual([
+        `error: [server] main.ts:4:28: ${CLEANUP_CUT_OFF}`,
+      ]);
       expect(exited.standardError).not.toContain("StopRequested");
-      expect(exited.standardError).toEndWith("\nTaskBodyFailed: its body failed with broken build");
+      expect(exited.standardError).toMatch(
+        /\nfailed: \[server\] \[main\] \(2 of 2 tasks\), [\d.]+s\nrun: \S+\/$/u,
+      );
     }),
   ),
 );
@@ -752,12 +874,7 @@ export const server = Task.make({ name: "server", run: Effect.gen(function* () {
   return yield* Task.serve("up");
 }) });`;
 
-const stopWhilePassedRunCloses = (
-  signal: "HUP" | "INT",
-  stoppingLine: string,
-  exitCode: number,
-  reason: string,
-) =>
+const stopWhilePassedRunCloses = (signal: "HUP" | "INT", stoppingLine: string, exitCode: number) =>
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -772,28 +889,18 @@ export default Task.make({ name: "main", run: Effect.asVoid(server) });`,
       expect(exited.standardError).toContain(`[server] cleaning up\n${stoppingLine}`);
       expect(yield* exists(`${project.directory}/released`)).toBe(true);
       expect(findCutOffLines(exited.standardError)).toEqual([]);
-      expect(exited.standardError).toMatch(new RegExp(`^error StopRequested: ${reason}$`, "mu"));
+      expect(exited.standardError).toMatch(/\nstopped: 0 of 2 tasks, [\d.]+s\nrun: \S+\/$/u);
     }),
   );
 
 export const interruptWhilePassedRunCloses = makeTest(
   "one Ctrl-C while a passed run closes its serving tasks is a first stop, so it prints the stopping line, lets a 2s cleanup finish and exits 130",
-  stopWhilePassedRunCloses(
-    "INT",
-    "stopping, press ctrl-c again to force",
-    EXIT_CODE_AFTER_SIGINT,
-    "received SIGINT",
-  ),
+  stopWhilePassedRunCloses("INT", "stopping: press ctrl-c again to force", EXIT_CODE_AFTER_SIGINT),
 );
 
 export const hangUpWhilePassedRunCloses = makeTest(
   "SIGHUP while a passed run closes its serving tasks is a first stop, so it prints the stopping line, lets a 2s cleanup finish and exits 129",
-  stopWhilePassedRunCloses(
-    "HUP",
-    STOPPING_AFTER_A_HANGUP,
-    EXIT_CODE_AFTER_SIGHUP,
-    "received SIGHUP",
-  ),
+  stopWhilePassedRunCloses("HUP", STOPPING_AFTER_A_HANGUP, EXIT_CODE_AFTER_SIGHUP),
 );
 
 export const interruptAfterFailure = makeTest(
@@ -813,12 +920,17 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const exited = yield* command.waitForExit;
       expect(exited.exitCode, exited.standardError).toBe(1);
       expect(exited.standardError).toContain(
-        "[server] cleaning up\nstopping, press ctrl-c again to force",
+        "[server] cleaning up\nstopping: press ctrl-c again to force",
       );
       expect(yield* exists(`${project.directory}/released`)).toBe(true);
       expect(findCutOffLines(exited.standardError)).toEqual([]);
       expect(exited.standardError).not.toContain("StopRequested");
-      expect(exited.standardError).toEndWith("\nTaskBodyFailed: its body failed with broken build");
+      expect(exited.standardError).toContain(
+        "\nerror: [main] main.ts:10:21: UntaggedFailure: broken build\n",
+      );
+      expect(exited.standardError).toMatch(
+        /\nfailed: \[main\] \(1 of 2 tasks\), [\d.]+s\nrun: \S+\/$/u,
+      );
     }),
   ),
 );
@@ -856,9 +968,11 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(
         findKilledProcesses(exited.standardError).map((each) => `${each.command} by ${each.by}`),
-      ).toEqual(['sleep by "server"']);
-      expect(findCutOffLines(exited.standardError)).toEqual([`[server] ${CLEANUP_CUT_OFF}`]);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, exited));
+      ).toEqual(["sleep by [server]"]);
+      expect(findCutOffLines(exited.standardError)).toEqual([
+        `error: [server] main.ts:4:28: ${CLEANUP_CUT_OFF}`,
+      ]);
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, exited));
       const workerShutdownLogs = (trace?.logs ?? [])
         .map((log) => String(log.body.stringValue))
         .filter((body) => body.startsWith("worker terminated"));
@@ -900,16 +1014,106 @@ export default deploy;`,
       expect(exited.exitCode, exited.standardError).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(yield* exists(`${project.directory}/cleanup-started`)).toBe(true);
       expect(yield* exists(`${project.directory}/cleanup-finished`)).toBe(false);
-      expect(findCutOffLines(exited.standardError)).toEqual([`[deploy] ${CLEANUP_CUT_OFF}`]);
+      expect(findCutOffLines(exited.standardError)).toEqual([
+        `error: [deploy] main.ts:3:28: ${CLEANUP_CUT_OFF}`,
+      ]);
+      expect(exited.standardError).not.toContain("[deploy] stopped:");
       expect(exited.standardError).toMatch(
-        /^\[deploy\] error TaskCleanupCutOff: its cleanup was cut off because the stop was forced\n(?:.*\n)*failed: deploy \(1 of 1 task\), [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nerror: \[deploy\] main\.ts:3:28: TaskCleanupCutOff: its cleanup was cut off because the stop was forced\n(?:ended: \[deploy\], [\d.]+s, (?:stopped|failed)\n)?failed: \[deploy\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, exited));
+      expect(endedLinesOf(exited.standardError, "deploy"), exited.standardError).toHaveLength(1);
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, exited));
       expect(
         (trace?.logs ?? [])
           .map((log) => String(log.body.stringValue))
           .filter((body) => body.includes("TaskCleanupCutOff")),
-      ).toEqual([`failed: ${CLEANUP_CUT_OFF}`]);
+      ).toEqual([`failed: error ${CLEANUP_CUT_OFF}`]);
+    }),
+  ),
+);
+
+const FORCED_STOP_TASK_NAMES = ["deploy", "main", "watch"] as const;
+
+export const forcedStopEndsEachTaskOnce = makeTest(
+  "a second Ctrl-C prints a cut-off line only for the task still in its cleanup, and each task's span records that the run ended before it finished",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const deploy = Task.make({ name: "deploy", run: Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.andThen(Effect.log("releasing lock"), Effect.sleep("1 minute")));
+  yield* Effect.log("deploying");
+  yield* Effect.never;
+}) });
+export const watch = Task.make({ name: "watch", run: Effect.never });
+export default Task.make({ name: "main", run: Task.all([deploy, watch]) });`,
+      });
+
+      const command = yield* startTaskProcess(project, "main.ts");
+      yield* command.waitForLine("[deploy] deploying");
+      yield* command.sendSignal("INT");
+      yield* command.waitForLine("[deploy] releasing lock");
+      yield* command.sendSignal("INT");
+
+      const exited = yield* command.waitForExit;
+      expect(exited.exitCode, exited.standardError).toBe(EXIT_CODE_AFTER_SIGINT);
+      const cutOffLines = [...findCutOffLines(exited.standardError)];
+      expect(cutOffLines).toContain(`error: [deploy] main.ts:3:28: ${CLEANUP_CUT_OFF}`);
+      expect(cutOffLines).toEqual([...new Set(cutOffLines)]);
+      expect(exited.standardError).not.toContain(STOPPED_LINE);
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, exited));
+      expect(
+        FORCED_STOP_TASK_NAMES.map((taskName) =>
+          countOccurrences(
+            trace?.findTaskEventNames("task", taskName).join("\n") ?? "",
+            RUN_ENDED_EVENT,
+          ),
+        ),
+      ).toEqual(FORCED_STOP_TASK_NAMES.map(() => 1));
+    }),
+  ),
+);
+
+export const timedOutCleanupEndsOnce = makeTest(
+  "a stopped task whose cleanup runs past its limit prints TaskCleanupTimedOut once, the other tasks print no end line, and each stop span records how its stop ended",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const deploy = Task.make({ name: "deploy", run: Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.sleep("1 minute"));
+  yield* Effect.log("deploying");
+  yield* Effect.never;
+}), cleanup: "1 second" });
+export const watch = Task.make({ name: "watch", run: Effect.never });
+export default Task.make({ name: "main", run: Task.all([deploy, watch]) });`,
+      });
+
+      const command = yield* startTaskProcess(project, "main.ts");
+      yield* command.waitForLine("[deploy] deploying");
+      yield* command.sendSignal("INT");
+
+      const exited = yield* command.waitForExit;
+      expect(exited.exitCode, exited.standardError).toBe(EXIT_CODE_AFTER_SIGINT);
+      expect(
+        countOccurrences(
+          exited.standardError,
+          "error: [deploy] main.ts:3:28: TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it",
+        ),
+      ).toBe(1);
+      expect(exited.standardError).not.toContain(STOPPED_LINE);
+      expect(exited.standardError).not.toContain(STILL_STOPPING);
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, exited));
+      expect(trace?.findTaskEventNames("cleanup", "deploy")).toEqual([
+        ...STOP_EVENTS_PAST_THE_CLEANUP_LIMIT,
+      ]);
+      expect(trace?.findTaskEventNames("cleanup", "watch")).toEqual([
+        ...STOP_EVENTS_WITHIN_THE_CLEANUP_LIMIT,
+      ]);
+      expect(trace?.findTaskEventNames("task", "watch")).toContain(RUN_ENDED_EVENT);
+      expect(trace?.findTaskEventNames("task", "main")).toContain(RUN_ENDED_EVENT);
     }),
   ),
 );
@@ -920,7 +1124,7 @@ export const forcedSkipsFinishedCleanup = makeTest(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { existsSync } from "node:fs";
-import { Effect, Schedule } from "effect";
+import { Effect, Schedule, Schema } from "effect";
 import { Task } from "@sshkeda/task";
 export const slow = Task.make({ name: "slow", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.gen(function* () {
@@ -931,13 +1135,13 @@ export const slow = Task.make({ name: "slow", run: Effect.gen(function* () {
   yield* Effect.log("slow running");
   yield* Effect.never;
 }) });
-export const quick = Task.make({ name: "quick", run: Effect.gen(function* () {
+export const quick = Task.make({ name: "quick", output: Schema.String, run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.sync(() => existsSync("slow-cleanup-started")).pipe(
     Effect.repeat({ until: (started) => started, schedule: Schedule.spaced("10 millis") }),
     Effect.andThen(Effect.promise(() => Bun.write("quick-cleanup-finished", ""))),
   ));
   yield* Effect.log("quick running");
-  yield* Effect.never;
+  return yield* Task.serve("up");
 }) });
 export default Task.make({ name: "main", run: Task.all([slow, quick]) });`,
       });
@@ -946,7 +1150,7 @@ export default Task.make({ name: "main", run: Task.all([slow, quick]) });`,
       yield* command.waitForLine(" running");
       yield* command.waitForLine(" running");
       yield* command.sendSignal("INT");
-      yield* command.waitForLine("[quick] stopped: the run ended before it finished");
+      yield* command.waitForLine("closed: [quick]");
       yield* command.sendSignal("INT");
 
       const exited = yield* command.waitForExit;
@@ -954,7 +1158,7 @@ export default Task.make({ name: "main", run: Task.all([slow, quick]) });`,
       expect(yield* exists(`${project.directory}/quick-cleanup-finished`)).toBe(true);
       expect(yield* exists(`${project.directory}/slow-cleanup-finished`)).toBe(false);
       const cutOffLines = findCutOffLines(exited.standardError);
-      expect(cutOffLines).toContain(`[slow] ${CLEANUP_CUT_OFF}`);
+      expect(cutOffLines).toContain(`error: [slow] main.ts:4:26: ${CLEANUP_CUT_OFF}`);
       expect(cutOffLines.filter((line) => line.startsWith("[quick]"))).toEqual([]);
     }),
   ),
@@ -978,17 +1182,20 @@ export default spin;`,
       const command = yield* startTaskProcess(project, "main.ts");
       yield* command.waitForLine("[spin] spinning");
       yield* command.sendSignal("INT");
-      yield* command.waitForLine("stopping, press ctrl-c again to force");
+      yield* command.waitForLine("stopping: press ctrl-c again to force");
       yield* command.sendSignal("INT");
 
       const exited = yield* command.waitForExit;
       expect(exited.exitCode, exited.standardError).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(yield* exists(`${project.directory}/cleanup-finished`)).toBe(false);
-      expect(findCutOffLines(exited.standardError)).toEqual([`[spin] ${CLEANUP_CUT_OFF}`]);
+      expect(findCutOffLines(exited.standardError)).toEqual([
+        `error: [spin] main.ts:3:26: ${CLEANUP_CUT_OFF}`,
+      ]);
       expect(exited.standardError).not.toContain("TaskCleanupNotStarted");
       expect(exited.standardError).toMatch(
-        /^failed: spin \(1 of 1 task\), [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nerror: \[spin\] main\.ts:3:26: TaskCleanupCutOff: its cleanup was cut off because the stop was forced\n(?:ended: \[spin\], [\d.]+s, (?:stopped|failed)\n)?failed: \[spin\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
+      expect(endedLinesOf(exited.standardError, "spin"), exited.standardError).toHaveLength(1);
     }),
   ),
 );
@@ -998,7 +1205,7 @@ const BODY_STOPS = [
     stoppedBy: "timeout",
     options: ', timeout: "3 seconds", cleanup: "5 seconds"',
     exitCode: 1,
-    timeoutLines: ["[main] error TaskTimedOut: timed out after 3s"],
+    timeoutLines: ["error: [main] TaskTimedOut: timed out after 3s"],
   },
   { stoppedBy: "Ctrl-C", options: "", exitCode: 130, timeoutLines: [] },
 ] as const;
@@ -1028,10 +1235,17 @@ export default Task.make({ name: "main", run: ${body}${options} });`,
           }
           const exited = yield* command.waitForExit;
           expect(exited.exitCode, `${stoppedBy}\n${exited.standardError}`).toBe(exitCode);
-          const errorLines = (exited.standardError.match(/^\[main\] .*error .*$/gmu) ?? []).map(
-            (line) => line.replace(/^\[main\] \S+: error /u, "[main] error "),
-          );
+          const errorLines = (
+            exited.standardError.match(/^error: \[main\] \S+: \w+: .*$/gmu) ?? []
+          ).map((line) => line.replace(/^error: \[main\] \S+: /u, "error: [main] "));
           expect(errorLines, `${stoppedBy}: ${body}`).toEqual([...timeoutLines, ...cleanupLines]);
+          const recapLines = (exited.standardError.match(/^recap: .*$/gmu) ?? []).map((line) =>
+            line.replace(/^recap: \[main\] 1\.output \| \S+: /u, "error: [main] "),
+          );
+          const latestErrorLines = cleanupLines.length === 0 ? timeoutLines : cleanupLines;
+          expect(recapLines, `${stoppedBy}: ${body}`).toEqual(
+            timeoutLines.length === 0 ? [] : latestErrorLines.slice(-1),
+          );
         }),
       ),
     { concurrency: "unbounded", discard: true },
@@ -1042,20 +1256,17 @@ export const bodyCleanupFailed = makeTest(
   Effect.all(
     [
       stopBody(ensuringCleanup("Effect.fail(new CloseFailed())"), [
-        "[main] error CloseFailed: CloseFailed",
+        "error: [main] CloseFailed: CloseFailed",
       ]),
       stopBody(ensuringCleanup('Effect.die(new Error("close crashed"))'), [
-        "[main] error TaskBodyFailed: its body failed with close crashed",
+        "error: [main] Error: close crashed",
       ]),
       stopBody(scopeCleanup('Effect.die(new Error("scope close crashed"))'), [
-        "[main] error TaskBodyFailed: its body failed with scope close crashed",
+        "error: [main] Error: scope close crashed",
       ]),
       stopBody(
         `${scopeCleanup('Effect.die(new Error("scope close crashed"))')}.pipe(Effect.ensuring(Effect.fail(new CloseFailed())))`,
-        [
-          "[main] error CloseFailed: CloseFailed",
-          "[main] error TaskCleanupFailed: its cleanup failed with scope close crashed",
-        ],
+        ["error: [main] CloseFailed: CloseFailed", "error: [main] Error: scope close crashed"],
       ),
     ],
     { concurrency: "unbounded", discard: true },
@@ -1067,8 +1278,16 @@ export const bodyCleanupSucceeded = makeTest(
   stopBody(`${scopeCleanup("Effect.void")}.pipe(Effect.ensuring(Effect.void))`, []),
 );
 
-export const stillStoppingWithCleanupLimit = makeTest(
-  "a stopped task whose cleanup outlasts the notice says its commands are killed and the run stops waiting at its cleanup limit, then fails when the limit passes",
+const CLEANUP_MILLISECONDS_ATTRIBUTE = "sshkeda_task.cleanup.milliseconds";
+
+const CLEANUP_LIMIT_MILLISECONDS = 4000;
+
+const NANOSECONDS_PER_MILLISECOND = 1_000_000n;
+
+const SLEEP_TOLERANCE_MILLISECONDS = 100;
+
+export const stopPastCleanupLimit = makeTest(
+  "a stopped task whose cleanup outlasts its limit prints no progress line before it fails when the limit passes, and its stop span records the request with the limit and the limit passing",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -1086,14 +1305,35 @@ export default Task.make({
       const stopped = yield* command.waitForExit;
       expect(stopped.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(stopped.standardError).toContain(
-        "[main] still stopping after 2s; @sshkeda/task kills its commands and stops waiting for it when its 4s cleanup limit passes\n[main] error TaskCleanupTimedOut: its cleanup did not finish within 4s, so the run stopped waiting for it",
+        "stopping: press ctrl-c again to force\nerror: [main] main.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 4s, so the run stopped waiting for it\nended: [main], ",
+      );
+      expect(stopped.standardError).toMatch(
+        /\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+      );
+      expect(stopped.standardError).not.toContain(STILL_STOPPING);
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, stopped));
+      const stopEvents = trace?.findTaskSpan("cleanup", "main")?.events ?? [];
+      expect(
+        stopEvents.map((event) => [
+          event.name,
+          readAttribute(event.attributes, CLEANUP_MILLISECONDS_ATTRIBUTE),
+        ]),
+      ).toEqual([
+        ["stop requested", CLEANUP_LIMIT_MILLISECONDS],
+        ["cleanup limit passed", undefined],
+      ]);
+      const [requestedAt, limitPassedAt] = stopEvents.map((event) =>
+        Number(BigInt(event.timeUnixNano) / NANOSECONDS_PER_MILLISECOND),
+      );
+      expect(Number(limitPassedAt) - Number(requestedAt)).toBeGreaterThanOrEqual(
+        CLEANUP_LIMIT_MILLISECONDS - SLEEP_TOLERANCE_MILLISECONDS,
       );
     }),
   ),
 );
 
 export const cleanupFinishesShortlyAfterItsLimit = makeTest(
-  "a finalizer that outlasts its cleanup limit by less than the 2s a worker gets to exit still finishes after TaskCleanupTimedOut is printed",
+  "a finalizer that outlasts its cleanup limit by less than the 2s a worker gets to exit still finishes after its task fails with TaskCleanupTimedOut",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -1119,7 +1359,7 @@ export default Task.make({
       const stopped = yield* command.waitForExit;
       expect(stopped.exitCode, stopped.standardError).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(stopped.standardError).toMatch(
-        /^\[main\] error TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it\n(?:.*\n)*\[main\] released the lock\n(?:.*\n)*failed: main \(1 of 1 task\), [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nerror: \[main\] main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it\n(?:.*\n)*\[main\] released the lock\n(?:.*\n)*failed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
       expect(yield* exists(`${project.directory}/cleanup-finished`)).toBe(true);
     }),
@@ -1153,7 +1393,7 @@ export default Task.make({
       const stopped = yield* command.waitForExit;
       expect(stopped.exitCode, stopped.standardError).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(stopped.standardError).toContain(
-        "[main] error TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it\n",
+        "\nerror: [main] main.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it\n",
       );
       expect(stopped.standardError).not.toContain("released the lock");
       expect(yield* exists(`${project.directory}/cleanup-finished`)).toBe(false);
@@ -1162,7 +1402,7 @@ export default Task.make({
 );
 
 export const cleanupFinishesWhileAnotherTaskStops = makeTest(
-  "a finalizer past its cleanup limit keeps running while the run waits for a serving task to stop, and finishes long after TaskCleanupTimedOut is printed",
+  "a finalizer past its cleanup limit keeps running while the run waits for a serving task to stop, and finishes long after its task fails with TaskCleanupTimedOut",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -1200,7 +1440,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const stopped = yield* command.waitForExit;
       expect(stopped.exitCode, stopped.standardError).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(stopped.standardError).toMatch(
-        /^\[quick\] error TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it\n(?:.*\n)*\[quick\] released the lock\n(?:.*\n)*\[patient\] drained\n(?:.*\n)*failed: quick \(1 of 3 tasks\), 1 stopped, [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nerror: \[quick\] main\.ts:3:27: TaskCleanupTimedOut: its cleanup did not finish within 1s, so the run stopped waiting for it\n(?:.*\n)*\[quick\] released the lock\n(?:.*\n)*\[patient\] drained\n(?:.*\n)*failed: \[quick\] \(1 of 3 tasks\), 2 stopped, [\d.]+s\nrun: \S+\/$/u,
       );
       expect(yield* exists(`${project.directory}/quick-cleanup-finished`)).toBe(true);
     }),
@@ -1208,7 +1448,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
 );
 
 export const timedOutCleanupLimitOnce = makeTest(
-  "a timed-out task whose cleanup outlasts its limit says it is still stopping and fails its cleanup once",
+  "a timed-out task whose cleanup outlasts its limit prints no progress line and fails its cleanup once",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -1223,22 +1463,23 @@ export default Task.make({
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(1);
-      expect(ran.standardError).toContain(
-        "[main] error TaskTimedOut: timed out after 1s\n[main] still stopping after 2s; @sshkeda/task kills its commands and stops waiting for it when its 3s cleanup limit passes\n[main] error TaskCleanupTimedOut: its cleanup did not finish within 3s, so the run stopped waiting for it\n",
+      expect(ran.standardError).toMatch(
+        /\nerror: \[main\] main\.ts:3:21: TaskTimedOut: timed out after 1s\nerror: \[main\] main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 3s, so the run stopped waiting for it\nerror: \[main\] its output is in \S+\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 3s, so the run stopped waiting for it\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
-      expect(countOccurrences(ran.standardError, "[main] still stopping"), ran.standardError).toBe(
-        1,
+      expect(ran.standardError).not.toContain(STILL_STOPPING);
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
+      const stopEventNames = trace?.findTaskEventNames("cleanup", "main") ?? [];
+      expect(stopEventNames).toContain("stop requested");
+      expect(countOccurrences(stopEventNames.join("\n"), "cleanup limit passed")).toBe(1);
+      expect(countOccurrences(ran.standardError, "TaskCleanupTimedOut"), ran.standardError).toBe(
+        ERROR_AND_RECAP_LINES,
       );
-      expect(
-        countOccurrences(ran.standardError, "[main] error TaskCleanupTimedOut"),
-        ran.standardError,
-      ).toBe(1);
     }),
   ),
 );
 
 export const stoppedCommandIgnoresTerm = makeTest(
-  "stopping a task whose command ignores SIGTERM prints that it is still stopping, then SIGKILLs the command when the task's cleanup limit passes, so the run ends",
+  "stopping a task whose command ignores SIGTERM prints no progress line, then SIGKILLs the command when the task's cleanup limit passes, so the run ends",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -1257,9 +1498,7 @@ export default Task.make({ name: "main", run: Task.all([stubborn, failing]) });`
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        "[stubborn] still stopping after 2s; @sshkeda/task kills its commands and stops waiting for it when its 4s cleanup limit passes",
-      );
+      expect(ran.standardError).not.toContain(STILL_STOPPING);
       expect(ran.standardError).not.toContain("did not exit within 5s");
       expect(ran.standardError).toMatch(/^failed: \S.*, [\d.]+s$/mu);
     }),
@@ -1274,7 +1513,7 @@ export const suspendedCommandGetsTerm = makeTest(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const suspended = Task.make({ name: "suspended", run: Task.exec("sh", ["-c", "trap 'echo got TERM; exit 0' TERM; echo $$ > pid; kill -STOP $$; while true; do sleep 1; done"]), cleanup: "4 seconds" });
+export const suspended = Task.make({ name: "suspended", run: Task.exec("sh", ["-c", "trap 'echo got TERM; exit 0' TERM; echo $$ > pid; kill -STOP $$; while true; do sleep 1; done"], { print: true }), cleanup: "4 seconds" });
 export const failing = Task.make({ name: "failing", run: Effect.gen(function* () {
   yield* Task.exec("sh", ["-c", "until [ -s pid ] && ps -o stat= -p $(cat pid) | grep -q T; do sleep 0.05; done"]);
   return yield* Effect.fail(new TaskError({ message: "lint failed" }));
@@ -1284,9 +1523,11 @@ export default Task.make({ name: "main", run: Task.all([suspended, failing]) });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(1);
       expect(ran.standardError).toContain("[suspended] got TERM\n");
-      expect(ran.standardError).not.toContain("still stopping");
+      expect(ran.standardError).not.toContain(STILL_STOPPING);
       expect(ran.standardError).not.toContain("did not exit within");
-      expect(ran.standardError).toMatch(/^failed: failing \(1 of 3 tasks\), 1 stopped, [\d.]+s$/mu);
+      expect(ran.standardError).toMatch(
+        /^failed: \[failing\] \(1 of 3 tasks\), 1 stopped, [\d.]+s$/mu,
+      );
     }),
   ),
 );
@@ -1297,7 +1538,7 @@ export const stoppedCommandGetsCleanupLimit = makeTest(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Task } from "@sshkeda/task";
-export const slow = Task.make({ name: "slow", run: Task.exec("sh", ["-c", "trap 'echo got TERM; sleep 6; echo graceful done; exit 0' TERM; while true; do sleep 0.1; done"]), timeout: "1 second", cleanup: "20 seconds" });
+export const slow = Task.make({ name: "slow", run: Task.exec("sh", ["-c", "trap 'echo got TERM; sleep 6; echo graceful done; exit 0' TERM; while true; do sleep 0.1; done"], { print: true }), timeout: "1 second", cleanup: "20 seconds" });
 export default Task.make({ name: "main", run: Task.allSettled([slow]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
@@ -1390,9 +1631,8 @@ export default Task.make({
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain("[main] error TaskTimedOut: timed out after 1s");
-      expect(ran.standardError).toContain(
-        "[main] error TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it",
+      expect(ran.standardError).toMatch(
+        /^run: \S+\/\nerror: \[main\] main\.ts:3:21: TaskTimedOut: timed out after 1s\nerror: \[main\] main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it\nerror: \[main\] its output is in \S+\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
     }),
   ),
@@ -1416,7 +1656,10 @@ export default Task.make({
       const stopped = yield* command.waitForExit;
       expect(stopped.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(stopped.standardError).toContain(
-        "[main] still stopping after 2s; @sshkeda/task kills its commands and stops waiting for it when its 5s cleanup limit passes\n[main] error TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it",
+        "stopping: press ctrl-c again to force\nerror: [main] main.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it\nended: [main], ",
+      );
+      expect(stopped.standardError).toMatch(
+        /\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
     }),
   ),

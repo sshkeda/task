@@ -3,8 +3,10 @@ import type { Array as Arrays, Pull } from "effect";
 import { systemError } from "effect/PlatformError";
 import type { PlatformError } from "effect/PlatformError";
 
+import { addContext } from "../../../../../shared/report-cause.ts";
 import { StandardInputRead } from "../../../../../shared/rpc.ts";
 import type { StartTaskFiber } from "../../../../../shared/rpc.ts";
+import { StandardInputNotRead } from "../../../../../shared/standard-input-not-read.ts";
 import { StandardInputReadOutsideRootTask } from "../../../../../shared/task-errors.ts";
 import type { WorkerState } from "../../../shared/provide-worker-state.ts";
 
@@ -16,7 +18,14 @@ const pullOfStandardInputAnswer = (
     Ended: () => Cause.done(),
     Failed: ({ reason }) =>
       Effect.fail(
-        systemError({ _tag: "Unknown", module: "Stdio", method: "stdin", description: reason }),
+        systemError({
+          _tag: "Unknown",
+          module: "Stdio",
+          method: "stdin",
+          cause: new StandardInputNotRead({
+            reportedErrors: [addContext(reason, "could not read standard input")],
+          }),
+        }),
       ),
     Refused: ({ rootTaskName, taskName }) =>
       Effect.die(new StandardInputReadOutsideRootTask({ rootTaskName, taskName })),

@@ -1,8 +1,10 @@
-import { Array as Arrays, Cause, Clock, Option, References } from "effect";
-import type { Logger } from "effect";
+import type { Cause } from "effect";
+import { Array as Arrays, Clock, Logger, Option, References } from "effect";
 import { OtlpResource } from "effect/observability";
 
-import { encodeTraceJson } from "./encode-trace-json.ts";
+import { encodeTraceJson } from "../../../shared/encode-trace-json.ts";
+import { describeTraceExceptions } from "../../../shared/report-cause.ts";
+import { TaskEvent } from "../../../shared/rpc.ts";
 
 const NANOSECONDS_PER_MILLISECOND = 1_000_000n;
 
@@ -19,14 +21,15 @@ const SEVERITY_NUMBERS = {
   None: 0,
 } as const;
 
-const describeErrors = (errors: readonly Error[]) => {
-  const [firstError] = errors;
-  return firstError === undefined
+const describeExceptions = (cause: Cause.Cause<unknown>) => {
+  const exceptions = describeTraceExceptions(cause);
+  const [firstException] = exceptions;
+  return firstException === undefined
     ? {}
     : {
-        "exception.type": firstError.name,
-        "exception.message": firstError.message,
-        "exception.stacktrace": errors.map((error) => error.stack).join("\n"),
+        "exception.type": firstException.errorType,
+        "exception.message": firstException.message,
+        "exception.stacktrace": exceptions.map((exception) => exception.stacktrace).join("\n"),
       };
 };
 
@@ -51,7 +54,7 @@ export const makeTraceLogRecordJson = (options: Logger.Options<unknown>) => {
               eventMilliseconds - startTime,
             ]),
         ),
-        ...describeErrors(Cause.prettyErrors(options.cause, { includeCauseInStack: true })),
+        ...describeExceptions(options.cause),
       }),
     ),
     body: OtlpResource.unknownToAttributeValue(message.length === 1 ? message[0] : message),
@@ -62,3 +65,13 @@ export const makeTraceLogRecordJson = (options: Logger.Options<unknown>) => {
   };
   return Option.getOrUndefined(encodeTraceJson(logRecord));
 };
+
+export const makeTraceOnlyLogger = (
+  reportToMainThreadNow: (event: typeof TaskEvent.Type) => void,
+) =>
+  Logger.make((logEntry) => {
+    const traceLogRecordJson = makeTraceLogRecordJson(logEntry);
+    if (traceLogRecordJson !== undefined) {
+      reportToMainThreadNow(TaskEvent.cases.TraceLogRecordRequested.make({ traceLogRecordJson }));
+    }
+  });

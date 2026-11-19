@@ -52,7 +52,7 @@ console.log(made._tag, made.location);`,
         `export const made = new globalThis.TaskError({ message: "m" });\n`,
       );
       expect(yield* Task.exec(binaryPath, [], { cwd: binaryDirectory })).toBe(
-        `TaskError ${binaryDirectory}/makes-error.js:1:36\n`,
+        `TaskError ${binaryDirectory}/makes-error.js:1:21\n`,
       );
     }),
   ),
@@ -72,7 +72,7 @@ export default Task.make({ name: "root", run: Effect.log("root ran") });`,
         Effect.catchTag("CommandFailed", (failure) =>
           Effect.sync(() => {
             expect(failure.standardError)
-              .toBe(`error RunCalledInStandaloneExecutable: @sshkeda/task can't run "root" inside a bun build --compile binary, which holds only its bundle, not the task source files it imports again to run tasks
+              .toBe(`error: RunCalledInStandaloneExecutable: @sshkeda/task can't run [root] inside a bun build --compile binary, which holds only its bundle, not the task source files it imports again to run tasks
 `);
             expect(failure.code).toBe(1);
             expect(failure.standardOutput).not.toContain("root ran");

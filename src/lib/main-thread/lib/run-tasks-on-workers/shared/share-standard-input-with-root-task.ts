@@ -1,7 +1,8 @@
 import { Cause, Effect, FiberSet, Pull, Ref, Scope, Semaphore, Stdio, Stream } from "effect";
 
 import { InternalInvariantBroken } from "../../../../../shared/invariant-errors.ts";
-import { describeCauseMessage } from "../../../../../shared/report-errors.ts";
+import { reportUnderlyingErrors } from "../../../../../shared/report-cause.ts";
+import { UNTAGGED_FAILURE_TAG } from "../../../../../shared/report-errors.ts";
 import type { StandardInputRead } from "../../../../../shared/rpc.ts";
 import { RunRootTaskConfig } from "../../../shared/provide-run-root-task-config.ts";
 import {
@@ -38,7 +39,10 @@ export const makeRootTaskStandardInput = Effect.gen(function* () {
         onFailure: (cause) =>
           Effect.succeed(
             StandardInputEvent.cases.ReceiveFailure.make({
-              reason: describeCauseMessage(Cause.squash(cause)),
+              reason: reportUnderlyingErrors(
+                { cause: Cause.squash(cause) },
+                UNTAGGED_FAILURE_TAG,
+              )[0],
             }),
           ),
       }),

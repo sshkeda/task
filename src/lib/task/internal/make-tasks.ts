@@ -162,9 +162,7 @@ export const make = <
       Services
     >(
       givenDescription,
-      Effect.die(
-        new TaskDefinitionNotGiven({ given: givenDescription, location: location ?? Bun.main }),
-      ),
+      Effect.die(new TaskDefinitionNotGiven({ given: givenDescription, location })),
       resolveTaskOptions({}),
       NO_TASK_OUTPUT,
       null,

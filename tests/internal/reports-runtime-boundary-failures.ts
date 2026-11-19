@@ -39,7 +39,11 @@ const injectedFailure = (input: {
       expect(result.exitCode).toBe(1);
       expect(result.standardError).toContain(input.expectedError);
       expect(
-        input.errorTags.some((errorTag) => result.standardError.includes(`error ${errorTag}: `)),
+        input.errorTags.some((errorTag) =>
+          new RegExp(`^error: (?:\\[[^\\]]+\\] )?(?:\\S+: )?${errorTag}: `, "mu").test(
+            result.standardError,
+          ),
+        ),
       ).toBe(true);
       expect(findMisprintedErrorLines(result.standardError)).toEqual([]);
       expect(result.standardError).not.toContain("timed out");
@@ -56,9 +60,8 @@ export const moduleImport = makeTest(
         "try: () => Promise.reject(new Error('injected import failure'))",
       ],
     ],
-    expectedError:
-      "main.ts: error TaskModuleImportFailed: could not import task module because injected import failure",
-    errorTags: ["TaskModuleImportFailed"],
+    expectedError: "main.ts: Error: injected import failure\nerror: could not import task module\n",
+    errorTags: ["Error"],
   }),
 );
 
@@ -73,8 +76,8 @@ export const workerImport = makeTest(
       ],
     ],
     expectedError:
-      "[main] main.ts: error TaskModuleImportFailed: could not import task module because injected worker import failure",
-    errorTags: ["TaskModuleImportFailed"],
+      "error: [main] main.ts: Error: injected worker import failure\nerror: [main] could not import task module\n",
+    errorTags: ["Error"],
   }),
 );
 
@@ -88,7 +91,7 @@ export const workerExport = makeTest(
         "findTasksMadeWithName('missing-task')",
       ],
     ],
-    expectedError: "error TaskNotRegisteredInWorker: importing",
+    expectedError: "error: [main] main.ts: TaskNotRegisteredInWorker: importing",
     errorTags: ["TaskNotRegisteredInWorker"],
   }),
 );
@@ -109,7 +112,7 @@ export const processInspection = makeTest(
       ],
     ],
     expectedError: "to find leftover processes",
-    errorTags: ["ProcDirectoryUnlistable", "ProcessTableNotRead"],
+    errorTags: ["Error", "SystemCallFailed"],
   }),
 );
 
@@ -130,7 +133,8 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
   const child = yield* ChildProcess.make("bun", ["-e", "process.exit(0)"], { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
   yield* child.exitCode;
 }) });`,
-    expectedError: "[main] error ProcessNotSignaled: could not send",
-    errorTags: ["ProcessNotSignaled"],
+    expectedError:
+      "error: [main] main.ts:4:21: Error: injected signal failure\nerror: [main] could not send ",
+    errorTags: ["Error"],
   }),
 );

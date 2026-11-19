@@ -7,8 +7,6 @@ import { formatPropertyAccess } from "./format-property-access.ts";
 
 const formatIssue = SchemaIssue.makeFormatterStandardSchemaV1();
 
-const VALUE_GOT = /, got .*$/su;
-
 export const encodeTaskOutput = (
   taskName: string,
   handedOver: TaskOutputInvalid["handedOver"],
@@ -34,7 +32,7 @@ export const encodeTaskOutput = (
                 ),
               )
               .join(""),
-            expectation: (firstIssue?.message ?? "").replace(VALUE_GOT, ""),
+            expectation: firstIssue?.message ?? "",
           }),
         );
       }),

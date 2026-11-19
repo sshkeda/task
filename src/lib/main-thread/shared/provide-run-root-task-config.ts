@@ -1,6 +1,5 @@
 import { Clock, Context, Effect, FileSystem, Layer, Path } from "effect";
 
-import { makeNodeModulesPackageFinder } from "../../../shared/find-node-modules-package-directory.ts";
 import { setProjectDirectoryPath } from "../../../shared/find-user-locations-in-stack-traces.ts";
 import {
   readSetupLimit,
@@ -12,6 +11,7 @@ import {
   workingDirectoryPath,
 } from "../../../shared/read-environment-config.ts";
 import type { takeRunArgument } from "../../../shared/read-environment-config.ts";
+import { setStartDirectoryPath } from "../../../shared/start-directory-path.ts";
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
 import { createRunMarker } from "../../kill-leftover-processes/index.ts";
 import { readSupervisorRunMarker } from "../../supervise-the-run/index.ts";
@@ -22,42 +22,20 @@ import {
 import { RootTaskFileUnavailable } from "./main-thread-errors.ts";
 import { readPackageJson } from "./read-package-json.ts";
 
-const readTraceDirectoryName = Effect.fn("readTraceDirectoryName")(function* (
-  rootTaskFilePath: string,
-  rootTaskPackageJsonDirectoryPath: string,
-) {
-  const path = yield* Path.Path;
+const findProjectDirectory = Effect.fn(function* (rootTaskPackageJsonDirectoryPath: string) {
   const startPackageJsonDirectoryPath = yield* findPackageJsonDirectoryPath(
     yield* workingDirectoryPath,
-  ).pipe(Effect.catchTag("PackageJsonSearchFailed", () => Effect.succeed(null)));
-  const startsInsideAnInstalledPackage =
-    startPackageJsonDirectoryPath !== null &&
-    makeNodeModulesPackageFinder(startPackageJsonDirectoryPath)(rootTaskFilePath) !== null;
-  if (startsInsideAnInstalledPackage) {
-    const startDirectoryName = path.basename(startPackageJsonDirectoryPath);
-    return yield* readPackageJson(startPackageJsonDirectoryPath).pipe(
-      Effect.map((packageJson) => packageJson.name ?? startDirectoryName),
-      Effect.catchTag(
-        [
-          "PackageJsonUnreadable",
-          "PackageJsonNotJson",
-          "PackageJsonNotObject",
-          "PackageJsonNameNotString",
-          "PackageJsonNameBlank",
-          "PackageJsonNameInvalid",
-          "PackageJsonFieldInvalid",
-        ],
-        () => Effect.succeed(startDirectoryName),
-      ),
-    );
-  }
-  return (
-    (yield* readPackageJson(rootTaskPackageJsonDirectoryPath)).name ??
-    path.basename(rootTaskPackageJsonDirectoryPath)
   );
+  const startsInsideTheRootTaskPackage =
+    startPackageJsonDirectoryPath === null ||
+    startPackageJsonDirectoryPath === rootTaskPackageJsonDirectoryPath ||
+    startPackageJsonDirectoryPath.startsWith(`${rootTaskPackageJsonDirectoryPath}/`);
+  return startsInsideTheRootTaskPackage
+    ? rootTaskPackageJsonDirectoryPath
+    : startPackageJsonDirectoryPath;
 });
 
-const readRunRootTaskConfig = Effect.fn("readRunRootTaskConfig")(function* (
+const readRunRootTaskConfig = Effect.fn(function* (
   runArgument: Effect.Success<typeof takeRunArgument>,
   supervisorProcessId: number | null,
 ) {
@@ -72,11 +50,13 @@ const readRunRootTaskConfig = Effect.fn("readRunRootTaskConfig")(function* (
       Effect.mapError((cause) => new RootTaskFileUnavailable({ filePath: scriptFilePath, cause })),
     );
   const rootTaskPackageJsonDirectoryPath = yield* requirePackageJsonDirectoryPath(rootTaskFilePath);
-  yield* setProjectDirectoryPath(rootTaskPackageJsonDirectoryPath);
-  const traceDirectoryName = yield* readTraceDirectoryName(
-    rootTaskFilePath,
-    rootTaskPackageJsonDirectoryPath,
-  );
+  const projectDirectoryPath = yield* findProjectDirectory(rootTaskPackageJsonDirectoryPath);
+  yield* setProjectDirectoryPath(projectDirectoryPath);
+  const workingDirectoryPathAtStart = yield* workingDirectoryPath;
+  yield* setStartDirectoryPath(workingDirectoryPathAtStart);
+  const projectRunsDirectoryName =
+    (yield* readPackageJson(projectDirectoryPath)).name ??
+    (yield* Path.Path).basename(projectDirectoryPath);
 
   const { stateDirectoryPath, configuredStateDirectoryPath } = yield* readStateDirectory();
   yield* passStateDirectoryToCommands(configuredStateDirectoryPath);
@@ -98,8 +78,9 @@ const readRunRootTaskConfig = Effect.fn("readRunRootTaskConfig")(function* (
     configuredStateDirectoryPath,
     rootTaskFilePath,
     rootTaskPackageJsonDirectoryPath,
-    traceDirectoryName,
-    workingDirectoryPathAtStart: yield* workingDirectoryPath,
+    projectDirectoryPath,
+    projectRunsDirectoryName,
+    workingDirectoryPathAtStart,
     runStartedAtMilliseconds,
     runProcessId: supervisorProcessId ?? process.pid,
     ownsSession: supervisorProcessId !== null,

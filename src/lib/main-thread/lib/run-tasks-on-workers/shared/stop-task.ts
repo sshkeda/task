@@ -1,9 +1,8 @@
 import { Array as Arrays, Clock, Deferred, Effect, Exit, Option, Duration } from "effect";
 
 import { dieOnInvariantFailure } from "../../../../../shared/invariant-errors.ts";
+import { nameTask } from "../../../../../shared/label-lines.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../../../shared/names-from-package-json.ts";
-import { printTaskLines } from "../../../../../shared/print-to-standard-error.ts";
-import { TASK_PACKAGE } from "../../../../../shared/task-package.ts";
 import { failTask } from "../../../shared/fail-run.ts";
 import {
   TaskCleanupFrozeWorker,
@@ -19,15 +18,18 @@ import { isOnWorker } from "./define-task-run-status.ts";
 import { findStopRequestedAt, hasCleanupStarted, TaskStopEvent } from "./define-task-stop-stage.ts";
 import type { moveTaskStopStage } from "./define-task-stop-stage.ts";
 
-const STILL_STOPPING_NOTICE_SECONDS = 2;
+const STOP_REQUESTED_EVENT = "stop requested";
 
-const STILL_STOPPING_NOTICE_AFTER = Duration.seconds(STILL_STOPPING_NOTICE_SECONDS);
+const CLEANUP_LIMIT_PASSED_EVENT = "cleanup limit passed";
 
-const failCleanup = Effect.fn("failCleanup")(function* (
+const NANOSECONDS_PER_MILLISECOND = 1_000_000n;
+
+const failCleanup = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   failure: TaskCleanupFrozeWorker | TaskCleanupNotStarted | TaskCleanupTimedOut,
 ) {
   yield* (yield* StopState).recordFirstFailure(failure);
+  yield* taskRunsState.recordCleanupFailure(failure.taskName, failure);
   yield* failTask(failure, taskRunsState.markFailed);
 });
 
@@ -54,34 +56,16 @@ export const interruptDependencyRequests = (taskRun: ReturnType<typeof makeTaskR
 
 const awaitBodyFinishedWithinLimit = (
   taskRun: ReturnType<typeof makeTaskRun>,
-  taskName: string,
   cleanupDuration: Duration.Duration,
   sinceStopRequested: Duration.Duration,
 ) =>
-  Effect.gen(function* () {
-    const isBeforeNotice = Duration.isLessThan(sinceStopRequested, STILL_STOPPING_NOTICE_AFTER);
-    if (!isBeforeNotice) {
-      return yield* Deferred.await(taskRun.bodyFinishedDeferred);
-    }
-    const finishedBeforeNotice = yield* Deferred.await(taskRun.bodyFinishedDeferred).pipe(
-      Effect.timeoutOption(Duration.subtract(STILL_STOPPING_NOTICE_AFTER, sinceStopRequested)),
-    );
-    if (Option.isSome(finishedBeforeNotice)) {
-      return;
-    }
-    yield* printTaskLines(
-      "Warn",
-      taskName,
-      `still stopping after ${Duration.format(STILL_STOPPING_NOTICE_AFTER)}; ${TASK_PACKAGE.name} kills its commands and stops waiting for it when its ${Duration.format(cleanupDuration)} cleanup limit passes`,
-    );
-    yield* Deferred.await(taskRun.bodyFinishedDeferred);
-  }).pipe(
+  Deferred.await(taskRun.bodyFinishedDeferred).pipe(
     Effect.timeoutOption(
       Duration.max(Duration.subtract(cleanupDuration, sinceStopRequested), Duration.zero),
     ),
   );
 
-const watchWorkerOfCleanupPastItsLimit = Effect.fn("watchWorkerOfCleanupPastItsLimit")(function* (
+const watchWorkerOfCleanupPastItsLimit = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   workerId: number,
@@ -126,7 +110,7 @@ const watchWorkerOfCleanupPastItsLimit = Effect.fn("watchWorkerOfCleanupPastItsL
   }
   yield* workerPool.requestWorkerTermination(
     workerId,
-    `because its cleanup of "${taskName}" ran past its ${Duration.format(cleanupDuration)} limit and then it stopped answering`,
+    `because its cleanup of ${nameTask(taskName)} ran past its ${Duration.format(cleanupDuration)} limit and then it stopped answering`,
     taskName,
   );
   yield* failCleanup(
@@ -138,14 +122,13 @@ const watchWorkerOfCleanupPastItsLimit = Effect.fn("watchWorkerOfCleanupPastItsL
   );
 });
 
-export const stopTask = Effect.fn("stopTask")(function* (
+export const stopTask = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   watchUntilStopsEnd: <Services>(
     watch: Effect.Effect<void, never, Services>,
   ) => Effect.Effect<void, never, Services>,
 ) {
-  yield* Effect.annotateCurrentSpan(`${TASK_TRACE_LABEL_PREFIX}.task`, taskName);
   const processGroups = yield* ProcessGroups;
   const discoveredTask = taskRunsState.discoveredTasksByName.get(taskName);
   const taskRun = taskRunsState.runsByTaskName.get(taskName);
@@ -162,7 +145,7 @@ export const stopTask = Effect.fn("stopTask")(function* (
   const workerPool = yield* WorkerPool;
   const cleanupDuration = discoveredTask.cleanupDuration;
   const cleanupMilliseconds = Duration.toMillis(cleanupDuration);
-  const notAnsweredReason = `because it did not answer the stop of "${taskName}" within ${Duration.format(cleanupDuration)}`;
+  const notAnsweredReason = `because it did not answer the stop of ${nameTask(taskName)} within ${Duration.format(cleanupDuration)}`;
   const failPastLimit = (
     terminationReason: string,
     failure: TaskCleanupNotStarted | TaskCleanupTimedOut,
@@ -185,7 +168,7 @@ export const stopTask = Effect.fn("stopTask")(function* (
         new TaskCleanupNotStarted({ taskName, cleanupMilliseconds }),
       ),
       failStillLoading: failPastLimit(
-        `because it did not stop loading "${taskName}" within ${Duration.format(cleanupDuration)}`,
+        `because it did not stop loading ${nameTask(taskName)} within ${Duration.format(cleanupDuration)}`,
         new TaskCleanupNotStarted({ taskName, cleanupMilliseconds }),
       ),
       failTimedOutNotAnswered: failPastLimit(
@@ -210,15 +193,20 @@ export const stopTask = Effect.fn("stopTask")(function* (
   yield* act(requestAction);
   const stopRequestedAtMilliseconds = findStopRequestedAt(stage);
   if (stopRequestedAtMilliseconds !== null) {
+    const stopRequestedAt = BigInt(stopRequestedAtMilliseconds) * NANOSECONDS_PER_MILLISECOND;
+    const cleanupSpan = yield* taskRunsState.openCleanupSpan(taskName, stopRequestedAt);
+    cleanupSpan?.event(STOP_REQUESTED_EVENT, stopRequestedAt, {
+      [`${TASK_TRACE_LABEL_PREFIX}.cleanup.milliseconds`]: cleanupMilliseconds,
+    });
     const ended = yield* awaitBodyFinishedWithinLimit(
       taskRun,
-      taskName,
       cleanupDuration,
       Duration.millis(nowMilliseconds - stopRequestedAtMilliseconds),
     );
     if (Option.isSome(ended)) {
       return;
     }
+    cleanupSpan?.event(CLEANUP_LIMIT_PASSED_EVENT, yield* Clock.currentTimeNanos, {});
   }
   yield* taskRun.stop.move(TaskStopEvent.cases.PassLimit.make({})).pipe(
     Effect.flatMap(([, limitAction]) => act(limitAction)),

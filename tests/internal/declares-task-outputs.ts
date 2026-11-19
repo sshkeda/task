@@ -108,7 +108,7 @@ export const droppedOutputs = makeTest(
       expect(ran.standardError).toMatch(/^passed: 6 tasks, [\d.]+s$/mu);
       expect(yield* read(`${project.directory}/checked.txt`)).toBe("checked");
       const stateFiles = yield* readStateDirectoryTexts(project.home);
-      expect(stateFiles.some((file) => file.path.startsWith("traces/"))).toBe(true);
+      expect(stateFiles.some((file) => file.path.startsWith("runs/"))).toBe(true);
       expect(ran.standardOutput).not.toContain(DROPPED_SECRET);
       expect(ran.standardError).not.toContain(DROPPED_SECRET);
       expect(
@@ -135,9 +135,32 @@ export default Task.make({
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(1);
       expect(ran.standardError).toMatch(
-        /^\[main\] error TaskOutputInvalid: returned a value that does not match the task's output at \.deploy\.url: Expected string$/mu,
+        /^error: \[main\] main\.ts:3:21: TaskOutputInvalid: returned a value that does not match the task's output at \.deploy\.url: Expected string$/mu,
       );
       expect(ran.standardError).not.toContain("20260101");
+    }),
+  ),
+);
+
+export const mismatchedOutputMessage = makeTest(
+  "a task whose value fails a check with its own message prints that whole message in TaskOutputInvalid",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect, Schema } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({
+  name: "main",
+  output: Schema.String.check(Schema.isMinLength(3, { message: "Expected a greeting, got too few letters for one" })),
+  run: Effect.succeed("hi"),
+});
+`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toMatch(
+        /^error: \[main\] main\.ts:3:21: TaskOutputInvalid: returned a value that does not match the task's output: Expected a greeting, got too few letters for one$/mu,
+      );
     }),
   ),
 );
@@ -186,7 +209,7 @@ export const redactedOutputs = makeTest(
         `${OUTPUT_SECRET}|${OUTPUT_SECRET}`,
       );
       const stateFiles = yield* readStateDirectoryTexts(project.home);
-      expect(stateFiles.some((file) => file.path.startsWith("traces/"))).toBe(true);
+      expect(stateFiles.some((file) => file.path.startsWith("runs/"))).toBe(true);
       expect(ran.standardOutput).not.toContain(OUTPUT_SECRET);
       expect(ran.standardError).not.toContain(OUTPUT_SECRET);
       expect(

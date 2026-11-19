@@ -39,17 +39,30 @@ const PACKAGE_FILES_LOADED_BY_PATH = [
 ].map((packageFile) => `node_modules/${packageJson.name}/${packageFile}`);
 
 const CONSUMER_SOURCE_FILES = {
-  "tasks.ts": `import { Effect, Schema } from "effect";
-import { Task } from "@sshkeda/task";
-import { CommandFailed } from "@sshkeda/task/errors";
+  "tasks.ts": `import { Effect, Layer, Schema } from "effect";
+import { Task, Tasks } from "@sshkeda/task";
+import { CommandFailed, type PrintableError } from "@sshkeda/task/errors";
 const echoOptions = { timeout: "1 minute", cleanup: "5 seconds" } as const;
 export const echoed = Task.make({ name: "echoed", output: Schema.String, run: Task.exec("echo", ["echoed"]), ...echoOptions });
 export const main = Task.make({ name: "main", run: Effect.gen(function* () {
   const printed = yield* echoed;
   yield* Effect.log(\`strict consumer saw \${printed.trim()}\`);
+  const stubbed = yield* Task.exec("echo", ["stubbed"]).pipe(Effect.provide(stubbedTasks));
+  yield* Effect.log(\`strict consumer with stubbed Tasks saw \${stubbed.trim()}\`);
 }) });
+export const stubbedTasks = Layer.succeed(Tasks, {
+  requestResult: () => Effect.die("the stub requests no tasks"),
+});
 export const isCommandFailure = (failure: unknown): failure is CommandFailed =>
   failure instanceof CommandFailed;
+export const commandFailureLocation = (failure: { readonly location?: string }) => failure.location;
+export const describedCommandFailure = (failure: CommandFailed) => commandFailureLocation(failure);
+export const commandFailureStdio = (failure: CommandFailed): { readonly stdio?: "inherit" } => failure;
+export const printableErrorFields = (printable: PrintableError): {
+  readonly taskName?: string;
+  readonly context?: readonly string[];
+  readonly outputLines?: readonly (string | null)[];
+} => printable;
 export const echoedText = (text: string) => Task.exec("echo", [text]);
 `,
   "count-lines.ts": `import { Effect } from "effect";
@@ -59,8 +72,13 @@ export const echoedLineCount = (text: string) =>
 `,
   "refused.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
+import { CommandFailed } from "@sshkeda/task/errors";
 // @ts-expect-error
 export const dated = Task.make({ name: "dated", output: Date, run: Effect.succeed(new Date()) });
+const commandEnd = { command: "sh", code: 1, standardOutput: "", standardError: "" };
+export const plainFailure = new CommandFailed(commandEnd);
+// @ts-expect-error
+export const nestedFailure = new CommandFailed({ ...commandEnd, nestedRecapLines: [] });
 `,
   "run.ts": `import { main } from "./tasks.ts";
 export default main;
@@ -167,7 +185,7 @@ export const strictConsumerUsesPackedTarball = makeTest(
       const emittedDeclarations = yield* fileSystem.readFileString(
         path.join(consumer, "declarations/tasks.d.ts"),
       );
-      expect(emittedDeclarations).toContain(`import { Task } from "${packageJson.name}";`);
+      expect(emittedDeclarations).toContain(`import { Task, Tasks } from "${packageJson.name}";`);
       expect(emittedDeclarations).toContain(`from "${packageJson.name}/errors"`);
       expect(emittedDeclarations).not.toMatch(/import\("\.\.\/|from "\.\.\//u);
       expect(
@@ -179,6 +197,7 @@ export const strictConsumerUsesPackedTarball = makeTest(
       );
       expect(ran.exitCode).toBe(0);
       expect(ran.standardError).toContain("[main] strict consumer saw echoed");
+      expect(ran.standardError).toContain("[main] strict consumer with stubbed Tasks saw stubbed");
     }),
   ),
   "2 minutes",

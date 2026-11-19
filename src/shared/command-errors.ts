@@ -63,6 +63,20 @@ export class CommandOutputTooLong extends Schema.TaggedError<CommandOutputTooLon
   }
 }
 
+export class WorkingDirectoryUnusable extends Schema.TaggedError<WorkingDirectoryUnusable>()(
+  "WorkingDirectoryUnusable",
+  {
+    ...TASK_ERROR_FIELDS,
+    workingDirectory: Schema.String,
+    whatIsWrong: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  public override get message() {
+    return `the working directory ${this.workingDirectory} ${this.whatIsWrong}`;
+  }
+}
+
 export const CommandRefusal = Schema.Union([
   CommandPipelineRefused,
   CommandOptionsRefused,

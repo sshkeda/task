@@ -19,15 +19,18 @@ import {
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import type { CommandLine } from "effect/process";
 
+import type { ProcessIdentity } from "../../../../../shared/claim-processes-to-report.ts";
 import {
   CommandOptionsRefused,
   CommandPipelineRefused,
   RedactedNonStringRefused,
   RedactedValueWithNulRefused,
+  WorkingDirectoryUnusable,
 } from "../../../../../shared/command-errors.ts";
 import type { CommandRefusal } from "../../../../../shared/command-errors.ts";
-import { formatFailureLines } from "../../../../../shared/format-error-lines.ts";
+import { describeFailureLines } from "../../../../../shared/format-error-lines.ts";
 import { markKilledBySignal } from "../../../../../shared/killed-by-signal.ts";
+import { TaskLines } from "../../../../../shared/mark-task-worker-thread-contexts.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../../../shared/names-from-package-json.ts";
 import {
   environmentEveryCommandSees,
@@ -40,17 +43,21 @@ import {
   makeStandardInputRunner,
   markStandardInputClosedByCommand,
 } from "../../../../../shared/standard-input-streams.ts";
+import { STOP_GRACE_PERIOD } from "../../../../../shared/stop-signals.ts";
 import type { StandardInputReadOutsideRootTask } from "../../../../../shared/task-errors.ts";
 import { TASK_PACKAGE } from "../../../../../shared/task-package.ts";
 import {
   findStartedGroupWitnessNow,
+  listMembersLeftByLeader,
   processGroupHasOnlyEndedMembers,
-  readLatestMemberStartTime,
+  readMembersAtLeaderExit,
 } from "../../../../kill-leftover-processes/index.ts";
 import { WorkerState } from "../../../shared/provide-worker-state.ts";
 import { ProcessGroupNotSignaledByWorker } from "../../../shared/worker-thread-errors.ts";
 
 const MODULE = "ChildProcess";
+
+const reportWarning = (text: string) => TaskLines.use((taskLines) => taskLines.printWarning(text));
 
 const OUTPUT_NAMES = ["stdout", "stderr"] as const;
 
@@ -104,58 +111,119 @@ const holdsNul = (word: CommandLine.Word | undefined) =>
 const isBrokenPipe = (failure: PlatformError.PlatformError) =>
   Predicate.hasProperty(failure.cause, "code") && failure.cause.code === "EPIPE";
 
-const describeExit = (subprocess: Bun.Subprocess, latestMemberStartTime: string | null) => ({
+const describeExit = (
+  subprocess: Bun.Subprocess,
+  membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[],
+) => ({
   code: subprocess.exitCode,
   signal: subprocess.signalCode,
   usage: subprocess.resourceUsage(),
-  latestMemberStartTime,
+  membersAtLeaderExit,
 });
 
-export const blameMissingWorkingDirectory = (
-  programName: string,
-  packageDirectoryPath: string,
-  workingDirectory: string,
-  spawnFailure: PlatformError.PlatformError,
-) => {
-  const describedWorkingDirectory = workingDirectory.startsWith(`${packageDirectoryPath}/`)
-    ? workingDirectory.slice(packageDirectoryPath.length + 1)
-    : workingDirectory;
-  const workingDirectoryFailure = (_tag: "BadResource" | "NotFound", whatIsWrong: string) =>
-    PlatformError.systemError({
-      _tag,
-      module: MODULE,
-      method: "spawn",
-      pathOrDescriptor: programName,
-      description: `the working directory ${describedWorkingDirectory} ${whatIsWrong}`,
-      cause: spawnFailure.reason.cause,
-    });
-  return FileSystem.FileSystem.use((fileSystem) => fileSystem.stat(workingDirectory)).pipe(
+const UNUSABLE_WORKING_DIRECTORIES = {
+  missing: { reasonTag: "NotFound", whatIsWrong: "doesn't exist" },
+  notADirectory: { reasonTag: "BadResource", whatIsWrong: "is not a directory" },
+} as const;
+
+const findUnusableWorkingDirectory = (workingDirectory: string) =>
+  FileSystem.FileSystem.use((fileSystem) => fileSystem.stat(workingDirectory)).pipe(
     Effect.map((workingDirectoryInformation) =>
       workingDirectoryInformation.type === "Directory"
-        ? spawnFailure
-        : workingDirectoryFailure("BadResource", "is not a directory"),
+        ? null
+        : {
+            unusable: UNUSABLE_WORKING_DIRECTORIES.notADirectory,
+            found: workingDirectoryInformation.type,
+          },
     ),
-    Effect.catchReason("PlatformError", "NotFound", () =>
-      Effect.succeed(workingDirectoryFailure("NotFound", "doesn't exist")),
+    Effect.catchReason("PlatformError", "NotFound", (notFound) =>
+      Effect.succeed({ unusable: UNUSABLE_WORKING_DIRECTORIES.missing, found: notFound }),
     ),
-    Effect.flatMap(Effect.fail),
   );
+
+const makeWorkingDirectoryFailure = (
+  programName: string,
+  runDirectoryPath: string,
+  workingDirectory: string,
+  unusable: (typeof UNUSABLE_WORKING_DIRECTORIES)[keyof typeof UNUSABLE_WORKING_DIRECTORIES],
+  cause: PlatformError.PlatformError | PlatformError.SystemError | string,
+) => {
+  const unusableWorkingDirectory = new WorkingDirectoryUnusable({
+    workingDirectory: workingDirectory.startsWith(`${runDirectoryPath}/`)
+      ? workingDirectory.slice(runDirectoryPath.length + 1)
+      : workingDirectory,
+    whatIsWrong: unusable.whatIsWrong,
+    cause,
+  });
+  return PlatformError.systemError({
+    _tag: unusable.reasonTag,
+    module: MODULE,
+    method: "spawn",
+    pathOrDescriptor: programName,
+    description: unusableWorkingDirectory.message,
+    cause: unusableWorkingDirectory,
+  });
 };
 
-export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
+export const checkWorkingDirectoryBeforeSpawn = (
+  programName: string,
+  runDirectoryPath: string,
+  workingDirectory: string,
+) =>
+  findUnusableWorkingDirectory(workingDirectory).pipe(
+    Effect.flatMap((found) =>
+      found === null
+        ? Effect.void
+        : Effect.fail(
+            makeWorkingDirectoryFailure(
+              programName,
+              runDirectoryPath,
+              workingDirectory,
+              found.unusable,
+              found.found,
+            ),
+          ),
+    ),
+  );
+
+export const recheckWorkingDirectoryAfterSpawnFailure = (
+  programName: string,
+  runDirectoryPath: string,
+  workingDirectory: string,
+  spawnFailure: PlatformError.PlatformError,
+) =>
+  findUnusableWorkingDirectory(workingDirectory).pipe(
+    Effect.matchEffect({
+      onFailure: () => Effect.fail(spawnFailure),
+      onSuccess: (found) =>
+        Effect.fail(
+          found === null
+            ? spawnFailure
+            : makeWorkingDirectoryFailure(
+                programName,
+                runDirectoryPath,
+                workingDirectory,
+                found.unusable,
+                spawnFailure,
+              ),
+        ),
+    }),
+  );
+
+export const spawnWithBun = Effect.fn(function* (
   command: ChildProcess.Command,
   taskName: string,
   standardInputRefusal: StandardInputReadOutsideRootTask | null,
-  packageDirectoryPath: string,
+  runDirectoryPath: string,
   cleanupDuration: Duration.Duration,
   leaderExitHandlers: {
     readonly onLeaderExited: (
       processId: number,
-      latestMemberStartTime: string | null,
+      membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[],
     ) => Effect.Effect<void>;
     readonly killMembersLeftByLeader: (
       processId: number,
-      latestMemberStartTime: string,
+      membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[],
     ) => Effect.Effect<void, { readonly message: string }>;
   },
 ) {
@@ -169,6 +237,10 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
   const spawnOptions = command.options;
   const readForceKillAfter = (killOptions: ChildProcess.KillOptions | undefined) =>
     Duration.fromInputUnsafe(killOptions?.forceKillAfter ?? cleanupDuration);
+  const readLimitAfterLeaderExit = () => {
+    const forceKillAfter = readForceKillAfter(spawnOptions);
+    return Duration.isFinite(forceKillAfter) ? forceKillAfter : STOP_GRACE_PERIOD;
+  };
   const unsupported = [
     spawnOptions.shell !== undefined && "shell",
     spawnOptions.detached === false && "detached: false",
@@ -234,6 +306,8 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
     stderr: Deferred.makeUnsafe<number>(),
   };
   const outputMayEndWhenIdle = Deferred.makeUnsafe<void>();
+  const outputMayBeHeldOutsideGroup = Deferred.makeUnsafe<void>();
+  const outputHeldOutsideGroupReported = Deferred.makeUnsafe<void>();
   const exitedDeferred = Deferred.makeUnsafe<
     ReturnType<typeof describeExit>,
     PlatformError.PlatformError
@@ -270,12 +344,14 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
   const signalMembersLeftByLeader = (
     subprocess: Bun.Subprocess,
     signal: ChildProcess.Signal,
-    latestMemberStartTimeAtLeaderExit: string,
+    membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[],
   ) =>
-    findStartedGroupWitnessNow(null, subprocess.pid, {
-      leaderStartTime: null,
-      latestMemberStartTimeAtLeaderExit,
-    }).pipe(
+    findStartedGroupWitnessNow(
+      null,
+      subprocess.pid,
+      { leaderStartTime: null, membersAtLeaderExit, taskName },
+      workerState.runMarker,
+    ).pipe(
       workerState.provideRuntimeServices,
       Effect.mapError(listingFailureToPlatformError("kill")),
       Effect.flatMap((witness) =>
@@ -291,13 +367,13 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
         return yield* signalProcessGroup(subprocess, signal);
       }
       const processExit = yield* Effect.exit(Deferred.await(exitedDeferred));
-      const latestMemberStartTime = Exit.isFailure(processExit)
-        ? null
-        : processExit.value.latestMemberStartTime;
-      if (latestMemberStartTime === null) {
+      const membersAtLeaderExit = Exit.isFailure(processExit)
+        ? []
+        : processExit.value.membersAtLeaderExit;
+      if (membersAtLeaderExit.length === 0) {
         return false;
       }
-      return yield* signalMembersLeftByLeader(subprocess, signal, latestMemberStartTime);
+      return yield* signalMembersLeftByLeader(subprocess, signal, membersAtLeaderExit);
     });
 
   const reportProcessCleanupFailure =
@@ -306,14 +382,15 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
       cleanup.pipe(
         Effect.matchEffect({
           onFailure: (error) =>
-            Effect.logWarning(
-              formatFailureLines(
-                new ProcessGroupNotSignaledByWorker({
-                  processGroupId: processId,
-                  programName,
-                  cause: error,
-                }),
-                null,
+            TaskLines.use((taskLines) =>
+              taskLines.printError(
+                describeFailureLines(
+                  new ProcessGroupNotSignaledByWorker({
+                    processGroupId: processId,
+                    programName,
+                    cause: error,
+                  }),
+                ),
               ),
             ).pipe(
               Effect.annotateLogs(
@@ -338,7 +415,7 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
         Effect.timeoutOption(forceKillAfter),
       );
       if (Option.isNone(ended)) {
-        yield* Effect.logWarning(
+        yield* reportWarning(
           `${programName} did not exit within ${Duration.format(forceKillAfter)} of ${signal}, so ${TASK_PACKAGE.name} sent SIGKILL to its process group`,
         );
         yield* signalProcessGroupUnlessReused(subprocess, "SIGKILL");
@@ -348,6 +425,24 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
 
   const endOutputOnceIdle = Deferred.done(outputMayEndWhenIdle, Exit.void).pipe(Effect.asVoid);
 
+  const outputStillOpen = `${programName} exited, but its output was still open ${Duration.format(OUTPUT_FLUSH_AFTER_LEADER_EXIT)} later`;
+  const describeOutputHeldByAnotherProcess = () =>
+    `${outputStillOpen}, and no process it left in its process group is still running, so another process holds it; ${TASK_PACKAGE.name} waits up to ${Duration.format(readLimitAfterLeaderExit())} for it to close`;
+
+  const endOutputHeldOutsideGroupOnceIdle = Deferred.done(
+    outputMayBeHeldOutsideGroup,
+    Exit.void,
+  ).pipe(Effect.andThen(endOutputOnceIdle));
+
+  const reportOutputHeldOutsideGroupOnce = Deferred.isDone(outputMayBeHeldOutsideGroup).pipe(
+    Effect.flatMap((mayBeHeld) =>
+      mayBeHeld ? Deferred.done(outputHeldOutsideGroupReported, Exit.void) : Effect.succeed(false),
+    ),
+    Effect.flatMap((isFirstReport) =>
+      isFirstReport ? reportWarning(describeOutputHeldByAnotherProcess()) : Effect.void,
+    ),
+  );
+
   const awaitOutputReleased = (subprocess: Bun.Subprocess) =>
     Effect.forEach(
       OUTPUT_NAMES.filter((name) => subprocess[name] instanceof ReadableStream),
@@ -355,37 +450,58 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
       { discard: true },
     );
 
-  const endMembersLeftByLeader = (
+  const reportOutputHeldPastLimit = (
     subprocess: Bun.Subprocess,
-    latestMemberStartTimeAtLeaderExit: string,
+    membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[],
+    signal: ChildProcess.Signal,
   ) =>
-    awaitOutputReleased(subprocess).pipe(
-      Effect.timeoutOption(OUTPUT_FLUSH_AFTER_LEADER_EXIT),
-      Effect.andThen(
-        signalMembersLeftByLeader(
-          subprocess,
-          spawnOptions.killSignal ?? "SIGTERM",
-          latestMemberStartTimeAtLeaderExit,
+    listMembersLeftByLeader(null, subprocess.pid, membersAtLeaderExit).pipe(
+      workerState.provideRuntimeServices,
+      Effect.mapError(listingFailureToPlatformError("kill")),
+      Effect.flatMap((members) =>
+        reportWarning(
+          Arrays.isArrayNonEmpty(members)
+            ? `${outputStillOpen}, so ${TASK_PACKAGE.name} sent ${signal} to the processes it left in its process group: ${members.map((member) => `${member.processId} (${member.command})`).join(", ")}`
+            : describeOutputHeldByAnotherProcess(),
         ),
       ),
-      Effect.andThen(
-        signalMembersLeftByLeader(subprocess, "SIGCONT", latestMemberStartTimeAtLeaderExit),
+    );
+
+  const endMembersLeftByLeader = (
+    subprocess: Bun.Subprocess,
+    membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[],
+  ) => {
+    const signal = spawnOptions.killSignal ?? "SIGTERM";
+    const leaderWasKilled = subprocess.signalCode !== null;
+    return (
+      leaderWasKilled
+        ? Effect.succeed(true)
+        : awaitOutputReleased(subprocess).pipe(
+            Effect.timeoutOption(OUTPUT_FLUSH_AFTER_LEADER_EXIT),
+            Effect.map(Option.isSome),
+          )
+    ).pipe(
+      Effect.flatMap((released) =>
+        released ? Effect.void : reportOutputHeldPastLimit(subprocess, membersAtLeaderExit, signal),
       ),
+      Effect.andThen(signalMembersLeftByLeader(subprocess, signal, membersAtLeaderExit)),
+      Effect.andThen(signalMembersLeftByLeader(subprocess, "SIGCONT", membersAtLeaderExit)),
       Effect.andThen(
         awaitOutputReleased(subprocess).pipe(
-          Effect.timeoutOption(readForceKillAfter(spawnOptions)),
+          Effect.timeoutOption(readLimitAfterLeaderExit()),
           Effect.flatMap((released) =>
             Option.isSome(released)
               ? Effect.void
               : leaderExitHandlers
-                  .killMembersLeftByLeader(subprocess.pid, latestMemberStartTimeAtLeaderExit)
+                  .killMembersLeftByLeader(subprocess.pid, membersAtLeaderExit)
                   .pipe(Effect.andThen(endOutputOnceIdle)),
           ),
-          reportProcessCleanupFailure(subprocess.pid),
-          workerState.forkInWorkerScope,
         ),
       ),
+      reportProcessCleanupFailure(subprocess.pid),
+      workerState.forkInWorkerScope,
     );
+  };
 
   const extendsEnvironmentEveryCommandSees =
     spawnOptions.extendEnv === true || spawnOptions.env === undefined;
@@ -400,6 +516,11 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
           ...declaredEnvironment,
           [RUN_MARKERS_VARIABLE_NAME]: markCommandOfTask(runMarker, taskName),
         };
+  if (spawnOptions.cwd !== undefined) {
+    yield* checkWorkingDirectoryBeforeSpawn(programName, runDirectoryPath, spawnOptions.cwd).pipe(
+      workerState.provideRuntimeServices,
+    );
+  }
   const child = yield* Effect.acquireRelease(
     Effect.try({
       try: () =>
@@ -416,14 +537,14 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
         }),
       catch: (cause) => toPlatformError({ method: "spawn", command: programName, cause }),
     }).pipe(
-      Effect.catchTag("PlatformError", (error) =>
+      Effect.catchTag("PlatformError", (spawnFailure) =>
         spawnOptions.cwd === undefined
-          ? Effect.fail(error)
-          : blameMissingWorkingDirectory(
+          ? Effect.fail(spawnFailure)
+          : recheckWorkingDirectoryAfterSpawnFailure(
               programName,
-              packageDirectoryPath,
+              runDirectoryPath,
               spawnOptions.cwd,
-              error,
+              spawnFailure,
             ).pipe(workerState.provideRuntimeServices),
       ),
       Effect.tap((subprocess) =>
@@ -434,24 +555,22 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
             catch: (cause) => toPlatformError({ method: "exited", command: programName, cause }),
           }).pipe(
             Effect.andThen(() =>
-              readLatestMemberStartTime(null, subprocess.pid).pipe(
+              readMembersAtLeaderExit(null, subprocess.pid).pipe(
                 workerState.provideRuntimeServices,
                 Effect.mapError(listingFailureToPlatformError("exited")),
               ),
             ),
-            Effect.tap((latestMemberStartTime) =>
-              leaderExitHandlers.onLeaderExited(subprocess.pid, latestMemberStartTime),
+            Effect.tap((membersAtLeaderExit) =>
+              leaderExitHandlers.onLeaderExited(subprocess.pid, membersAtLeaderExit),
             ),
-            Effect.tap((latestMemberStartTime) =>
-              latestMemberStartTime === null
-                ? endOutputOnceIdle
-                : endMembersLeftByLeader(subprocess, latestMemberStartTime).pipe(
-                    reportProcessCleanupFailure(subprocess.pid),
-                  ),
+            Effect.tap((membersAtLeaderExit) =>
+              membersAtLeaderExit.length === 0
+                ? endOutputHeldOutsideGroupOnceIdle
+                : endMembersLeftByLeader(subprocess, membersAtLeaderExit),
             ),
-            Effect.flatMap((latestMemberStartTime) =>
+            Effect.flatMap((membersAtLeaderExit) =>
               Effect.try({
-                try: () => describeExit(subprocess, latestMemberStartTime),
+                try: () => describeExit(subprocess, membersAtLeaderExit),
                 catch: (cause) =>
                   toPlatformError({ method: "resourceUsage", command: programName, cause }),
               }),
@@ -509,12 +628,29 @@ export const spawnWithBun = Effect.fn("spawnWithBun")(function* (
                   const nowMilliseconds = yield* Clock.currentTimeMillis;
                   yield* Deferred.done(
                     outputMustEndAtMilliseconds[name],
-                    Exit.succeed(
-                      nowMilliseconds + Duration.toMillis(readForceKillAfter(spawnOptions)),
+                    Exit.succeed(nowMilliseconds + Duration.toMillis(readLimitAfterLeaderExit())),
+                  );
+                  const mustEndAtMilliseconds = yield* Deferred.await(
+                    outputMustEndAtMilliseconds[name],
+                  );
+                  const readSoon = yield* Fiber.join(reading).pipe(
+                    Effect.timeoutOption(
+                      Duration.millis(
+                        Math.max(
+                          Math.min(
+                            OUTPUT_FLUSH_AFTER_LEADER_EXIT_MILLISECONDS,
+                            mustEndAtMilliseconds - nowMilliseconds,
+                          ),
+                          0,
+                        ),
+                      ),
                     ),
                   );
-                  const millisecondsLeft =
-                    (yield* Deferred.await(outputMustEndAtMilliseconds[name])) - nowMilliseconds;
+                  if (Option.isSome(readSoon)) {
+                    return readSoon.value;
+                  }
+                  yield* reportOutputHeldOutsideGroupOnce;
+                  const millisecondsLeft = mustEndAtMilliseconds - (yield* Clock.currentTimeMillis);
                   const read = yield* Fiber.join(reading).pipe(
                     Effect.timeoutOption(Duration.millis(Math.max(millisecondsLeft, 0))),
                   );

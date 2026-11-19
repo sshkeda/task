@@ -1,10 +1,9 @@
-import { Array as Arrays, Deferred, Effect, FiberSet } from "effect";
+import { Array as Arrays, Clock, Deferred, Effect, Exit, FiberSet } from "effect";
 
-import { formatFailureLines } from "../../../../../../../shared/format-error-lines.ts";
 import { dieOnInvariantFailure } from "../../../../../../../shared/invariant-errors.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../../../../../shared/names-from-package-json.ts";
-import { printLine } from "../../../../../../../shared/print-to-standard-error.ts";
 import type { TaskMadeInBody } from "../../../../../../../shared/rpc.ts";
+import { startTaskSpan } from "../../../../../../../shared/task-spans.ts";
 import {
   AwaitedTaskFailed,
   TaskNotMadeWhileLoading,
@@ -22,6 +21,7 @@ import {
 } from "../../../../../shared/main-thread-errors.ts";
 import type { TaskDefinitionViolation } from "../../../../../shared/main-thread-errors.ts";
 import { StopState } from "../../../../../shared/provide-stop-state.ts";
+import { TaskOutputFiles } from "../../../../../shared/write-task-output-files.ts";
 import { findAssignedWorkerId } from "../../../shared/define-task-run-state.ts";
 import type { makeTaskRun, makeTaskRunsState } from "../../../shared/define-task-run-state.ts";
 import { executeTask } from "./execute-task.ts";
@@ -29,26 +29,23 @@ import { executeTask } from "./execute-task.ts";
 const requestedTaskNotDiscovered = (requestedTaskName: string, requestingTaskName: string) =>
   new TaskNotMadeWhileLoading({ taskName: requestingTaskName, requestedTaskName });
 
-const refuseBrokenTask = Effect.fn("refuseBrokenTask")(function* (
+const refuseBrokenTask = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   violations: Arrays.NonEmptyReadonlyArray<typeof TaskDefinitionViolation.Type>,
 ) {
   const brokenTasks = new BrokenTasksFound({ violations });
-  yield* printLine("Error", formatFailureLines(brokenTasks, null));
-  yield* (yield* StopState).recordPrintedFailure(brokenTasks);
+  yield* (yield* StopState).recordRunFailure(brokenTasks);
   yield* failRun(brokenTasks, taskRunsState.markFailed);
   return yield* new AwaitedTaskFailed({ awaitedTaskName: taskName });
 });
 
-const discoverTaskMadeLate = Effect.fn("discoverTaskMadeLate")(function* (
+const discoverTaskMadeLate = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   taskFilePath: string,
 ) {
-  const checked = yield* findTaskMadeLate(taskName, taskFilePath).pipe(
-    Effect.catch((error) => Effect.die(error)),
-  );
+  const checked = yield* findTaskMadeLate(taskName, taskFilePath);
   if (Arrays.isReadonlyArrayNonEmpty(checked.violations)) {
     return yield* refuseBrokenTask(taskRunsState, taskName, checked.violations);
   }
@@ -57,15 +54,13 @@ const discoverTaskMadeLate = Effect.fn("discoverTaskMadeLate")(function* (
   }
 });
 
-const refuseTaskMadeAgainElsewhere = Effect.fn("refuseTaskMadeAgainElsewhere")(function* (
+const refuseTaskMadeAgainElsewhere = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   firstLocation: string,
   secondTaskFilePath: string,
 ) {
-  const checked = yield* findTaskMadeLate(taskName, secondTaskFilePath).pipe(
-    Effect.catch((error) => Effect.die(error)),
-  );
+  const checked = yield* findTaskMadeLate(taskName, secondTaskFilePath);
   const violations = Arrays.isReadonlyArrayNonEmpty(checked.violations)
     ? checked.violations
     : Arrays.make(
@@ -75,7 +70,7 @@ const refuseTaskMadeAgainElsewhere = Effect.fn("refuseTaskMadeAgainElsewhere")(f
   return yield* refuseBrokenTask(taskRunsState, taskName, violations);
 });
 
-const discoverTaskMadeInBody = Effect.fn("discoverTaskMadeInBody")(function* (
+const discoverTaskMadeInBody = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   requestingTaskName: string,
@@ -100,11 +95,11 @@ const discoverTaskMadeInBody = Effect.fn("discoverTaskMadeInBody")(function* (
   const locations = isDiscoveredTaskListedByWorker
     ? madeInBody.locations
     : [discovered.location, ...madeInBody.locations];
-  const checked = yield* checkTasksMadeWithName(
+  const checked = checkTasksMadeWithName(
     taskName,
     locations.map((location) => ({ location: location ?? undefined, options: madeInBody.options })),
     workerId,
-  ).pipe(Effect.catch((error) => Effect.die(error)));
+  );
   const violations = [
     ...checked.violations,
     ...(madeInBody.options.isolated === true
@@ -119,7 +114,33 @@ const discoverTaskMadeInBody = Effect.fn("discoverTaskMadeInBody")(function* (
   }
 });
 
-const runTaskOnce = Effect.fn("runTaskOnce")(function* (
+const REQUESTED_TASK_EVENT = "requested task";
+
+export const runOnce = <Success, Failure, Services>(
+  resultDeferreds: Map<string, Deferred.Deferred<Success, Failure>>,
+  taskName: string,
+  start: (
+    resultDeferred: Deferred.Deferred<Success, Failure>,
+  ) => Effect.Effect<void, never, Services>,
+) =>
+  Effect.suspend(() => {
+    const existingResultDeferred = resultDeferreds.get(taskName);
+    if (existingResultDeferred !== undefined) {
+      return Effect.succeed(existingResultDeferred);
+    }
+    const resultDeferred = Deferred.makeUnsafe<Success, Failure>();
+    resultDeferreds.set(taskName, resultDeferred);
+    return start(resultDeferred).pipe(
+      Effect.onExit((startExit) =>
+        Exit.isFailure(startExit)
+          ? Deferred.failCause(resultDeferred, startExit.cause)
+          : Effect.void,
+      ),
+      Effect.as(resultDeferred),
+    );
+  }).pipe(Effect.uninterruptible);
+
+const runTaskOnce = (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   resultDeferreds: Map<
     string,
@@ -129,23 +150,26 @@ const runTaskOnce = Effect.fn("runTaskOnce")(function* (
     >
   >,
   taskName: string,
-) {
-  const existingResultDeferred = resultDeferreds.get(taskName);
-  if (existingResultDeferred !== undefined) {
-    return existingResultDeferred;
-  }
-  taskRunsState.createRecord(taskName);
-  const resultDeferred: Parameters<typeof resultDeferreds.set>[1] = Deferred.makeUnsafe();
-  resultDeferreds.set(taskName, resultDeferred);
-  yield* FiberSet.run(
-    taskRunsState.taskFibers,
-    executeTask(taskRunsState, taskName).pipe(
-      Effect.onExit((taskExit) => Deferred.done(resultDeferred, taskExit)),
-      Effect.withParentSpan(taskRunsState.runSpan),
-    ),
+) =>
+  runOnce(resultDeferreds, taskName, (resultDeferred) =>
+    Effect.gen(function* () {
+      const taskSpan = yield* startTaskSpan("task", taskName, {
+        parent: taskRunsState.runSpan,
+        attributes: { [`${TASK_TRACE_LABEL_PREFIX}.task`]: taskName },
+      });
+      taskRunsState.createRecord(taskName, taskSpan);
+      yield* TaskOutputFiles.use((taskOutputFiles) =>
+        taskOutputFiles.recordTaskSpan(taskName, taskSpan),
+      );
+      yield* FiberSet.run(
+        taskRunsState.taskFibers,
+        executeTask(taskRunsState, taskName).pipe(
+          Effect.onExit((taskExit) => Deferred.done(resultDeferred, taskExit)),
+          Effect.withParentSpan(taskSpan),
+        ),
+      );
+    }),
   );
-  return resultDeferred;
-});
 
 const findDependencyPathToRequestingTask = (
   taskRunsByName: ReadonlyMap<string, ReturnType<typeof makeTaskRun>>,
@@ -174,12 +198,11 @@ const findDependencyPathToRequestingTask = (
   return findDependencyPath(dependencyTaskName);
 };
 
-export const runRequestedTask = Effect.fn("runRequestedTask")(function* (
+export const runRequestedTask = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   resultDeferreds: Parameters<typeof runTaskOnce>[1],
   taskName: string,
 ) {
-  yield* Effect.annotateCurrentSpan(`${TASK_TRACE_LABEL_PREFIX}.task`, taskName);
   if (!taskRunsState.discoveredTasksByName.has(taskName)) {
     return yield* requestedTaskNotDiscovered(taskName, taskName);
   }
@@ -187,7 +210,7 @@ export const runRequestedTask = Effect.fn("runRequestedTask")(function* (
   return yield* Deferred.await(resultDeferred);
 });
 
-export const runRequestedDependencyTask = Effect.fn("runRequestedDependencyTask")(function* (
+export const runRequestedDependencyTask = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   resultDeferreds: Parameters<typeof runTaskOnce>[1],
   dependencyTaskName: string,
@@ -195,10 +218,6 @@ export const runRequestedDependencyTask = Effect.fn("runRequestedDependencyTask"
   dependencyTaskFilePath: string | null,
   dependencyTaskMadeInBody: typeof TaskMadeInBody.Type | null,
 ) {
-  yield* Effect.annotateCurrentSpan({
-    [`${TASK_TRACE_LABEL_PREFIX}.task`]: dependencyTaskName,
-    [`${TASK_TRACE_LABEL_PREFIX}.requested_by`]: requestingTaskName,
-  });
   if (dependencyTaskMadeInBody !== null) {
     yield* discoverTaskMadeInBody(
       taskRunsState,
@@ -244,8 +263,11 @@ export const runRequestedDependencyTask = Effect.fn("runRequestedDependencyTask"
       });
     }
   }
-  const requestingTaskDependencies =
-    taskRunsState.runsByTaskName.get(requestingTaskName)?.awaitedTaskNames;
+  const requestingTaskRun = taskRunsState.runsByTaskName.get(requestingTaskName);
+  requestingTaskRun?.taskSpan.event(REQUESTED_TASK_EVENT, yield* Clock.currentTimeNanos, {
+    [`${TASK_TRACE_LABEL_PREFIX}.wanted_task`]: dependencyTaskName,
+  });
+  const requestingTaskDependencies = requestingTaskRun?.awaitedTaskNames;
   requestingTaskDependencies?.push(dependencyTaskName);
   const awaitedResultDeferred = yield* runTaskOnce(
     taskRunsState,

@@ -30,6 +30,7 @@ import {
   FlagGivenTwice,
   FlagInvalid,
   FlagMissing,
+  FlagsInvalid,
   FlagNotFlat,
   FlagNotRead,
   FlagReadTwoWays,
@@ -45,6 +46,7 @@ const EntryStartRefusal = Schema.Union([
   FlagGivenTwice,
   FlagInvalid,
   FlagMissing,
+  FlagsInvalid,
   FlagNotFlat,
   FlagNotRead,
   FlagReadTwoWays,
@@ -136,7 +138,7 @@ export const decideEntryStart = (facts: {
   }
   if (defaultTaskMade?.definitionNotGiven) {
     const { given, location } = defaultTaskMade.definitionNotGiven;
-    return refuse(new TaskDefinitionNotGiven({ given, location: location ?? facts.entryFilePath }));
+    return refuse(new TaskDefinitionNotGiven({ given, location }));
   }
   const defaultTaskName: unknown = defaultTaskMade?.task.name;
   const isDefaultTaskUnnamed =
@@ -144,7 +146,7 @@ export const decideEntryStart = (facts: {
   if (isDefaultTaskUnnamed) {
     return refuse(
       new TaskNameNotString({
-        location: defaultTaskMade.location ?? facts.entryFilePath,
+        location: defaultTaskMade.location,
         nameText: inspect(defaultTaskName),
       }),
     );

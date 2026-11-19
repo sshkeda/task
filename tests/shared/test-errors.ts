@@ -91,3 +91,21 @@ export class ErrorsMisprinted extends Schema.TaggedError<ErrorsMisprinted>()("Er
     return `the child printed errors in the wrong format:\n${this.misprinted.map(({ line, fault }) => `${line}\n  ${fault}`).join("\n")}`;
   }
 }
+
+export class SourceDidNotCompile extends Schema.TaggedError<SourceDidNotCompile>()(
+  "SourceDidNotCompile",
+  { compilerOutput: Schema.String },
+) {
+  public override get message() {
+    return this.compilerOutput;
+  }
+}
+
+export class PipeNotReleased extends Schema.TaggedError<PipeNotReleased>()("PipeNotReleased", {
+  pipeName: Schema.String,
+  reason: Schema.String,
+}) {
+  public override get message() {
+    return `could not release ${this.pipeName}: ${this.reason}`;
+  }
+}

@@ -55,7 +55,7 @@ import { Task as T } from "@sshkeda/task";
 const dependency = T.make({ name: "dependency", output: Schema.Finite, run: Effect.succeed(42) });
 export default T.make({ name: "main", run: Effect.gen(function* () {
   const value = yield* dependency;
-  yield* T.exec("echo", [String(value)]);
+  yield* T.exec("echo", [String(value)], { print: true });
 }) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");

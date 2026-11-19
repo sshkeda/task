@@ -1,13 +1,13 @@
-import { Cause, Context, Deferred, Effect, Exit, FiberSet } from "effect";
-import type { FileSystem, Path, Schema } from "effect";
+import { Cause, Context, Deferred, Effect, Exit, FiberSet, Option, Schema } from "effect";
+import type { FileSystem, Path } from "effect";
 
-import { printLine, printTaskLines } from "../../../../../shared/print-to-standard-error.ts";
 import type { TaskMadeInBody } from "../../../../../shared/rpc.ts";
 import type { TaskRequestFailure } from "../../../../../shared/task-errors.ts";
 import { TASK_PACKAGE } from "../../../../../shared/task-package.ts";
 import { failRunOnFailure, failTask } from "../../../shared/fail-run.ts";
 import {
   ServingTaskRequestsItself,
+  StopRequested,
   TaskCleanupCutOff,
 } from "../../../shared/main-thread-errors.ts";
 import type { ProcessGroups } from "../../../shared/provide-process-groups.ts";
@@ -15,6 +15,7 @@ import type { RunRootTaskConfig } from "../../../shared/provide-run-root-task-co
 import { StopState } from "../../../shared/provide-stop-state.ts";
 import type { WorkerEvent, WorkerPool } from "../../../shared/provide-worker-pool.ts";
 import { reportTaskFailure } from "../../../shared/report-task-failure.ts";
+import { TaskOutputFiles } from "../../../shared/write-task-output-files.ts";
 import type { TraceFile } from "../../../shared/write-trace-file.ts";
 import {
   runRequestedTask,
@@ -24,7 +25,9 @@ import { makeTaskRunsState } from "../shared/define-task-run-state.ts";
 import { isInBody, TaskRunOutcome, TaskRunStatus } from "../shared/define-task-run-status.ts";
 import { hasCleanupLimitPassed, TaskStopEvent } from "../shared/define-task-stop-stage.ts";
 import { interruptDependencyRequests, stopTask } from "../shared/stop-task.ts";
-import { handleWorkerEvent } from "./handle-worker-events.ts";
+import { splitWorkerEvents } from "./handle-worker-events.ts";
+
+const isStopRequested = Schema.is(StopRequested);
 
 export const makeTaskRuns = Effect.gen(function* () {
   const taskExecutionServices = yield* Effect.context<
@@ -33,10 +36,13 @@ export const makeTaskRuns = Effect.gen(function* () {
     | ProcessGroups
     | RunRootTaskConfig
     | StopState
+    | TaskOutputFiles
     | TraceFile
     | WorkerPool
   >();
   const taskRunsState = yield* makeTaskRunsState;
+  yield* (yield* StopState).readTaskLocationsFrom(taskRunsState.discoveredTasksByName);
+  yield* (yield* TaskOutputFiles).readAwaitedTasksFrom(taskRunsState.runsByTaskName);
   const resultDeferreds: Parameters<typeof runRequestedTask>[1] = new Map();
   const {
     discoveredTasksByName,
@@ -75,19 +81,23 @@ export const makeTaskRuns = Effect.gen(function* () {
         Effect.provide(taskExecutionServices),
       ),
     requestDependencyTaskResult,
-    handleWorkerEvent: (event: typeof WorkerEvent.Type) =>
-      handleWorkerEvent(taskRunsState, requestDependencyTaskResult, event).pipe(
-        failRunOnFailure(markFailed),
-        Effect.provide(taskExecutionServices),
+    handleWorkerEvents: (events: readonly (typeof WorkerEvent.Type)[]) =>
+      Effect.forEach(
+        splitWorkerEvents(taskRunsState, requestDependencyTaskResult, events),
+        (step) => step.pipe(failRunOnFailure(markFailed), Effect.provide(taskExecutionServices)),
+        { discard: true },
       ),
     stopAll: Effect.gen(function* () {
       const stopState = yield* StopState;
+      const isEndedByAStop = isStopRequested(yield* stopState.outcome);
       yield* stopState.begin;
-      const unfinishedTaskNames = new Set(
-        [...taskRunsByName]
-          .filter(([, taskRun]) => TaskRunOutcome.guards.Pending(taskRun.outcome))
-          .map(([taskName]) => taskName),
-      );
+      if (isEndedByAStop) {
+        for (const [taskName, taskRun] of taskRunsByName) {
+          if (TaskRunStatus.guards.Serving(taskRun.status)) {
+            yield* taskRunsState.markServedStopped(taskName);
+          }
+        }
+      }
       yield* FiberSet.clear(taskRunsState.taskFibers);
       yield* Effect.forEach(
         taskRunsByName.values(),
@@ -210,11 +220,6 @@ export const makeTaskRuns = Effect.gen(function* () {
               ),
             ),
             failRunOnFailure(markFailed),
-            Effect.ensuring(
-              unfinishedTaskNames.has(stop.taskName)
-                ? printTaskLines("Info", stop.taskName, "stopped: the run ended before it finished")
-                : Effect.void,
-            ),
             Effect.ensuring(Deferred.done(stop.stopped, Exit.void)),
           ),
         { concurrency: "unbounded", discard: true },
@@ -227,7 +232,6 @@ export const makeTaskRuns = Effect.gen(function* () {
         if (isNotServing) {
           return;
         }
-        yield* printLine("Info", `${taskName} is serving`);
         yield* Deferred.await(taskRun.bodyFinishedDeferred);
       }),
     findTaskNamesStillInBodyOrCleanup: Effect.sync(() =>
@@ -238,18 +242,50 @@ export const makeTaskRuns = Effect.gen(function* () {
         )
         .map(([taskName]) => taskName),
     ),
-    reportCleanupsCutOff: (taskNames: readonly string[]) =>
+    reportStopsCutOff: (cutOffTaskNames: readonly string[]) =>
       Effect.forEach(
-        taskNames,
-        (taskName) =>
-          markFailed(taskName).pipe(
-            Effect.andThen(
-              reportTaskFailure(taskName, Cause.fail(new TaskCleanupCutOff({ taskName }))),
-            ),
-          ),
+        cutOffTaskNames,
+        (taskName) => {
+          const cutOff = new TaskCleanupCutOff({ taskName });
+          return markFailed(taskName, cutOff).pipe(
+            Effect.andThen(taskRunsState.recordCleanupFailure(taskName, cutOff)),
+            Effect.andThen(reportTaskFailure(taskName, Cause.fail(cutOff))),
+          );
+        },
         { discard: true },
       ).pipe(Effect.provide(taskExecutionServices)),
     markFailed,
+    describeOwnWork: (nowMilliseconds: number) =>
+      Effect.gen(function* () {
+        const ownWork: { readonly taskName: string; readonly milliseconds: number }[] = [];
+        for (const [taskName, taskRun] of taskRunsByName) {
+          const isRunningItsBodyOrCleanup =
+            TaskRunStatus.guards.Running(taskRun.status) ||
+            TaskRunStatus.guards.Failing(taskRun.status);
+          const isDoingOwnWork =
+            isRunningItsBodyOrCleanup &&
+            taskRun.requestFibersByDependencyRequestId.size === 0 &&
+            !taskRun.hasEnded;
+          const bodyStartedAtMilliseconds = isDoingOwnWork
+            ? yield* Deferred.poll(taskRun.bodyStartedAtMillisecondsDeferred).pipe(
+                Effect.flatMap(Effect.transposeOption),
+              )
+            : Option.none();
+          if (Option.isSome(bodyStartedAtMilliseconds)) {
+            ownWork.push({
+              taskName,
+              milliseconds:
+                nowMilliseconds -
+                bodyStartedAtMilliseconds.value -
+                taskRun.bodyWaitingOnRequestedTasks.readMilliseconds(nowMilliseconds),
+            });
+          }
+        }
+        const endedTaskCount = [...taskRunsByName.values()].filter(
+          (taskRun) => taskRun.hasEnded,
+        ).length;
+        return { ownWork, endedTaskCount };
+      }),
     counts: Effect.sync(() => {
       const taskRuns = [...taskRunsByName];
       return {
@@ -263,8 +299,10 @@ export const makeTaskRuns = Effect.gen(function* () {
             !taskRun.outcome.causedByAwaitedTasks
           );
         }),
-        stopped: taskRuns.filter(([, taskRun]) => TaskRunOutcome.guards.Cancelled(taskRun.outcome))
-          .length,
+        stoppedTaskNames: [...discoveredTasksByName.keys()].filter((taskName) => {
+          const taskRun = taskRunsByName.get(taskName);
+          return taskRun !== undefined && TaskRunOutcome.guards.Cancelled(taskRun.outcome);
+        }),
         unawaitedFailedTaskNames: taskRuns
           .filter(
             ([taskName, taskRun]) =>

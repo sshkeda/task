@@ -4,7 +4,7 @@ import { Effect } from "effect";
 
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
-import { readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
+import { readProjectRunsDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
 export const exited = makeTest(
@@ -18,8 +18,8 @@ export default Task.make({ name: "quit", run: Effect.sync(() => process.exit(7))
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        "[quit] error WorkerExited: its worker exited on its own with code 7",
+      expect(ran.standardError).toMatch(
+        /^run: \S+\/\nerror: \[quit\] main\.ts:3:21: WorkerExited: its worker exited on its own with code 7\nerror: \[quit\] its output is in \S+\/1\.output\nended: \[quit\], [\d.]+s, failed\nrecap: \[quit\] 1\.output \| main\.ts:3:21: WorkerExited: its worker exited on its own with code 7\nfailed: \[quit\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
     }),
   ),
@@ -40,7 +40,7 @@ export default Task.make({ name: "main", run: Task.all([quit, pending]) });`,
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain("its worker exited on its own with code 7");
       expect(ran.standardError).not.toContain("pending body ran");
-      const traces = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const traces = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       expect(traces.map((trace) => trace.text).join("")).not.toContain("NoSuchElementError");
     }),
   ),
@@ -61,9 +61,9 @@ export default Task.make({ name: "main", run: Effect.asVoid(server) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain("[server] closed");
-      expect(ran.standardError).toContain(
-        "[server] error WorkerExited: its worker exited on its own with code 7",
+      expect(ran.standardError).toContain("closed: [server]");
+      expect(ran.standardError).toMatch(
+        /\nrecap: \[server\] 2\.output \| main\.ts:3:28: WorkerExited: its worker exited on its own with code 7\nfailed: \[server\] \(1 of 2 tasks\), [\d.]+s\nrun: \S+\/$/u,
       );
     }),
   ),
@@ -83,8 +83,8 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        "[main] main.ts:4:32: error WorkerExited: its worker stopped on the uncaught error escaped",
+      expect(ran.standardError).toMatch(
+        /^run: \S+\/\nerror: \[main\] main\.ts:4:32: Error: escaped\nerror: \[main\] its worker stopped on this uncaught error\nerror: \[main\] its output is in \S+\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:4:32: Error: escaped\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
     }),
   ),

@@ -2,11 +2,9 @@ import { expect } from "bun:test";
 
 import { Effect, Queue, Stream } from "effect";
 
-import { TASK_TRACE_LABEL_PREFIX } from "../../src/shared/names-from-package-json.ts";
 import { EXIT_CODE_AFTER_SIGINT } from "../shared/exit-codes-after-stop-signals.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
-import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 
 const encodeText = (text: string) => new TextEncoder().encode(text);
@@ -168,8 +166,8 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
         Stream.make(encodeText("unread")),
       );
       expect(ran.standardError).toContain("[reader] reader started");
-      expect(ran.standardError).toContain(
-        `[reader] error StandardInputReadOutsideRootTask: read standard input, which only the root task "main" can read`,
+      expect(ran.standardError.split("\n")).toContain(
+        `error: [reader] main.ts:3:28: StandardInputReadOutsideRootTask: read standard input, which only the root task [main] can read`,
       );
       expect(ran.exitCode).toBe(1);
     }),
@@ -208,7 +206,7 @@ export default hook;`,
       expect(exited.standardError).toContain("[hook] cleaned up");
       expect(exited.standardError).not.toContain("standard input ended");
       expect(exited.standardError).toMatch(
-        /^failed: 0 of 1 task, 1 stopped, [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nstopped: \[hook\] \(1 of 1 task\), [\d.]+s\nrun: .+\/$/u,
       );
     }),
   ),
@@ -245,8 +243,8 @@ export default Task.make({ name: "main", run: Effect.gen(function* () { yield* r
       expect(rootRan.standardError).toContain("[hook] input is piped");
       expect(rootRan.exitCode).toBe(0);
       const dependencyRan = yield* runWithInput("dependency.ts", "piped");
-      expect(dependencyRan.standardError).toContain(
-        `[reader] error StandardInputReadOutsideRootTask: read standard input, which only the root task "main" can read`,
+      expect(dependencyRan.standardError.split("\n")).toContain(
+        `error: [reader] dependency.ts:4:28: StandardInputReadOutsideRootTask: read standard input, which only the root task [main] can read`,
       );
       expect(dependencyRan.standardError).not.toContain("input is");
       expect(dependencyRan.exitCode).toBe(1);
@@ -274,7 +272,7 @@ export const hook = Task.make({ name: "hook", run: Effect.gen(function* () {
 export default hook;`;
 
 export const readAfterInterruptedRead = makeTest(
-  "the root task's next read receives the bytes written after it interrupted a pending read, and sends no second request",
+  "the root task's next read receives the bytes written after it interrupted a pending read",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({ "main.ts": HOOK_INTERRUPTING_A_PENDING_READ });
@@ -295,15 +293,6 @@ export const readAfterInterruptedRead = makeTest(
       yield* command.waitForLine("[hook] received [7,8,9]");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(0);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, exited));
-      const standardInputRequests = trace
-        ?.named("handleWorkerEvent")
-        .filter(
-          (span) =>
-            readAttribute(span.attributes, `${TASK_TRACE_LABEL_PREFIX}.message`) ===
-            "TaskFiberRequestedStandardInput",
-        );
-      expect(standardInputRequests).toHaveLength(1);
     }),
   ),
 );

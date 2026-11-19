@@ -48,11 +48,12 @@ export const isStillListedAs = (
     ),
   );
 
-export const processGroupHasOnlyEndedMembers = Effect.fn("processGroupHasOnlyEndedMembers")(
-  function* (taskName: string | null, processGroupId: number) {
-    const listedProcesses = yield* listProcesses(taskName);
-    return [...listedProcesses.values()]
-      .filter((listedProcess) => listedProcess.processGroupId === processGroupId)
-      .every((listedProcess) => listedProcess.hasEnded);
-  },
-);
+export const processGroupHasOnlyEndedMembers = Effect.fn(function* (
+  taskName: string | null,
+  processGroupId: number,
+) {
+  const listedProcesses = yield* listProcesses(taskName);
+  return [...listedProcesses.values()]
+    .filter((listedProcess) => listedProcess.processGroupId === processGroupId)
+    .every((listedProcess) => listedProcess.hasEnded);
+});

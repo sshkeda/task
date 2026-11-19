@@ -9,40 +9,81 @@ import {
   Logger,
   Option,
   Path,
+  Predicate,
   Ref,
+  Scope,
   Tracer,
 } from "effect";
 
 import { formatFailureLines } from "../../../shared/format-error-lines.ts";
-import { formatIsoTimestamp } from "../../../shared/format-task-lines.ts";
-import { printLine } from "../../../shared/print-to-standard-error.ts";
-import { TraceFileIncomplete } from "../shared/main-thread-errors.ts";
+import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
+import {
+  awaitLineWritten,
+  printLine,
+  queueLineToAwaitItsWrite,
+} from "../../../shared/print-to-standard-error.ts";
+import { endTaskSpan, startTaskSpan } from "../../../shared/task-spans.ts";
+import { formatIsoTimestamp } from "../shared/format-task-lines.ts";
 import { RunRootTaskConfig } from "../shared/provide-run-root-task-config.ts";
+import { StopState } from "../shared/provide-stop-state.ts";
+import { TaskOutputFiles, makeTaskOutputFiles } from "../shared/write-task-output-files.ts";
 import { TraceFile, makeTraceFile } from "../shared/write-trace-file.ts";
+import { formatRunLine, RunDirectory } from "./provide-run-directory.ts";
 
-const TRACE_RETENTION = "14 days";
+const RUN_DIRECTORY_RETENTION = "14 days";
 
-const deleteTracesOlderThanRetention = Effect.fn("deleteTracesOlderThanRetention")(function* (
-  currentTraceFilePath: string,
+const TRACE_FILE_NAME = "trace.jsonl";
+
+const RUN_PROCESS_ID_PATTERN = /Z-(?<processId>\d+)$/u;
+
+const isRunProcessAlive = (runDirectoryName: string) => {
+  const processId = Number(
+    RUN_PROCESS_ID_PATTERN.exec(runDirectoryName)?.groups?.["processId"] ?? 0,
+  );
+  if (processId === 0) {
+    return false;
+  }
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return Predicate.hasProperty(error, "code") && error.code === "EPERM";
+  }
+};
+
+const runDirectoryPathOf = (runRootTaskConfig: RunRootTaskConfig["Service"]) => {
+  const timestamp = formatIsoTimestamp(runRootTaskConfig.runStartedAtMilliseconds).replaceAll(
+    ":",
+    "-",
+  );
+  return `${runRootTaskConfig.stateDirectoryPath}/runs/${runRootTaskConfig.projectRunsDirectoryName}/${timestamp}-${runRootTaskConfig.runProcessId}`;
+};
+
+const deleteRunDirectoriesOlderThanRetention = Effect.fn(function* (
+  currentRunDirectoryPath: string,
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
-  const traceDirectoryPath = path.dirname(currentTraceFilePath);
+  const projectRunsDirectoryPath = path.dirname(currentRunDirectoryPath);
   const oldestKeptMilliseconds =
-    (yield* Clock.currentTimeMillis) - Duration.toMillis(TRACE_RETENTION);
-  const fileNames = yield* fileSystem.readDirectory(traceDirectoryPath);
+    (yield* Clock.currentTimeMillis) - Duration.toMillis(RUN_DIRECTORY_RETENTION);
+  const runDirectoryNames = yield* fileSystem.readDirectory(projectRunsDirectoryPath);
   yield* Effect.forEach(
-    fileNames.filter(
-      (fileName) => fileName.endsWith(".jsonl") && fileName !== path.basename(currentTraceFilePath),
+    runDirectoryNames.filter(
+      (runDirectoryName) =>
+        runDirectoryName !== path.basename(currentRunDirectoryPath) &&
+        !isRunProcessAlive(runDirectoryName),
     ),
-    (fileName) => {
-      const traceFilePath = path.join(traceDirectoryPath, fileName);
-      return fileSystem.stat(traceFilePath).pipe(
+    (runDirectoryName) => {
+      const runDirectoryPath = path.join(projectRunsDirectoryPath, runDirectoryName);
+      return fileSystem.stat(path.join(runDirectoryPath, TRACE_FILE_NAME)).pipe(
         Effect.flatMap((information) => {
-          const isExpiredTraceFile =
+          const isExpiredRunDirectory =
             information.type === "File" &&
             Option.exists(information.mtime, (mtime) => mtime.getTime() < oldestKeptMilliseconds);
-          return isExpiredTraceFile ? fileSystem.remove(traceFilePath) : Effect.void;
+          return isExpiredRunDirectory
+            ? fileSystem.remove(runDirectoryPath, { recursive: true })
+            : Effect.void;
         }),
         Effect.catchTag("PlatformError", () => Effect.void),
       );
@@ -55,13 +96,11 @@ export const TraceFileLive = Layer.effect(
   TraceFile,
   Effect.gen(function* () {
     const runRootTaskConfig = yield* RunRootTaskConfig;
-    const timestamp = formatIsoTimestamp(runRootTaskConfig.runStartedAtMilliseconds).replaceAll(
-      ":",
-      "-",
-    );
-    const traceFilePath = `${runRootTaskConfig.stateDirectoryPath}/traces/${runRootTaskConfig.traceDirectoryName}/${timestamp}-${runRootTaskConfig.runProcessId}.jsonl`;
+    const runDirectoryPath = runDirectoryPathOf(runRootTaskConfig);
+    const traceFilePath = `${runDirectoryPath}/${TRACE_FILE_NAME}`;
     const made = yield* Ref.make<Effect.Success<ReturnType<typeof makeTraceFile>> | null>(null);
-    const sweepOfOldTraces = yield* Ref.make<Fiber.Fiber<void> | null>(null);
+    const sweepOfOldRunDirectories = yield* Ref.make<Fiber.Fiber<void> | null>(null);
+    const sweepScope = yield* Scope.fork(yield* Effect.scope);
     yield* Effect.addFinalizer(() =>
       Ref.get(made).pipe(
         Effect.flatMap((madeTraceFile) =>
@@ -70,19 +109,13 @@ export const TraceFileLive = Layer.effect(
             : madeTraceFile.whyIncomplete.pipe(
                 Effect.flatMap((whyIncomplete) =>
                   whyIncomplete === null
-                    ? printLine("Info", `wrote the trace to ${traceFilePath}`)
-                    : printLine(
-                        "Error",
-                        formatFailureLines(
-                          new TraceFileIncomplete({ traceFilePath, reason: whyIncomplete }),
-                          null,
-                        ),
-                      ),
+                    ? Effect.void
+                    : printLine(formatFailureLines(whyIncomplete)),
                 ),
               ),
         ),
         Effect.andThen(
-          Effect.flatMap(Ref.get(sweepOfOldTraces), (sweep) =>
+          Effect.flatMap(Ref.get(sweepOfOldRunDirectories), (sweep) =>
             sweep === null ? Effect.void : Fiber.join(sweep),
           ),
         ),
@@ -93,12 +126,32 @@ export const TraceFileLive = Layer.effect(
       createdBelow: runRootTaskConfig.stateDirectoryPath,
     });
     yield* Ref.set(made, traceFile);
-    if ((yield* traceFile.whyIncomplete) === null) {
+    const runDirectory = yield* RunDirectory;
+    const shutdown = yield* StopState;
+    const isComplete = (yield* traceFile.whyIncomplete) === null;
+    const runLineWritten = yield* shutdown
+      .holdStopAnnouncementsDuring(
+        Effect.gen(function* () {
+          if (yield* shutdown.isStopping) {
+            return null;
+          }
+          yield* Ref.set(runDirectory, {
+            path: runDirectoryPath,
+            runStartedAtMilliseconds: runRootTaskConfig.runStartedAtMilliseconds,
+          });
+          return isComplete
+            ? yield* queueLineToAwaitItsWrite(formatRunLine(runDirectoryPath))
+            : null;
+        }),
+      )
+      .pipe(Effect.uninterruptible);
+    if (runLineWritten !== null) {
+      yield* awaitLineWritten(runLineWritten);
       yield* Ref.set(
-        sweepOfOldTraces,
-        yield* deleteTracesOlderThanRetention(traceFilePath).pipe(
+        sweepOfOldRunDirectories,
+        yield* deleteRunDirectoriesOlderThanRetention(runDirectoryPath).pipe(
           Effect.catchTag("PlatformError", () => Effect.void),
-          Effect.forkScoped,
+          Effect.forkIn(sweepScope),
         ),
       );
     }
@@ -106,12 +159,40 @@ export const TraceFileLive = Layer.effect(
   }),
 );
 
+export const TaskOutputFilesLive = Layer.effect(
+  TaskOutputFiles,
+  Effect.gen(function* () {
+    const traceFile = yield* TraceFile;
+    const taskOutputFiles = yield* makeTaskOutputFiles({
+      runDirectoryPath: runDirectoryPathOf(yield* RunRootTaskConfig),
+      isRunDirectoryWritable: (yield* traceFile.whyIncomplete) === null,
+      hasStopSignal: (yield* StopState).hasStopSignal,
+    });
+    yield* Effect.addFinalizer(() =>
+      taskOutputFiles.whyIncomplete.pipe(
+        Effect.flatMap((whyIncomplete) =>
+          whyIncomplete === null ? Effect.void : printLine(formatFailureLines(whyIncomplete)),
+        ),
+      ),
+    );
+    return taskOutputFiles;
+  }),
+);
+
 export const RuntimeTracingLive = Layer.effectContext(
   Effect.gen(function* () {
     const trace = yield* TraceFile;
-    const runSpan = yield* Effect.makeSpanScoped("runRootTaskFiber").pipe(
-      Effect.withTracer(trace.tracer),
-    );
+    const { rootTaskName, rootTaskFilePath } = yield* RunRootTaskConfig;
+    const runSpan = yield* Effect.acquireRelease(
+      startTaskSpan("run", `run ${rootTaskName}`, {
+        parent: null,
+        attributes: {
+          [`${TASK_TRACE_LABEL_PREFIX}.root.task`]: rootTaskName,
+          [`${TASK_TRACE_LABEL_PREFIX}.entry`]: rootTaskFilePath,
+        },
+      }),
+      (span, exit) => endTaskSpan(span, exit),
+    ).pipe(Effect.withTracer(trace.tracer));
     return Context.make(Tracer.Tracer, trace.tracer).pipe(
       Context.add(Logger.CurrentLoggers, new Set([trace.logger])),
       Context.add(Tracer.ParentSpan, runSpan),

@@ -1,26 +1,51 @@
 import { expect } from "bun:test";
 
 import { Task } from "@sshkeda/task";
-import { Effect, Exit, Fiber, FileSystem, PlatformError, Ref, Tracer } from "effect";
+import {
+  Deferred,
+  Effect,
+  Exit,
+  Fiber,
+  FileSystem,
+  Logger,
+  PlatformError,
+  Ref,
+  References,
+} from "effect";
 import { ChildProcess } from "effect/process";
+import { RpcTest } from "effect/rpc";
 
 import {
+  claimUnknownOwnership,
   killTaskProcessGroups,
+  ProcessOwnershipUnknown,
   startedProcessGroup,
 } from "../../src/lib/kill-leftover-processes/index.ts";
+import { findPossibleRunProcesses } from "../../src/lib/kill-leftover-processes/internal/find-unknown-ownership.ts";
 import {
   decodeProcStatText,
   listProcessesFromProcDirectory,
 } from "../../src/lib/kill-leftover-processes/internal/list-linux-processes-from-proc.ts";
 import { listProcesses } from "../../src/lib/kill-leftover-processes/internal/list-processes.ts";
+import {
+  MarkerReading,
+  readLinuxMarkers,
+} from "../../src/lib/kill-leftover-processes/internal/mark-run-processes.ts";
 import { sendSignal } from "../../src/lib/kill-leftover-processes/internal/send-signal.ts";
+import { makeUnknownOwnershipClaimer } from "../../src/lib/supervise-the-run/internal/claim-unknown-ownership-in-the-run.ts";
+import { SupervisorRpcs } from "../../src/lib/supervise-the-run/internal/talk-to-the-supervisor.ts";
+import type { connectToTheSupervisor } from "../../src/lib/supervise-the-run/internal/talk-to-the-supervisor.ts";
 import { makeProcessReportClaimer } from "../../src/shared/claim-processes-to-report.ts";
 import type { ProcessIdentity } from "../../src/shared/claim-processes-to-report.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../src/shared/names-from-package-json.ts";
+import { RUN_MARKERS_VARIABLE_NAME } from "../../src/shared/read-environment-config.ts";
+import { RunMarker } from "../../src/shared/run-marker.ts";
 import { failTestCleanup } from "../shared/fail-test-cleanup.ts";
 import { exitAsValue } from "../shared/failure-as-value.ts";
-import { isProcessAlive } from "../shared/is-process-alive.ts";
+import { isProcessAlive, waitUntilProcessEnds } from "../shared/is-process-alive.ts";
 import { makeTest } from "../shared/make-tests.ts";
+
+const REGISTRATION = 1;
 
 const READABLE_PROCESS_ID = 300;
 
@@ -47,12 +72,15 @@ const sweepAsTask = (
   Effect.gen(function* () {
     const reported = yield* Ref.make<readonly (typeof ProcessIdentity.Type)[]>([]);
     const endedProcessGroupIds = yield* killTaskProcessGroups(
-      new Map([[leftover.processId, startedProcessGroup("leaver", leftover.startTime, null)]]),
+      new Map([
+        [leftover.processId, startedProcessGroup(REGISTRATION, "leaver", leftover.startTime, null)],
+      ]),
       "leaver",
       (processes) =>
         claimProcessesToReport(processes).pipe(
           Effect.tap((firstReports) => Ref.set(reported, firstReports)),
         ),
+      null,
       listProcesses,
       sendSignalNow,
     );
@@ -98,7 +126,7 @@ export const signaledAgainReportedOnce = makeTest(
       const { claimProcessesToReport } = makeProcessReportClaimer();
       yield* claimProcessesToReport([leftover]);
       expect(yield* killAsTaskCollectingReports(leftover, claimProcessesToReport)).toEqual([]);
-      expect(yield* isProcessAlive(leftover.processId)).toBe(false);
+      yield* waitUntilProcessEnds(leftover.processId);
     }),
   ),
 );
@@ -118,7 +146,7 @@ export const interruptedPass = makeTest(
       expect(yield* killAsTaskCollectingReports(leftover, claimProcessesToReport)).toEqual([
         leftover,
       ]);
-      expect(yield* isProcessAlive(leftover.processId)).toBe(false);
+      yield* waitUntilProcessEnds(leftover.processId);
     }),
   ),
 );
@@ -134,7 +162,7 @@ export const probeDenied = makeTest(
         claimProcessesToReport,
         deniedFor((processId, signal) => processId < 0 && signal === PROBE_SIGNAL),
       );
-      expect(yield* isProcessAlive(leftover.processId)).toBe(false);
+      yield* waitUntilProcessEnds(leftover.processId);
       expect(swept).toEqual({ reported: [leftover], isForgotten: true });
     }),
   ),
@@ -160,7 +188,7 @@ export const groupKillDenied = makeTest(
         reported: [],
         isForgotten: true,
       });
-      expect(yield* isProcessAlive(leftover.processId)).toBe(false);
+      yield* waitUntilProcessEnds(leftover.processId);
     }),
   ),
 );
@@ -175,6 +203,7 @@ export const linuxStartTime = makeTest(
     ).toEqual({
       processName: "my (odd) name",
       state: "S",
+      isExiting: false,
       parentProcessId: 1,
       processGroupId: 1234,
       sessionId: 1234,
@@ -202,16 +231,26 @@ export const linuxHiddenProcessesSkipped = makeTest(
       ["/proc/1/stat", "EPERM"],
       ["/proc/2/stat", "EACCES"],
     ]);
-    const spans: Tracer.NativeSpan[] = [];
-    const recordingTracer = Tracer.make({
-      span: (options) => {
-        const span = new Tracer.NativeSpan(options);
-        spans.push(span);
-        return span;
-      },
+    const logged: {
+      message: unknown;
+      unreadableProcessIds: unknown;
+      spanId: string | undefined;
+    }[] = [];
+    const recordingLogger = Logger.make((options) => {
+      logged.push({
+        message: options.message,
+        unreadableProcessIds: options.fiber.getRef(References.CurrentLogAnnotations)[
+          `${TASK_TRACE_LABEL_PREFIX}.unreadableProcessIds`
+        ],
+        spanId: options.fiber.cache.span?.spanId,
+      });
     });
-    const listed = yield* listProcessesFromProcDirectory("main").pipe(
-      Effect.withTracer(recordingTracer),
+    const { cleanupSpan, listed } = yield* Effect.all({
+      cleanupSpan: Effect.currentSpan,
+      listed: listProcessesFromProcDirectory("main"),
+    }).pipe(
+      Effect.withSpan("cleanup main"),
+      Effect.provideService(Logger.CurrentLoggers, new Set([recordingLogger])),
       Effect.provideService(
         FileSystem.FileSystem,
         FileSystem.makeNoop({
@@ -228,10 +267,346 @@ export const linuxHiddenProcessesSkipped = makeTest(
       ),
     );
     expect([...listed.keys()]).toEqual([READABLE_PROCESS_ID]);
+    expect(logged).toEqual([
+      {
+        message: ["skipped processes whose /proc files cannot be read"],
+        unreadableProcessIds: [1, ACCESS_DENIED_PROCESS_ID],
+        spanId: cleanupSpan.spanId,
+      },
+    ]);
+  }),
+);
+
+const FIXTURE_MARKER = RunMarker.make({
+  fileDescriptor: 3,
+  token: "run-token",
+  environmentValue: "run-token",
+});
+
+const FIXTURE_MARKER_PIPE = "pipe:[42]";
+
+const PROC_STAT_FIELDS_BEFORE_START_TIME = 15;
+
+const PROC_PATH_PROCESS_ID_INDEX = 2;
+
+const ENVIRONMENT_READS_OF_A_HIDDEN_PROCESS = 2;
+
+const procStatLine = (filePath: string, state: string) => {
+  const processId = filePath.split("/")[PROC_PATH_PROCESS_ID_INDEX];
+  return `${processId} (tsc) ${state} 1 ${processId} ${processId} ${"0 ".repeat(PROC_STAT_FIELDS_BEFORE_START_TIME)}300`;
+};
+
+const RUNNING_STATE = "S";
+
+const UNMARKED_PROCESS_ID = 400;
+
+const MARKED_PROCESS_ID = 500;
+
+const OLDER_ACCESS_DENIED_PROCESS_ID = 600;
+
+const BEFORE_THE_RUN_START_TIME = "100";
+
+const RUN_START_TIME = "200";
+
+const AFTER_THE_RUN_START_TIME = "300";
+
+export const linuxHiddenMarkersUnknown = makeTest(
+  "a Linux process started since the run whose environment and file descriptors cannot be read is unknown to the run, not unmarked, while one started before the run, one whose environment does not name the run and one holding the run's marker pipe are unmarked, unmarked and marked",
+  Effect.gen(function* () {
+    const deniedFilePaths = new Set(
+      [ACCESS_DENIED_PROCESS_ID, OLDER_ACCESS_DENIED_PROCESS_ID].flatMap((processId) => [
+        `/proc/${processId}/environ`,
+        `/proc/${processId}/fd`,
+      ]),
+    );
+    const readOrDeny =
+      <Success>(read: (filePath: string) => Success) =>
+      (filePath: string) =>
+        deniedFilePaths.has(filePath)
+          ? Effect.fail(deniedWith("EACCES", filePath))
+          : Effect.succeed(read(filePath));
+    const readings = yield* readLinuxMarkers(
+      FIXTURE_MARKER,
+      FIXTURE_MARKER_PIPE,
+      [
+        { processId: ACCESS_DENIED_PROCESS_ID, startTime: RUN_START_TIME },
+        { processId: UNMARKED_PROCESS_ID, startTime: AFTER_THE_RUN_START_TIME },
+        { processId: MARKED_PROCESS_ID, startTime: AFTER_THE_RUN_START_TIME },
+        { processId: OLDER_ACCESS_DENIED_PROCESS_ID, startTime: BEFORE_THE_RUN_START_TIME },
+      ],
+      RUN_START_TIME,
+    ).pipe(
+      Effect.provideService(
+        FileSystem.FileSystem,
+        FileSystem.makeNoop({
+          readFile: readOrDeny(() =>
+            new TextEncoder().encode(`PATH=/bin\0${RUN_MARKERS_VARIABLE_NAME}=another-run\0`),
+          ),
+          readFileString: (filePath) => Effect.succeed(procStatLine(filePath, RUNNING_STATE)),
+          readDirectory: readOrDeny(() => ["0", "3"]),
+          readLink: readOrDeny((filePath) =>
+            filePath === `/proc/${MARKED_PROCESS_ID}/fd/3` ? FIXTURE_MARKER_PIPE : "/dev/null",
+          ),
+        }),
+      ),
+    );
     expect(
-      spans
-        .find((span) => span.name === "listProcessesFromProcDirectory")
-        ?.attributes.get(`${TASK_TRACE_LABEL_PREFIX}.unreadableProcessIds`),
-    ).toEqual([1, ACCESS_DENIED_PROCESS_ID]);
+      readings.map(([processId, reading]) => [
+        processId,
+        MarkerReading.match(reading, {
+          Marked: () => "marked",
+          Unmarked: () => "unmarked",
+          Unreadable: () => "unknown",
+        }),
+      ]),
+    ).toEqual([
+      [ACCESS_DENIED_PROCESS_ID, "unknown"],
+      [UNMARKED_PROCESS_ID, "unmarked"],
+      [MARKED_PROCESS_ID, "marked"],
+      [OLDER_ACCESS_DENIED_PROCESS_ID, "unmarked"],
+    ]);
+  }),
+);
+
+const ANCESTOR_PROCESS_ID = 700;
+
+const UNRELATED_PARENT_PROCESS_ID = 710;
+
+const RUN_CHILD_PROCESS_ID = 720;
+
+const ORPHAN_PROCESS_ID = 730;
+
+const ADOPTED_BY_ANCESTOR_PROCESS_ID = 740;
+
+const ORPHAN_CHILD_PROCESS_ID = 750;
+
+const MARKED_CHILD_PROCESS_ID = 760;
+
+const UNRELATED_CHILD_PROCESS_ID = 770;
+
+const UNRELATED_GRANDCHILD_PROCESS_ID = 780;
+
+const FIRST_PROCESS_ID = 1;
+
+export const linuxUnreadableUnrelatedProcessesUnmarked = makeTest(
+  "a Linux process whose environment and file descriptors cannot be read is unknown only when its parent is the run, a process of the run, PID 1, an ancestor of the run that may have adopted it, or another such unknown process, and is unmarked when its parent is a readable process that is not the run's",
+  Effect.gen(function* () {
+    const parents = new Map([
+      [process.pid, ANCESTOR_PROCESS_ID],
+      [ANCESTOR_PROCESS_ID, FIRST_PROCESS_ID],
+      [UNRELATED_PARENT_PROCESS_ID, FIRST_PROCESS_ID],
+      [MARKED_PROCESS_ID, process.pid],
+      [RUN_CHILD_PROCESS_ID, process.pid],
+      [ORPHAN_PROCESS_ID, FIRST_PROCESS_ID],
+      [ADOPTED_BY_ANCESTOR_PROCESS_ID, ANCESTOR_PROCESS_ID],
+      [ORPHAN_CHILD_PROCESS_ID, ORPHAN_PROCESS_ID],
+      [MARKED_CHILD_PROCESS_ID, MARKED_PROCESS_ID],
+      [UNRELATED_CHILD_PROCESS_ID, UNRELATED_PARENT_PROCESS_ID],
+      [UNRELATED_GRANDCHILD_PROCESS_ID, UNRELATED_CHILD_PROCESS_ID],
+    ]);
+    const deniedProcessIds = [
+      RUN_CHILD_PROCESS_ID,
+      ORPHAN_PROCESS_ID,
+      ADOPTED_BY_ANCESTOR_PROCESS_ID,
+      ORPHAN_CHILD_PROCESS_ID,
+      MARKED_CHILD_PROCESS_ID,
+      UNRELATED_CHILD_PROCESS_ID,
+      UNRELATED_GRANDCHILD_PROCESS_ID,
+    ];
+    const deniedFilePaths = new Set(
+      deniedProcessIds.flatMap((processId) => [
+        `/proc/${processId}/environ`,
+        `/proc/${processId}/fd`,
+      ]),
+    );
+    const readOrDeny =
+      <Success>(read: (filePath: string) => Success) =>
+      (filePath: string) =>
+        deniedFilePaths.has(filePath)
+          ? Effect.fail(deniedWith("EACCES", filePath))
+          : Effect.succeed(read(filePath));
+    const readings = yield* readLinuxMarkers(
+      FIXTURE_MARKER,
+      FIXTURE_MARKER_PIPE,
+      [UNRELATED_PARENT_PROCESS_ID, MARKED_PROCESS_ID, ...deniedProcessIds].map((processId) => ({
+        processId,
+        startTime: AFTER_THE_RUN_START_TIME,
+      })),
+      RUN_START_TIME,
+    ).pipe(
+      Effect.provideService(
+        FileSystem.FileSystem,
+        FileSystem.makeNoop({
+          readFile: readOrDeny(() => new TextEncoder().encode("PATH=/bin\0")),
+          readFileString: (filePath) => Effect.succeed(procStatLine(filePath, RUNNING_STATE)),
+          readDirectory: readOrDeny(() => ["0", "3"]),
+          readLink: readOrDeny((filePath) =>
+            filePath === `/proc/${MARKED_PROCESS_ID}/fd/3` ? FIXTURE_MARKER_PIPE : "/dev/null",
+          ),
+        }),
+      ),
+    );
+    const possibleRunProcesses = findPossibleRunProcesses(
+      new Map([...parents].map(([processId, parentProcessId]) => [processId, { parentProcessId }])),
+      new Map(
+        readings.flatMap(([processId, reading]) =>
+          MarkerReading.guards.Unreadable(reading) ? [[processId, reading.cause] as const] : [],
+        ),
+      ),
+      readings.flatMap(([processId, reading]) =>
+        MarkerReading.guards.Marked(reading) ? [processId] : [],
+      ),
+    );
+    expect([...possibleRunProcesses.keys()].toSorted((left, right) => left - right)).toEqual([
+      RUN_CHILD_PROCESS_ID,
+      ORPHAN_PROCESS_ID,
+      ADOPTED_BY_ANCESTOR_PROCESS_ID,
+      ORPHAN_CHILD_PROCESS_ID,
+      MARKED_CHILD_PROCESS_ID,
+    ]);
+  }),
+);
+
+const unknownOwnershipOf = (processId: number) =>
+  new ProcessOwnershipUnknown({
+    processId,
+    startTime: AFTER_THE_RUN_START_TIME,
+    command: "ssh-agent",
+    cause: "EACCES",
+  });
+
+const reportedProcessIds = (claimed: readonly ProcessOwnershipUnknown[]) =>
+  claimed.map((unknownOwnership) => unknownOwnership.processId);
+
+export const unknownOwnershipReportedOnce = makeTest(
+  "each process whose ownership is unknown is reported once per run, across the run's cleanup stages, the supervisor's sweep and the run's own sweep after the supervisor is gone",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { claimProcessesToReport: claimInTheSupervisor } = makeProcessReportClaimer();
+      const handlers = yield* SupervisorRpcs.toHandlers({
+        ReportReady: () => Effect.void,
+        AcknowledgeStop: () => Effect.void,
+        ShareProcessGroup: () => Effect.void,
+        RunInTerminal: () => Effect.die("the test supervisor runs no terminal commands"),
+        AwaitTerminalCommandExit: () => Effect.void,
+        ClaimUnknownOwnership: ({ processes }) => claimInTheSupervisor(processes),
+        SweepBeforeExit: () => Effect.succeed([]),
+      });
+      const supervisorConnection =
+        yield* Deferred.make<Effect.Success<ReturnType<typeof connectToTheSupervisor>>>();
+      yield* Deferred.succeed(
+        supervisorConnection,
+        yield* RpcTest.makeClient(SupervisorRpcs).pipe(Effect.provideContext(handlers)),
+      );
+      const disconnected = yield* Deferred.make<void>();
+      const claimInTheRun = makeUnknownOwnershipClaimer(supervisorConnection, disconnected);
+      const first = unknownOwnershipOf(RUN_CHILD_PROCESS_ID);
+      const second = unknownOwnershipOf(ORPHAN_PROCESS_ID);
+      const third = unknownOwnershipOf(ORPHAN_CHILD_PROCESS_ID);
+      const fourth = unknownOwnershipOf(MARKED_CHILD_PROCESS_ID);
+      expect(reportedProcessIds(yield* claimUnknownOwnership([first], claimInTheRun))).toEqual([
+        RUN_CHILD_PROCESS_ID,
+      ]);
+      expect(
+        reportedProcessIds(yield* claimUnknownOwnership([first, second], claimInTheRun)),
+      ).toEqual([ORPHAN_PROCESS_ID]);
+      expect(
+        reportedProcessIds(
+          yield* claimUnknownOwnership([first, second, third], claimInTheSupervisor),
+        ),
+      ).toEqual([ORPHAN_CHILD_PROCESS_ID]);
+      yield* Deferred.done(disconnected, Exit.void);
+      expect(
+        reportedProcessIds(yield* claimUnknownOwnership([first, fourth], claimInTheRun)),
+      ).toEqual([MARKED_CHILD_PROCESS_ID]);
+    }),
+  ),
+);
+
+const ZOMBIE_PROCESS_ID = 800;
+
+const GONE_PROCESS_ID = 810;
+
+const READABLE_ON_REREAD_PROCESS_ID = 820;
+
+const STILL_HIDDEN_PROCESS_ID = 830;
+
+const ZOMBIE_STATE = "Z";
+
+const goneWith = (filePath: string) =>
+  PlatformError.systemError({
+    _tag: "NotFound",
+    module: "FileSystem",
+    method: "readFileString",
+    pathOrDescriptor: filePath,
+    cause: Object.assign(new Error("ENOENT: gone"), { code: "ENOENT" }),
+  });
+
+export const linuxEndingProcessesUnmarked = makeTest(
+  "a Linux process whose environment cannot be read is unmarked when its stat shows it a zombie or it is gone, is read once more while it runs, and is unknown only when that second read is still denied",
+  Effect.gen(function* () {
+    const environmentReads = new Map<string, number>();
+    const readEnvironment = (filePath: string) => {
+      const readsSoFar = (environmentReads.get(filePath) ?? 0) + 1;
+      environmentReads.set(filePath, readsSoFar);
+      const isReadableNow =
+        filePath === `/proc/${READABLE_ON_REREAD_PROCESS_ID}/environ` && readsSoFar > 1;
+      return isReadableNow
+        ? Effect.succeed(new TextEncoder().encode("PATH=/bin\0"))
+        : Effect.fail(deniedWith("EACCES", filePath));
+    };
+    const readings = yield* readLinuxMarkers(
+      FIXTURE_MARKER,
+      FIXTURE_MARKER_PIPE,
+      [
+        ZOMBIE_PROCESS_ID,
+        GONE_PROCESS_ID,
+        READABLE_ON_REREAD_PROCESS_ID,
+        STILL_HIDDEN_PROCESS_ID,
+      ].map((processId) => ({ processId, startTime: AFTER_THE_RUN_START_TIME })),
+      RUN_START_TIME,
+    ).pipe(
+      Effect.provideService(
+        FileSystem.FileSystem,
+        FileSystem.makeNoop({
+          readFile: readEnvironment,
+          readDirectory: (filePath) =>
+            filePath === `/proc/${READABLE_ON_REREAD_PROCESS_ID}/fd`
+              ? Effect.succeed(["0"])
+              : Effect.fail(deniedWith("EACCES", filePath)),
+          readLink: () => Effect.succeed("/dev/null"),
+          readFileString: (filePath) => {
+            if (filePath === `/proc/${GONE_PROCESS_ID}/stat`) {
+              return Effect.fail(goneWith(filePath));
+            }
+            return Effect.succeed(
+              procStatLine(
+                filePath,
+                filePath === `/proc/${ZOMBIE_PROCESS_ID}/stat` ? ZOMBIE_STATE : RUNNING_STATE,
+              ),
+            );
+          },
+        }),
+      ),
+    );
+    expect(
+      readings.map(([processId, reading]) => [
+        processId,
+        MarkerReading.match(reading, {
+          Marked: () => "marked",
+          Unmarked: () => "unmarked",
+          Unreadable: () => "unknown",
+        }),
+      ]),
+    ).toEqual([
+      [ZOMBIE_PROCESS_ID, "unmarked"],
+      [GONE_PROCESS_ID, "unmarked"],
+      [READABLE_ON_REREAD_PROCESS_ID, "unmarked"],
+      [STILL_HIDDEN_PROCESS_ID, "unknown"],
+    ]);
+    expect(environmentReads.get(`/proc/${STILL_HIDDEN_PROCESS_ID}/environ`)).toBe(
+      ENVIRONMENT_READS_OF_A_HIDDEN_PROCESS,
+    );
+    expect(environmentReads.get(`/proc/${ZOMBIE_PROCESS_ID}/environ`)).toBe(1);
   }),
 );

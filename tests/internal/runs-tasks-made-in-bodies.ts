@@ -71,11 +71,11 @@ export default Task.make({ name: "main", run: Task.all([first, second]) });`);
           SSHKEDA_TASK_WORKERS: workerCount,
         });
         expect(ran.exitCode).toBe(1);
-        expect(ran.standardError).toContain(
-          'main.ts:3:85: error TaskMadeMoreThanOnce: makes the task "made", which 2 Task.make() calls make\n',
+        expect(ran.standardError.split("\n")).toContain(
+          "error: main.ts:3:85: TaskMadeMoreThanOnce: makes the task [made], which 2 Task.make() calls make",
         );
-        expect(ran.standardError).toContain(
-          'main.ts:4:122: error TaskMadeMoreThanOnce: makes the task "made", which 2 Task.make() calls make\n',
+        expect(ran.standardError.split("\n")).toContain(
+          "error: main.ts:4:122: TaskMadeMoreThanOnce: makes the task [made], which 2 Task.make() calls make",
         );
         expect(ran.standardError).not.toContain("made by second");
         expect(findMisprintedErrorLines(ran.standardError)).toEqual([]);
@@ -93,11 +93,11 @@ export const madeAgainInBody = makeTest(
 export default Task.make({ name: "main", run: Effect.gen(function* () { yield* Task.make({ name: "lint", run: Effect.log("body lint ran") }); }) });`);
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        'main.ts:3:26: error TaskMadeMoreThanOnce: makes the task "lint", which 2 Task.make() calls make\n',
+      expect(ran.standardError.split("\n")).toContain(
+        "error: main.ts:3:26: TaskMadeMoreThanOnce: makes the task [lint], which 2 Task.make() calls make",
       );
-      expect(ran.standardError).toContain(
-        'main.ts:4:85: error TaskMadeMoreThanOnce: makes the task "lint", which 2 Task.make() calls make\n',
+      expect(ran.standardError.split("\n")).toContain(
+        "error: main.ts:4:85: TaskMadeMoreThanOnce: makes the task [lint], which 2 Task.make() calls make",
       );
       expect(ran.standardError).not.toContain("lint ran");
     }),
@@ -114,8 +114,8 @@ export const brokenInBody = makeTest(
 }) });`);
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        "made: error TaskTimeoutInvalid: has the timeout -1, which is not a duration above 0\n",
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [made] TaskTimeoutInvalid: has the timeout -1, which is not a duration above 0",
       );
       expect(ran.standardError).not.toContain("made ran");
     }),
@@ -132,8 +132,10 @@ export const timedOutInBody = makeTest(
 }) });`);
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain("[made] error TaskTimedOut: timed out after 1s\n");
-      expect(ran.standardError).toContain("[main] error AwaitedTaskFailed: made failed\n");
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [made] main.ts:4:15: TaskTimedOut: timed out after 1s",
+      );
+      expect(ran.standardError).not.toContain("AwaitedTaskFailed");
     }),
   ),
 );
@@ -157,7 +159,7 @@ export const stoppedInBody = makeTest(
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(exited.standardError).toContain("[made] made cleaned up");
       expect(exited.standardError).toMatch(
-        /^failed: 0 of 2 tasks, 2 stopped, [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /\nstopped: \[main\] \[made\] \(2 of 2 tasks\), [\d.]+s\nrun: .+\/$/u,
       );
     }),
   ),
@@ -177,8 +179,8 @@ export const madeOutsideTheBodyFiber = makeTest(
 }) });`);
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        '[main] error TaskNotMadeWhileLoading: the task "made" was not made while the task files loaded, so no worker thread can run it\n',
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [main] main.ts:3:21: TaskNotMadeWhileLoading: the task [made] was not made while the task files loaded, so no worker thread can run it",
       );
       expect(ran.standardError).not.toContain("made ran");
     }),

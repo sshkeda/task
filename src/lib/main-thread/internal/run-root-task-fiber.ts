@@ -10,17 +10,18 @@ import {
   Fiber,
 } from "effect";
 
-import { formatFailureLines } from "../../../shared/format-error-lines.ts";
-import { formatSeconds } from "../../../shared/format-task-lines.ts";
 import { dieOnInvariantFailure } from "../../../shared/invariant-errors.ts";
+import { labelLine, nameTask } from "../../../shared/label-lines.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
-import { printLine } from "../../../shared/print-to-standard-error.ts";
+import { offerLines, readLastStandardErrorWrite } from "../../../shared/print-to-standard-error.ts";
 import { availableParallelism } from "../../../shared/read-environment-config.ts";
 import { TaskBodyFailed } from "../../../shared/task-errors.ts";
-import { TASK_PACKAGE } from "../../../shared/task-package.ts";
+import { endTaskSpan } from "../../../shared/task-spans.ts";
 import { TaskRuns } from "../lib/run-tasks-on-workers/index.ts";
 import { failRun, failRunOnFailure } from "../shared/fail-run.ts";
+import { formatSeconds } from "../shared/format-task-lines.ts";
 import {
+  NoTaskStarted,
   RootTaskWorkingDirectoryUnavailable,
   StopRequested,
   TasksNeverRan,
@@ -31,10 +32,12 @@ import { ProcessGroups } from "../shared/provide-process-groups.ts";
 import { RunRootTaskConfig } from "../shared/provide-run-root-task-config.ts";
 import { StopState } from "../shared/provide-stop-state.ts";
 import { WorkerPool } from "../shared/provide-worker-pool.ts";
+import { readTerminalCommands } from "../shared/track-terminal-commands.ts";
+import { TaskOutputFiles } from "../shared/write-task-output-files.ts";
+import { decideNoTaskStarted } from "./decide-no-task-started.ts";
+import { formatRunningLine, printRunningLinesWhileQuiet } from "./print-running-lines.ts";
 
-const stopEverythingStarted = Effect.fn("stopEverythingStarted")(function* (
-  workerEventHandlingFiber: Fiber.Fiber<void>,
-) {
+const stopEverythingStarted = Effect.fn(function* (workerEventHandlingFiber: Fiber.Fiber<void>) {
   const shutdown = yield* StopState;
   const taskRuns = yield* TaskRuns;
   const workerPool = yield* WorkerPool;
@@ -50,7 +53,7 @@ const stopEverythingStarted = Effect.fn("stopEverythingStarted")(function* (
     const cutOffTaskNames = yield* taskRuns.findTaskNamesStillInBodyOrCleanup;
     yield* workerPool.terminateAllWorkers;
     yield* killAllProcessGroups;
-    yield* taskRuns.reportCleanupsCutOff(cutOffTaskNames);
+    yield* taskRuns.reportStopsCutOff(cutOffTaskNames);
   }
   yield* workerPool.requestExitOfAllWorkers;
   const workersGone = yield* Deferred.make<false>();
@@ -75,11 +78,62 @@ const isTaskBodyFailed = Schema.is(TaskBodyFailed);
 
 const LARGEST_PROCESS_EXIT_CODE = 255;
 
-const MOST_NAMED_FAILED_TASKS = 3;
+const MOST_NAMED_TASKS = 3;
+
+const countTasks = (count: number) => `${count} ${count === 1 ? "task" : "tasks"}`;
+
+const nameSomeTasks = (taskNames: readonly string[], total: number) => {
+  const named = taskNames.slice(0, MOST_NAMED_TASKS).map((taskName) => nameTask(taskName));
+  const unnamedCount = taskNames.length - named.length;
+  return [
+    ...named,
+    ...(unnamedCount === 0 ? [] : [`and ${unnamedCount} more`]),
+    `(${taskNames.length} of ${countTasks(total)})`,
+  ].join(" ");
+};
+
+export const formatSummaryLine = (run: {
+  readonly runPassed: boolean;
+  readonly isStopped: boolean;
+  readonly total: number;
+  readonly failedTaskNames: readonly string[];
+  readonly stoppedTaskNames: readonly string[];
+  readonly elapsedMilliseconds: number;
+}) => {
+  const failedCount = run.failedTaskNames.length;
+  const stoppedCount = run.stoppedTaskNames.length;
+  const stopped = stoppedCount === 0 ? [] : [`${stoppedCount} stopped`];
+  const seconds = formatSeconds(run.elapsedMilliseconds);
+  if (run.runPassed) {
+    const caughtFailures =
+      failedCount === 0
+        ? []
+        : [`${failedCount} caught ${failedCount === 1 ? "failure" : "failures"}`];
+    return labelLine(
+      "passed",
+      null,
+      [countTasks(run.total), ...caughtFailures, ...stopped, seconds].join(", "),
+    );
+  }
+  const isStoppedWithoutFailures = run.isStopped && failedCount === 0;
+  if (isStoppedWithoutFailures) {
+    const stoppedTasks =
+      stoppedCount === 0
+        ? `0 of ${countTasks(run.total)}`
+        : nameSomeTasks(run.stoppedTaskNames, run.total);
+    return labelLine("stopped", null, [stoppedTasks, seconds].join(", "));
+  }
+  const failedTasks =
+    failedCount === 0
+      ? `0 of ${countTasks(run.total)}`
+      : nameSomeTasks(run.failedTaskNames, run.total);
+  return labelLine("failed", null, [failedTasks, ...stopped, seconds].join(", "));
+};
 
 const exitCodeOfRunEndingFailure = (
   runEndingFailure:
     | Effect.Success<ReturnType<typeof stopEverythingStarted>>
+    | NoTaskStarted
     | TasksNeverRan
     | UnawaitedTasksFailed
     | null,
@@ -103,6 +157,18 @@ const exitCodeOfRunEndingFailure = (
   return isFailedCommandExitCodeUsable ? failedCommandExitCode : 1;
 };
 
+export const handleWorkerEventsAsTheyArrive = Effect.gen(function* () {
+  const workerPool = yield* WorkerPool;
+  const taskRuns = yield* TaskRuns;
+  yield* workerPool.events.pipe(
+    Stream.groupByKey((workerEvent) => workerEvent.workerId),
+    Stream.mapEffect(([, events]) => Stream.runForEachArray(events, taskRuns.handleWorkerEvents), {
+      concurrency: "unbounded",
+    }),
+    Stream.runDrain,
+  );
+});
+
 export const runRootTaskFiber = Effect.gen(function* () {
   const runRootTaskConfig = yield* RunRootTaskConfig;
   const { rootTaskName } = runRootTaskConfig;
@@ -114,32 +180,39 @@ export const runRootTaskFiber = Effect.gen(function* () {
   const workerPool = yield* WorkerPool;
   const taskRuns = yield* TaskRuns;
   if (discoveredTasks.brokenTasks !== null) {
-    yield* printLine("Error", formatFailureLines(discoveredTasks.brokenTasks, null));
-    yield* shutdown.recordPrintedFailure(discoveredTasks.brokenTasks);
+    yield* shutdown.recordRunFailure(discoveredTasks.brokenTasks);
     yield* failRun(discoveredTasks.brokenTasks, taskRuns.markFailed);
   }
-  const workerEventHandlingFiber = yield* workerPool.events.pipe(
-    Stream.groupByKey((workerEvent) => workerEvent.workerId),
-    Stream.mapEffect(([, events]) => Stream.runForEach(events, taskRuns.handleWorkerEvent), {
-      concurrency: "unbounded",
-    }),
-    Stream.runDrain,
+  const workerEventHandlingFiber = yield* handleWorkerEventsAsTheyArrive.pipe(
     Effect.withParentSpan(runSpan),
     Effect.forkScoped,
   );
+  const runningLinesFiber = yield* printRunningLinesWhileQuiet({
+    readLastWrite: readLastStandardErrorWrite,
+    readTerminalCommands,
+    describe: (nowMilliseconds) =>
+      Effect.gen(function* () {
+        return formatRunningLine({
+          isStopping: yield* shutdown.isStopping,
+          ...(yield* taskRuns.describeOwnWork(nowMilliseconds)),
+          runMilliseconds: nowMilliseconds - runRootTaskConfig.runStartedAtMilliseconds,
+        });
+      }),
+    print: (line) => offerLines("status", line),
+  }).pipe(Effect.forkScoped);
   if (discoveredTasks.tasksByName !== null) {
     yield* taskRuns.registerDiscoveredTasks(discoveredTasks.tasksByName);
-    yield* Effect.try({
-      try: () => {
-        process.chdir(runRootTaskConfig.rootTaskPackageJsonDirectoryPath);
-      },
-      catch: (cause) =>
-        new RootTaskWorkingDirectoryUnavailable({
-          packageJsonDirectoryPath: runRootTaskConfig.rootTaskPackageJsonDirectoryPath,
-          cause,
-        }),
-    });
     yield* Effect.gen(function* () {
+      yield* Effect.try({
+        try: () => {
+          process.chdir(runRootTaskConfig.rootTaskPackageJsonDirectoryPath);
+        },
+        catch: (cause) =>
+          new RootTaskWorkingDirectoryUnavailable({
+            packageJsonDirectoryPath: runRootTaskConfig.rootTaskPackageJsonDirectoryPath,
+            cause,
+          }),
+      });
       yield* taskRuns.requestRootTaskResult(rootTaskName);
       yield* taskRuns.awaitServingTaskClosure(rootTaskName);
     }).pipe(
@@ -151,6 +224,7 @@ export const runRootTaskFiber = Effect.gen(function* () {
     );
   }
 
+  yield* Fiber.interrupt(runningLinesFiber);
   const failure = yield* stopEverythingStarted(workerEventHandlingFiber);
   const taskRunCounts = yield* taskRuns.counts;
   const elapsedMilliseconds =
@@ -162,7 +236,7 @@ export const runRootTaskFiber = Effect.gen(function* () {
   const isEveryRootFileTaskDue =
     failure === null && unawaitedTasksFailed === null && runRootTaskConfig.checksForgottenTasks;
   const neverRanTaskNames = isEveryRootFileTaskDue
-    ? discoveredTasks.unexportedRootFileTaskNames.filter(
+    ? discoveredTasks.rootFileTaskNames.unexported.filter(
         (taskName) => !taskRunCounts.taskNames.includes(taskName),
       )
     : [];
@@ -172,54 +246,47 @@ export const runRootTaskFiber = Effect.gen(function* () {
         filePath: runRootTaskConfig.rootTaskFilePath,
       })
     : null;
-  const runEndingFailure = failure ?? unawaitedTasksFailed ?? tasksNeverRan;
-  const runPassed = runEndingFailure === null;
-  const failedTaskCount = taskRunCounts.failedTaskNames.length;
-  const totalTasks = `${taskRunCounts.total} ${taskRunCounts.total === 1 ? "task" : "tasks"}`;
-  const namedFailedTaskNames = taskRunCounts.failedTaskNames.slice(0, MOST_NAMED_FAILED_TASKS);
-  const unnamedFailedTaskCount = failedTaskCount - namedFailedTaskNames.length;
-  const failedTasks = [
-    namedFailedTaskNames.join(", "),
-    ...(unnamedFailedTaskCount === 0 ? [] : [`and ${unnamedFailedTaskCount} more`]),
-    `(${failedTaskCount} of ${totalTasks})`,
-  ].join(" ");
-  const caughtFailures = `${failedTaskCount} caught ${failedTaskCount === 1 ? "failure" : "failures"}`;
-  const tasksWithFailures = runPassed ? [totalTasks, caughtFailures] : [failedTasks];
-  const tasksWithoutFailures = runPassed ? [totalTasks] : [`0 of ${totalTasks}`];
-  const tasks = failedTaskCount === 0 ? tasksWithoutFailures : tasksWithFailures;
-  const counts = [
-    ...tasks,
-    ...(taskRunCounts.stopped === 0 ? [] : [`${taskRunCounts.stopped} stopped`]),
-    formatSeconds(elapsedMilliseconds),
-  ].join(", ");
-  const isFailureUnprinted =
-    failure !== null && (isStopRequested(failure) || !(yield* shutdown.wasPrinted(failure)));
-  const runFailures = [
-    ...(unawaitedTasksFailed === null ? [] : [unawaitedTasksFailed]),
-    ...(tasksNeverRan === null ? [] : [tasksNeverRan]),
-    ...(isFailureUnprinted ? [failure] : []),
-  ];
-  yield* printLine("Info", runPassed ? `passed: ${counts}` : `failed: ${counts}`);
-  for (const runFailure of runFailures) {
-    yield* printLine("Error", formatFailureLines(runFailure, null));
-  }
+  const notStartedTaskNames = decideNoTaskStarted({
+    madeTaskNames: discoveredTasks.rootFileTaskNames.made,
+    startedTaskNames: taskRunCounts.taskNames,
+    rootTaskGroup: runRootTaskConfig.rootTaskGroup,
+    runAlreadyFailed: failure !== null || unawaitedTasksFailed !== null || tasksNeverRan !== null,
+  });
+  const noTaskStarted =
+    notStartedTaskNames === null
+      ? null
+      : new NoTaskStarted({
+          madeTaskNames: notStartedTaskNames,
+          filePath: runRootTaskConfig.rootTaskFilePath,
+        });
+  const runEndingFailure = failure ?? unawaitedTasksFailed ?? tasksNeverRan ?? noTaskStarted;
+  const summaryLine = formatSummaryLine({
+    runPassed: runEndingFailure === null,
+    isStopped: isStopRequested(runEndingFailure),
+    total: taskRunCounts.total,
+    failedTaskNames: taskRunCounts.failedTaskNames,
+    stoppedTaskNames: taskRunCounts.stoppedTaskNames,
+    elapsedMilliseconds,
+  });
   const exitCode = exitCodeOfRunEndingFailure(runEndingFailure, rootTaskName);
-  yield* Effect.annotateCurrentSpan({
-    [`${TASK_TRACE_LABEL_PREFIX}.version`]: TASK_PACKAGE.version,
-    [`${TASK_TRACE_LABEL_PREFIX}.entry`]: runRootTaskConfig.rootTaskFilePath,
-    [`${TASK_TRACE_LABEL_PREFIX}.root.task`]: rootTaskName,
-    [`${TASK_TRACE_LABEL_PREFIX}.exit.code`]: exitCode,
+  for (const [key, value] of Object.entries({
+    "process.exit.code": exitCode,
     [`${TASK_TRACE_LABEL_PREFIX}.elapsed.milliseconds`]: elapsedMilliseconds,
     [`${TASK_TRACE_LABEL_PREFIX}.workers.started`]: yield* workerPool.startedWorkerCount,
     [`${TASK_TRACE_LABEL_PREFIX}.workers.limit`]: runRootTaskConfig.workerCount,
-    "host.cpus": yield* availableParallelism,
-  });
-  runSpan.end(
-    yield* Clock.currentTimeNanos,
-    runEndingFailure === null ? Exit.void : Exit.fail(runEndingFailure),
-  );
+    [`${TASK_TRACE_LABEL_PREFIX}.workers.available`]: yield* availableParallelism,
+  })) {
+    runSpan.attribute(key, value);
+  }
+  yield* endTaskSpan(runSpan, runEndingFailure === null ? Exit.void : Exit.fail(runEndingFailure));
+  const taskOutputFiles = yield* TaskOutputFiles;
   return {
     exitCode,
+    summaryLine,
+    printRecapLines:
+      runEndingFailure === null
+        ? Effect.void
+        : taskOutputFiles.printRecapLines(taskRunCounts.failedTaskNames),
     runEndingCause: runEndingFailure === null ? null : Cause.fail(runEndingFailure),
   };
 });

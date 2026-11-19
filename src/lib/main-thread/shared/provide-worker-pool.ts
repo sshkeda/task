@@ -3,6 +3,7 @@ import { Worker } from "node:worker_threads";
 import * as BunStream from "@effect/platform-bun/BunStream";
 import {
   Cause,
+  Clock,
   Context,
   Deferred,
   Duration,
@@ -17,7 +18,6 @@ import {
   Schema,
   Scope,
   Semaphore,
-  Stdio,
   Stream,
   SubscriptionRef,
   Tracer,
@@ -27,24 +27,41 @@ import type { RpcClientError, RpcMessage } from "effect/rpc";
 import { Worker as EffectWorker } from "effect/workers";
 
 import type { ProcessIdentity } from "../../../shared/claim-processes-to-report.ts";
-import { findUserLocationInStack } from "../../../shared/find-user-locations-in-stack-traces.ts";
 import { dieOnInvariantFailure } from "../../../shared/invariant-errors.ts";
+import { joinMessages } from "../../../shared/join-messages.ts";
+import { decodeOutputText, OutputToJoin, splitOutputPieces } from "../../../shared/label-output.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
-import { UncaughtWorkerError } from "../../../shared/process-errors.ts";
+import {
+  offerOutputPiece,
+  standardErrorWriterStoppedDeferred,
+} from "../../../shared/print-to-standard-error.ts";
 import { bunArguments, commandLineArguments } from "../../../shared/read-environment-config.ts";
-import { describeCauseMessage, ErrorStack } from "../../../shared/report-errors.ts";
+import { addContext, reportUnderlyingErrors } from "../../../shared/report-cause.ts";
+import {
+  describeCauseMessage,
+  THROWN_VALUE_WITHOUT_MESSAGE,
+  UNTAGGED_FAILURE_TAG,
+} from "../../../shared/report-errors.ts";
 import {
   MainThreadRpcs,
-  MessageFromMainThreadRpcClient,
+  MessageFromWorkerToMainThread,
   TASK_EVENT_FIELDS,
+  ConsoleLineWritten,
   TaskMadeInBody,
   TaskWorkerRpcs,
   WorkerInitialMessage,
+  WorkerTraceRecord,
 } from "../../../shared/rpc.ts";
 import type { StandardInputRead, StartTaskFiber, WorkerData } from "../../../shared/rpc.ts";
 import { awaitTerminalCommandExit, runInTerminal } from "../../../shared/run-in-terminal.ts";
 import type { TaskRequestFailure } from "../../../shared/task-errors.ts";
+import {
+  liftTaskOutputBudget,
+  makeTaskOutputBudget,
+  releaseTaskOutputBytes,
+} from "../../../shared/task-output-budget.ts";
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
+import { PrintableError } from "../../errors/index.ts";
 import {
   awaitTheSupervisorTerminalCommandExit,
   runInTheSupervisorTerminal,
@@ -56,23 +73,82 @@ import {
   WorkerStage,
   WorkerStageEvent,
 } from "./define-worker-stage.ts";
-import { StopRequested } from "./main-thread-errors.ts";
+import { WorkerOutputNotRead, WorkerTerminationFailed } from "./main-thread-errors.ts";
 import { DiscoveredTasks } from "./provide-discovered-tasks.ts";
 import { RunRootTaskConfig } from "./provide-run-root-task-config.ts";
 import { StopState } from "./provide-stop-state.ts";
+import { whileACommandHasTheTerminal } from "./track-terminal-commands.ts";
 import { TraceFile } from "./write-trace-file.ts";
 
 const WORKER_EXIT_GRACE_SECONDS = 2;
 
 const WORKER_EXIT_GRACE = Duration.seconds(WORKER_EXIT_GRACE_SECONDS);
 
+const OUTPUT_MEBIBYTES_WAITING_TO_BE_WRITTEN = 16;
+
+const BYTES_PER_MEBIBYTE = 1_048_576;
+
+const OUTPUT_BYTES_WAITING_TO_BE_WRITTEN =
+  OUTPUT_MEBIBYTES_WAITING_TO_BE_WRITTEN * BYTES_PER_MEBIBYTE;
+
 const FORCED_STOP_REASON = "without waiting for it to exit because the stop was forced";
 
-const OUTPUT_READER_WAIT_AFTER_A_STOP_SIGNAL = Duration.seconds(1);
+const readOutputPieces = (readable: Worker["stdout"]) =>
+  splitOutputPieces(decodeOutputText(BunStream.fromReadable({ evaluate: () => readable })));
 
-const WORKER_OUTPUT_CHUNKS_WAITING_TO_BE_WRITTEN = 16;
+const copyOutput = (
+  source: string,
+  readable: Worker["stdout"],
+  budgetLifted: Deferred.Deferred<void>,
+) =>
+  Effect.gen(function* () {
+    const budget = yield* Semaphore.make(OUTPUT_BYTES_WAITING_TO_BE_WRITTEN);
+    yield* readOutputPieces(readable).pipe(
+      Stream.runForEach((piece) => {
+        const permits = Math.min(Buffer.byteLength(piece.text), OUTPUT_BYTES_WAITING_TO_BE_WRITTEN);
+        return budget.take(permits).pipe(
+          Effect.as(Effect.asVoid(budget.release(permits))),
+          Effect.raceFirst(Deferred.await(budgetLifted).pipe(Effect.as(Effect.void))),
+          Effect.flatMap((onWritten) =>
+            offerOutputPiece(
+              OutputToJoin.cases.Piece.make({ source, taskName: null, piece }),
+              onWritten,
+            ),
+          ),
+        );
+      }),
+    );
+  });
 
-const isStopRequested = Schema.is(StopRequested);
+const isWorkerTraceRecord = Schema.is(WorkerTraceRecord);
+
+const describeWorkerEndingForTrace = (
+  workerId: number,
+  exitCode: number,
+  ending: typeof WorkerEnding.Type,
+  uncaughtError: PrintableError | null,
+) => {
+  if (WorkerEnding.guards.Terminated(ending)) {
+    return {
+      errorType: "WorkerTerminated",
+      message: `worker ${workerId} was terminated before this span ended`,
+    };
+  }
+  return uncaughtError === null
+    ? {
+        errorType: "WorkerExited",
+        message: `worker ${workerId} exited with code ${exitCode} before this span ended`,
+      }
+    : {
+        errorType: uncaughtError.tag,
+        message: joinMessages([
+          addContext(
+            uncaughtError,
+            `worker ${workerId} stopped on this uncaught error before this span ended`,
+          ),
+        ]),
+      };
+};
 
 export const FromWorker = Schema.TaggedUnion({
   ...TASK_EVENT_FIELDS,
@@ -98,9 +174,9 @@ export const FromWorker = Schema.TaggedUnion({
   },
 });
 
-const decodeMessageFromMainThreadRpcClient = Schema.decodeUnknownExit(
-  MessageFromMainThreadRpcClient,
-);
+const decodeMessageFromWorkerToMainThread = Schema.decodeUnknownExit(MessageFromWorkerToMainThread);
+
+const isConsoleLineWritten = Schema.is(ConsoleLineWritten);
 
 const holdMessagesUntilListened = (thread: Worker) => {
   const inbox = {
@@ -136,13 +212,14 @@ const workerThreadPlatform = EffectWorker.makePlatform<
 });
 
 export const WorkerEvent = Schema.TaggedUnion({
+  ConsoleLineWritten: ConsoleLineWritten.fields,
   MessageReceived: { workerId: Schema.Int, message: FromWorker },
   MessageUnreadable: { workerId: Schema.Int, reason: Schema.String },
   ExitedWithCode: {
     workerId: Schema.Int,
     exitCode: Schema.Int,
     ending: WorkerEnding,
-    uncaughtError: Schema.NullOr(UncaughtWorkerError),
+    uncaughtError: Schema.NullOr(PrintableError),
   },
 });
 
@@ -162,7 +239,6 @@ const makeWorkerPool = Effect.gen(function* () {
   const shutdown = yield* StopState;
   const runRootTaskConfig = yield* RunRootTaskConfig;
   const traceFile = yield* TraceFile;
-  const stdio = yield* Stdio.Stdio;
   const parentSpan = yield* Tracer.ParentSpan;
   const { tasksByName } = yield* DiscoveredTasks;
   const workerLimit = Math.min(runRootTaskConfig.workerCount, tasksByName?.size ?? 0);
@@ -173,11 +249,13 @@ const makeWorkerPool = Effect.gen(function* () {
       readonly client: RpcClient.FromGroup<typeof TaskWorkerRpcs, RpcClientError.RpcClientError>;
       readonly stage: Ref.Ref<typeof WorkerStage.Type>;
       readonly exitedDeferred: Deferred.Deferred<void>;
-      readonly outputDrainedDeferred: Deferred.Deferred<void>;
+      readonly outputCopyEndedDeferred: Deferred.Deferred<void>;
+      readonly terminationFailedDeferred: Deferred.Deferred<void>;
       readonly postedBodyStartCount: Int32Array<SharedArrayBuffer>;
+      readonly taskOutputBudget: Int32Array<SharedArrayBuffer>;
       readonly handledBodyStartCount: SubscriptionRef.SubscriptionRef<number>;
       readonly isIsolated: boolean;
-      uncaughtError: Option.Option<typeof UncaughtWorkerError.Type>;
+      uncaughtError: Option.Option<PrintableError>;
     }
   >();
   const workerSelectionSemaphore = yield* Semaphore.make(1);
@@ -187,41 +265,37 @@ const makeWorkerPool = Effect.gen(function* () {
   const runInWorkerConnectionsScope = yield* FiberSet.makeRuntime<never, void, never>().pipe(
     Scope.provide(workerConnectionsScope),
   );
-  const workerOutput = yield* Queue.bounded<Deferred.Deferred<void> | Uint8Array>(
-    WORKER_OUTPUT_CHUNKS_WAITING_TO_BE_WRITTEN,
-  );
-  const workerOutputWriterStopped = yield* Deferred.make<void>();
-  yield* Stream.fromQueue(workerOutput).pipe(
-    Stream.rechunk(1),
-    Stream.filterMapEffect((chunkOrWritten) =>
-      chunkOrWritten instanceof Uint8Array
-        ? Effect.succeed(Result.succeed(chunkOrWritten))
-        : Deferred.done(chunkOrWritten, Exit.void).pipe(Effect.as(Result.fail(chunkOrWritten))),
+  const outputBudgetLifted = yield* Deferred.make<void>();
+  yield* Effect.raceAll([
+    shutdown.awaitForcedStop,
+    Deferred.await(standardErrorWriterStoppedDeferred),
+    shutdown.awaitStopSignal,
+  ]).pipe(
+    Effect.andThen(Deferred.done(outputBudgetLifted, Exit.void)),
+    Effect.andThen(
+      Effect.sync(() => {
+        for (const workerThread of workersById.values()) {
+          liftTaskOutputBudget(workerThread.taskOutputBudget);
+        }
+      }),
     ),
-    Stream.run(stdio.stdout()),
-    Effect.catchTag("PlatformError", () => Effect.void),
-    Effect.ensuring(Deferred.done(workerOutputWriterStopped, Exit.void)),
     Effect.forkIn(workerConnectionsScope),
   );
-  const copyWorkerOutput = (thread: Worker) =>
-    Effect.gen(function* () {
-      const written = yield* Deferred.make<void>();
-      yield* BunStream.fromReadable({ evaluate: () => thread.stdout }).pipe(
-        Stream.runForEach((chunk) => Queue.offer(workerOutput, chunk)),
-        Effect.andThen(Queue.offer(workerOutput, written)),
-        Effect.andThen(Deferred.await(written)),
-        Effect.raceFirst(
-          Deferred.await(workerOutputWriterStopped).pipe(
-            Effect.andThen(
-              Effect.sync(() => {
-                thread.stdout.resume();
-              }),
-            ),
-          ),
-        ),
-        Effect.catchTag("UnknownError", () => Effect.void),
-      );
-    });
+  const copyWorkerOutput = (workerId: number, thread: Worker) =>
+    Effect.all(
+      [
+        copyOutput(`${workerId} stdout`, thread.stdout, outputBudgetLifted),
+        copyOutput(`${workerId} stderr`, thread.stderr, outputBudgetLifted),
+      ],
+      { concurrency: "unbounded", discard: true },
+    ).pipe(
+      Effect.catchTag("UnknownError", (cause) => {
+        const lost = new WorkerOutputNotRead({ workerId, cause });
+        return shutdown
+          .recordRunFailure(lost)
+          .pipe(Effect.andThen(shutdown.recordFirstFailure(lost)), Effect.asVoid);
+      }),
+    );
   const nextAnswerId = yield* Ref.make(0);
   const pendingDependencyResults = new Map<
     number,
@@ -265,14 +339,46 @@ const makeWorkerPool = Effect.gen(function* () {
         ),
       );
     });
+  const recordWorkerTrace = (workerId: number, record: typeof WorkerTraceRecord.Type) => {
+    WorkerTraceRecord.match(record, {
+      SpanExported: (exported) => {
+        traceFile.writeWorkerSpan(exported);
+      },
+      TaskSpanStarted: ({ span }) => {
+        traceFile.recordWorkerTaskSpanStart(workerId, span);
+      },
+      TaskSpanUpdated: ({ span }) => {
+        traceFile.recordWorkerTaskSpanUpdate(span);
+      },
+      TaskSpanEnded: ({ spanId }) => {
+        traceFile.recordWorkerTaskSpanEnd(spanId);
+      },
+    });
+  };
   const makeWorkerRpcServerProtocol = (workerId: number, workerPort: MessagePort) =>
     RpcServer.Protocol.make((writeRequest) =>
       Effect.gen(function* () {
         const runInPoolScope = yield* FiberSet.makeRuntime<never, void, never>();
         const onMessage = (event: { readonly data: unknown }) => {
-          Exit.match(decodeMessageFromMainThreadRpcClient(event.data), {
-            onSuccess: (request) => {
-              runInPoolScope(writeRequest(0, request));
+          if (isConsoleLineWritten(event.data)) {
+            Queue.offerUnsafe(
+              workerEvents,
+              event.data.workerId === workerId
+                ? event.data
+                : WorkerEvent.cases.MessageUnreadable.make({
+                    workerId,
+                    reason: `a console line names worker ${event.data.workerId}`,
+                  }),
+            );
+            return;
+          }
+          Exit.match(decodeMessageFromWorkerToMainThread(event.data), {
+            onSuccess: (message) => {
+              if (isWorkerTraceRecord(message)) {
+                recordWorkerTrace(workerId, message);
+                return;
+              }
+              runInPoolScope(writeRequest(0, message));
             },
             onFailure: (cause) => {
               Queue.offerUnsafe(
@@ -341,23 +447,23 @@ const makeWorkerPool = Effect.gen(function* () {
               }),
             null,
           ),
-        RecordTraceSpan: (recorded) =>
-          Effect.sync(() => {
-            traceFile.writeWorkerSpan(recorded.spanJson);
-          }),
         RunInTerminal: (command) =>
-          runRootTaskConfig.ownsSession
-            ? runInTheSupervisorTerminal(command)
-            : runInTerminal(
-                Effect.asVoid(shutdown.awaitFailure),
-                runRootTaskConfig.runMarker === null
-                  ? null
-                  : runRootTaskConfig.runMarker.fileDescriptor,
-              )(command),
+          whileACommandHasTheTerminal(
+            runRootTaskConfig.ownsSession
+              ? runInTheSupervisorTerminal(command)
+              : runInTerminal(
+                  Effect.asVoid(shutdown.awaitFailure),
+                  runRootTaskConfig.runMarker === null
+                    ? null
+                    : runRootTaskConfig.runMarker.fileDescriptor,
+                )(command),
+          ),
         AwaitTerminalCommandExit: (command) =>
-          runRootTaskConfig.ownsSession
-            ? awaitTheSupervisorTerminalCommandExit(command)
-            : awaitTerminalCommandExit(command),
+          whileACommandHasTheTerminal(
+            runRootTaskConfig.ownsSession
+              ? awaitTheSupervisorTerminalCommandExit(command)
+              : awaitTerminalCommandExit(command),
+          ),
         RecordStartedProcess: (started) =>
           reportAndAwaitAnswer(
             workerId,
@@ -427,6 +533,11 @@ const makeWorkerPool = Effect.gen(function* () {
       );
       const isNewlyExited = action === "reportExit" && WorkerStage.guards.Exited(stage);
       if (isNewlyExited) {
+        traceFile.recordWorkerEnded(
+          workerId,
+          yield* Clock.currentTimeNanos,
+          describeWorkerEndingForTrace(workerId, exitCode, stage.ending, uncaughtError),
+        );
         yield* Queue.offer(
           workerEvents,
           WorkerEvent.cases.ExitedWithCode.make({
@@ -439,21 +550,24 @@ const makeWorkerPool = Effect.gen(function* () {
       }
       yield* Deferred.done(workerThread.exitedDeferred, Exit.void);
     }).pipe(Effect.uninterruptible);
-  const recordOutputDrained = (workerThread: Parameters<typeof workersById.set>[1]) =>
+  const recordOutputCopyEnded = (workerThread: Parameters<typeof workersById.set>[1]) =>
     Deferred.await(workerThread.exitedDeferred).pipe(
       Effect.andThen(moveWorker(workerThread, WorkerStageEvent.cases.DrainOutput.make({}))),
-      Effect.andThen(Deferred.done(workerThread.outputDrainedDeferred, Exit.void)),
+      Effect.andThen(Deferred.done(workerThread.outputCopyEndedDeferred, Exit.void)),
     );
   const startWorker = (workerId: number, isIsolated: boolean) =>
     Effect.gen(function* () {
       const postedBodyStartCount = new Int32Array(
         new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT),
       );
+      const taskOutputBudget = makeTaskOutputBudget();
       const workerData = {
         workerId,
-        projectDirectoryPath: runRootTaskConfig.rootTaskPackageJsonDirectoryPath,
+        projectDirectoryPath: runRootTaskConfig.projectDirectoryPath,
+        startDirectoryPath: runRootTaskConfig.workingDirectoryPathAtStart,
         taskLogHold: shutdown.taskLogHold,
         postedBodyStartCount,
+        taskOutputBudget,
         runMarker: runRootTaskConfig.runMarker,
         rootTaskGroup: runRootTaskConfig.rootTaskGroup,
         flags: runRootTaskConfig.flags,
@@ -463,6 +577,7 @@ const makeWorkerPool = Effect.gen(function* () {
       const thread = new Worker(new URL("../../worker-thread/index.ts", import.meta.url), {
         workerData,
         stdout: true,
+        stderr: true,
         argv: yield* commandLineArguments,
         execArgv: yield* bunArguments,
       });
@@ -472,26 +587,26 @@ const makeWorkerPool = Effect.gen(function* () {
         client: yield* connectToWorker(threadMessages, rpcChannel.port2),
         stage: yield* Ref.make<typeof WorkerStage.Type>(WorkerStage.cases.Idle.make({})),
         exitedDeferred: yield* Deferred.make<void>(),
-        outputDrainedDeferred: yield* Deferred.make<void>(),
+        outputCopyEndedDeferred: yield* Deferred.make<void>(),
+        terminationFailedDeferred: yield* Deferred.make<void>(),
         postedBodyStartCount,
+        taskOutputBudget,
         handledBodyStartCount: yield* SubscriptionRef.make(0),
         isIsolated,
         uncaughtError: Option.none(),
       } satisfies Parameters<typeof workersById.set>[1];
+      if (Deferred.isDoneUnsafe(outputBudgetLifted)) {
+        liftTaskOutputBudget(taskOutputBudget);
+      }
       workersById.set(workerId, workerThread);
-      yield* copyWorkerOutput(thread).pipe(
-        Effect.andThen(recordOutputDrained(workerThread)),
+      yield* copyWorkerOutput(workerId, thread).pipe(
+        Effect.andThen(recordOutputCopyEnded(workerThread)),
         Effect.forkIn(workerConnectionsScope),
       );
       workerThread.thread.on("error", (error) => {
-        workerThread.uncaughtError = Option.some({
-          message: describeCauseMessage(error),
-          location: Option.getOrNull(
-            Option.flatMap(Schema.decodeUnknownOption(ErrorStack)(error), (withStack) =>
-              Option.fromUndefinedOr(findUserLocationInStack(withStack.stack)),
-            ),
-          ),
-        });
+        workerThread.uncaughtError = Option.some(
+          reportUnderlyingErrors({ cause: error }, UNTAGGED_FAILURE_TAG)[0],
+        );
       });
       workerThread.thread.on("exit", (exitCode) => {
         runInWorkerConnectionsScope(recordExit(workerId, workerThread, exitCode));
@@ -523,7 +638,28 @@ const makeWorkerPool = Effect.gen(function* () {
       yield* Effect.logInfo(`worker terminated ${reason}`).pipe(
         Effect.annotateLogs(`${TASK_TRACE_LABEL_PREFIX}.worker`, workerId),
       );
-      void workerThread.thread.terminate();
+      const termination = workerThread.thread.terminate();
+      runInWorkerConnectionsScope(
+        Effect.promise(() => termination).pipe(
+          Effect.asVoid,
+          Effect.catchCause((cause) => {
+            const failed = new WorkerTerminationFailed({
+              workerId,
+              reason: Result.getOrElse(
+                Result.try(() => describeCauseMessage(Cause.squash(cause))),
+                () => THROWN_VALUE_WITHOUT_MESSAGE,
+              ),
+            });
+            return shutdown
+              .recordRunFailure(failed)
+              .pipe(
+                Effect.andThen(shutdown.recordFirstFailure(failed)),
+                Effect.asVoid,
+                Effect.ensuring(Deferred.done(workerThread.terminationFailedDeferred, Exit.void)),
+              );
+          }),
+        ),
+      );
     }).pipe(Effect.uninterruptible);
   const requestWorkerExit = (workerThread: Parameters<typeof workersById.set>[1]) =>
     Effect.gen(function* () {
@@ -556,14 +692,7 @@ const makeWorkerPool = Effect.gen(function* () {
           Effect.raceFirst(shutdown.awaitForcedStop.pipe(Effect.as(Option.none()))),
         );
         if (Option.isSome(exited)) {
-          const outputDrained = Deferred.await(workerThread.outputDrainedDeferred).pipe(
-            Effect.raceFirst(shutdown.awaitForcedStop),
-          );
-          const isStoppedBySignal =
-            (yield* shutdown.hasFailed) && isStopRequested(yield* shutdown.awaitFailure);
-          return yield* isStoppedBySignal
-            ? Effect.timeoutOption(outputDrained, OUTPUT_READER_WAIT_AFTER_A_STOP_SIGNAL)
-            : outputDrained;
+          return yield* Deferred.await(workerThread.outputCopyEndedDeferred);
         }
         yield* terminateWorker(
           workerId,
@@ -573,7 +702,9 @@ const makeWorkerPool = Effect.gen(function* () {
             : `because it did not exit within ${Duration.format(WORKER_EXIT_GRACE)} of being asked to`,
           null,
         );
-        yield* Deferred.await(workerThread.exitedDeferred);
+        yield* Deferred.await(workerThread.exitedDeferred).pipe(
+          Effect.raceFirst(Deferred.await(workerThread.terminationFailedDeferred)),
+        );
       }),
     { concurrency: "unbounded", discard: true },
   ).pipe(Effect.andThen(Queue.end(workerEvents)));
@@ -751,6 +882,13 @@ const makeWorkerPool = Effect.gen(function* () {
     requestExitOfAllWorkers,
     terminateAllWorkers,
     awaitWorkerShutdown,
+    releaseTaskOutputBytes: (workerId: number, bytes: number) =>
+      Effect.sync(() => {
+        const workerThread = workersById.get(workerId);
+        if (workerThread !== undefined) {
+          releaseTaskOutputBytes(workerThread.taskOutputBudget, bytes);
+        }
+      }),
     recordBodyStartHandled: (workerId: number) =>
       findStartedWorker(workerId, "a body start comes from a started worker").pipe(
         Effect.flatMap((workerThread) =>

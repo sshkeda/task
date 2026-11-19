@@ -37,7 +37,7 @@ export default Task.make({ name: "main", run: Effect.sync(() => Bun.spawn(["slee
 const RUNNING_A_COMMAND = `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 export default Task.make({ name: "main", run: Effect.log(\`run \${process.pid}\`).pipe(
-  Effect.andThen(Task.exec("sh", ["-c", "echo command $$; exec sleep 1000"])),
+  Effect.andThen(Task.exec("sh", ["-c", "echo command $$; exec sleep 1000"], { print: true })),
 ) });`;
 
 const RELEASING_IN_STEPS = `import { Effect } from "effect";
@@ -48,12 +48,12 @@ const releaseStep = (step: number) => Effect.sleep("1200 millis").pipe(
 export default Task.make({ name: "main", cleanup: "30 seconds", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => Effect.forEach([1, 2, 3, 4, 5], releaseStep, { discard: true }));
   yield* Effect.log(\`run \${process.pid} supervised by \${process.ppid}\`);
-  yield* Task.exec("sh", ["-c", "echo command $$; exec sleep 1000"]);
+  yield* Task.exec("sh", ["-c", "echo command $$; exec sleep 1000"], { print: true });
 }) });`;
 
 const RELEASE_STEPS = ["1", "2", "3", "4", "5"] as const;
 
-const STOPPING_AFTER_A_HANGUP = "stopping, send SIGTERM or press ctrl-c to force";
+const STOPPING_AFTER_A_HANGUP = "stopping: send SIGTERM or press ctrl-c to force";
 
 const SLOW_LOADING_SERVER = `console.error(\`loading \${process.pid}\`);
 await Bun.sleep(1000);
@@ -93,7 +93,7 @@ ${SPAWNING_SERVER("spawned")}`;
 const LAUNCHER = (
   scriptArguments: string,
 ) => `const child = Bun.spawn([process.execPath, ${scriptArguments}], { stdio: ["ignore", "inherit", "inherit"] });
-console.error(\`started \${child.pid}\`);
+console.error(\`launched \${child.pid}\`);
 await child.exited;
 console.error(\`exited \${child.exitCode} \${child.signalCode}\`);`;
 
@@ -157,12 +157,17 @@ const waitUntilEnded = (processId: number) =>
 const startOnTerminal = (
   project: Effect.Success<ReturnType<typeof makeProject>>,
   command: readonly string[],
+  extraEnvironment: Readonly<Record<string, string>> = {},
 ) =>
   Effect.gen(function* () {
     const chunks = yield* Queue.unbounded<string>();
     const screen = yield* Ref.make("");
     const decoder = new TextDecoder();
-    const environment = yield* makeTaskProcessEnvironment(project, { PS1: "$ ", ENV: "" });
+    const environment = yield* makeTaskProcessEnvironment(project, {
+      PS1: "$ ",
+      ENV: "",
+      ...extraEnvironment,
+    });
     const started = yield* startTerminalCommand(command, {
       workingDirectory: project.directory,
       environment,
@@ -282,11 +287,11 @@ export const terminalInterrupt = makeTest(
       yield* killWhenDone([orphan]);
       yield* waitUntilEnded(shell);
       yield* terminal.type("\u0003");
-      yield* terminal.waitFor(/stopping, press ctrl-c again to force/u);
+      yield* terminal.waitFor(/stopping: press ctrl-c again to force/u);
       yield* terminal.type("\u0003");
       expect(yield* terminal.exited).toBe(EXIT_CODE_AFTER_SIGINT);
-      expect(yield* terminal.waitFor(/StopRequested: received SIGINT\r\n$/u)).toBeTruthy();
-      expect(yield* terminal.screen).toContain(`killed ${orphan} (`);
+      expect(yield* terminal.waitFor(/\r\nrun: \S+\/\r\n$/u)).toBeTruthy();
+      expect(yield* terminal.screen).toContain(`killed: ${orphan} (`);
       expect(yield* isProcessAlive(orphan)).toBe(false);
     }),
   ),
@@ -312,7 +317,7 @@ export const terminalSuspend = makeTest(
         yield* pollProcessState(processId, (state) => !isStopped(state));
       }
       yield* terminal.type("\u0003");
-      yield* terminal.waitFor(/StopRequested: received SIGINT\r\n/u);
+      yield* terminal.waitFor(/\r\nrun: \S+\/\r\n/u);
       yield* terminal.type('echo "exit $?"\n');
       yield* terminal.waitFor(/exit 130\r\n/u);
       yield* terminal.type("exit\n");
@@ -320,6 +325,78 @@ export const terminalSuspend = makeTest(
       for (const processId of started) {
         yield* waitUntilEnded(processId);
       }
+    }),
+  ),
+);
+
+const PROMPTING_ON_THE_TERMINAL = `import { Task } from "@sshkeda/task";
+export default Task.make({
+  name: "main",
+  run: Task.exec("sh", ["-c", 'echo "prompting $$ $PPID"; printf "name? "; read -r name; echo "hello $name"'], { stdio: "inherit" }),
+});`;
+
+export const terminalCommandSuspend = makeTest(
+  "Ctrl-Z at a terminal command's prompt stops the command and the run, and fg gives the prompt back to the command",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({ "main.ts": PROMPTING_ON_THE_TERMINAL });
+      const terminal = yield* startOnTerminal(project, ["sh", "-i"]);
+      yield* terminal.type(`"${process.execPath}" main.ts\n`);
+      const started = yield* decodeProcessIdPair(
+        parseProcessIds(yield* terminal.waitFor(/prompting \d+ \d+\r\n/u)),
+      );
+      yield* killWhenDone(started);
+      yield* terminal.waitFor(/name\? /u);
+      yield* terminal.type("\u001A");
+      for (const processId of started) {
+        yield* pollProcessState(processId, isStopped);
+      }
+      yield* terminal.type("fg\n");
+      for (const processId of started) {
+        yield* pollProcessState(processId, (state) => !isStopped(state));
+      }
+      yield* terminal.type("Ada\n");
+      yield* terminal.waitFor(/hello Ada\r\n/u);
+      yield* terminal.waitFor(/\r\npassed: 1 task, [\d.]+s\r\nrun: \S+\/\r\n/u);
+      yield* terminal.type('echo "exit $?"\n');
+      yield* terminal.waitFor(/exit 0\r\n/u);
+      yield* terminal.type("exit\n");
+      yield* terminal.exited;
+    }),
+  ),
+);
+
+const LOGGING_THEN_PROMPTING = `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({
+  name: "main",
+  run: Effect.log(\`run \${process.pid}\`).pipe(
+    Effect.andThen(Task.exec("sh", ["-c", 'echo "prompting $$ $PPID"; printf "name? "; read -r name'], { stdio: "inherit" })),
+  ),
+});`;
+
+export const runKilledAtTerminalCommand = makeTest(
+  "SIGKILL to the run's process while a terminal command waits at its prompt ends that command and the supervisor, and the shell gets the terminal back",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({ "main.ts": LOGGING_THEN_PROMPTING });
+      const terminal = yield* startOnTerminal(project, ["sh", "-i"]);
+      yield* terminal.type(`"${process.execPath}" main.ts\n`);
+      const [run] = yield* decodeProcessId(
+        parseProcessIds(yield* terminal.waitFor(/\[main\] run \d+\r\n/u)),
+      );
+      const [command, supervisor] = yield* decodeProcessIdPair(
+        parseProcessIds(yield* terminal.waitFor(/prompting \d+ \d+\r\n/u)),
+      );
+      yield* killWhenDone([run, command, supervisor]);
+      yield* terminal.waitFor(/name\? /u);
+      yield* Effect.sync(() => process.kill(run, "SIGKILL"));
+      yield* waitUntilEnded(command);
+      yield* waitUntilEnded(supervisor);
+      yield* terminal.type('echo "back $?"\n');
+      yield* terminal.waitFor(/back \d+\r\n/u);
+      yield* terminal.type("exit\n");
+      yield* terminal.exited;
     }),
   ),
 );
@@ -351,9 +428,6 @@ export const stopsInOrderBeforeReady = makeTest(
       expect(endedOnSigterm ? EXIT_CODE_AFTER_SIGTERM : EXIT_CODE_AFTER_SIGINT).toBe(
         exited.exitCode,
       );
-      expect(exited.standardError).toEndWith(
-        `StopRequested: received ${endedOnSigterm ? "SIGTERM" : "SIGINT"}`,
-      );
       yield* waitUntilEnded(starting);
     }),
   ),
@@ -375,7 +449,9 @@ export const continueRefused = makeTest(
       yield* Effect.sync(() => process.kill(command.processId, "SIGCONT"));
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(1);
-      expect(exited.standardError).toContain("ProcessNotSignaled");
+      expect(exited.standardError).toMatch(
+        /^error: (?:\S+: )?Error: continue refused(?: \(EINVAL\))?\nerror: could not send SIGCONT to process (?:group )?\d+$/mu,
+      );
       for (const processId of started) {
         yield* waitUntilEnded(processId);
       }
@@ -470,12 +546,12 @@ export const pipedIntoCat = makeTest(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": ORPHAN_HOLDING_SPAWN_SYNC_OUTPUT,
-        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`{ "$0" main.ts & echo run $! >&2; wait $!; echo $? > exit-code; } 2>&1 | cat >&2\`, process.execPath], { stdio: ["ignore", "inherit", "inherit"] });
+        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`{ "$0" main.ts & echo launched $! >&2; wait $!; echo $? > exit-code; } 2>&1 | cat >&2\`, process.execPath], { stdio: ["ignore", "inherit", "inherit"] });
 process.exitCode = await shell.exited;`,
       });
       const command = yield* startTaskProcess(project, "piped.ts");
-      const lines = yield* waitForEachLine(command, ["run", "orphan"]);
-      const [run] = yield* decodeProcessId(lines.get("run"));
+      const lines = yield* waitForEachLine(command, ["launched ", "orphan"]);
+      const [run] = yield* decodeProcessId(lines.get("launched "));
       const [orphan, shell] = yield* decodeProcessIdPair(lines.get("orphan"));
       yield* waitUntilEnded(shell);
       yield* Effect.sync(() => process.kill(run, "SIGHUP"));
@@ -484,7 +560,9 @@ process.exitCode = await shell.exited;`,
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(0);
       expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("143");
-      expect(exited.standardError).toEndWith("StopRequested: received SIGTERM");
+      expect(exited.standardError).toMatch(
+        /\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+      );
       expect(findKilledProcesses(exited.standardError).map((each) => each.processId)).toEqual([
         orphan,
       ]);
@@ -529,8 +607,8 @@ export default Task.make({ name: "main", run: Effect.void });`,
         "launch.ts": LAUNCHER(`"main.ts"`),
       });
       const command = yield* startTaskProcess(project, "launch.ts");
-      const lines = yield* waitForEachLine(command, ["started", "stuck loading"]);
-      const [launched] = yield* decodeProcessId(lines.get("started"));
+      const lines = yield* waitForEachLine(command, ["launched ", "stuck loading"]);
+      const [launched] = yield* decodeProcessId(lines.get("launched "));
       yield* Effect.sync(() => process.kill(launched, "SIGTERM"));
       const exited = yield* command.waitForExit;
       expect(exited.standardError).toEndWith("exited 143 null");
@@ -547,8 +625,8 @@ export const launcherKilled = makeTest(
         "launch.ts": LAUNCHER(`"main.ts"`),
       });
       const command = yield* startTaskProcess(project, "launch.ts");
-      const lines = yield* waitForEachLine(command, ["started", "[main] run"]);
-      const [launched] = yield* decodeProcessId(lines.get("started"));
+      const lines = yield* waitForEachLine(command, ["launched ", "[main] run"]);
+      const [launched] = yield* decodeProcessId(lines.get("launched "));
       yield* Effect.sync(() => process.kill(launched, "SIGKILL"));
       const exited = yield* command.waitForExit;
       expect(exited.standardError).toEndWith("exited null SIGKILL");
@@ -605,7 +683,7 @@ export const launcherKilledWhileLoading = makeTest(
       });
       const command = yield* startTaskProcess(project, "launch.ts");
       const [launched] = yield* decodeProcessId(
-        parseProcessIds(yield* command.waitForLine("started")),
+        parseProcessIds(yield* command.waitForLine("launched ")),
       );
       const [loading] = yield* Stream.fromEffectRepeat(command.waitForLine("loading")).pipe(
         Stream.map(parseProcessIds),
@@ -642,7 +720,7 @@ export default Task.make({ name: "main", run: Effect.log("ran") });`,
       });
       const command = yield* startTaskProcess(project, "launch.ts");
       const [launched] = yield* decodeProcessId(
-        parseProcessIds(yield* command.waitForLine("started")),
+        parseProcessIds(yield* command.waitForLine("launched ")),
       );
       const [loading] = yield* decodeProcessId(
         parseProcessIds(yield* command.waitForLine("loading")),
@@ -672,11 +750,11 @@ export default Task.make({ name: "main", run: Effect.sync(() => {
       });
       const exited = yield* runTaskProcess(project, "main.ts");
       expect(exited.exitCode).toBe(0);
-      expect(exited.standardError).toContain("arguments .\n");
+      expect(exited.standardError).toContain("[main] arguments .\n");
       const printed = exited.standardError
         .split("\n")
-        .filter((line) => line.startsWith("environment "))
-        .map((line) => line.slice("environment ".length));
+        .filter((line) => line.startsWith("[main] environment "))
+        .map((line) => line.slice("[main] environment ".length));
       const environment = yield* makeTaskProcessEnvironment(project);
       expect(printed.toSorted()).toEqual(
         Object.entries(environment)

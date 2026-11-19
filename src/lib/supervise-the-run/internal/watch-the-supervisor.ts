@@ -1,14 +1,20 @@
-import { Deferred, Effect, Exit, Option, Ref, Stdio, Stream } from "effect";
+import { Deferred, Effect, Exit, Option, Ref } from "effect";
 
-import { formatFailureLines } from "../../../shared/format-error-lines.ts";
+import { printFailureNow } from "../../../shared/print-to-standard-error.ts";
 import { takeSupervisorSocketPath } from "../../../shared/read-environment-config.ts";
 import type { RunMarker } from "../../../shared/run-marker.ts";
 import {
   adoptSupervisorRunMarker,
+  claimUnknownOwnership,
   signalRunProcesses,
 } from "../../kill-leftover-processes/index.ts";
+import { claimUnknownOwnershipInTheRun } from "./claim-unknown-ownership-in-the-run.ts";
 import { processGroupsSharedWithTheSupervisor } from "./share-process-groups.ts";
-import { connectToTheSupervisor, supervisorConnectionDeferred } from "./talk-to-the-supervisor.ts";
+import {
+  connectToTheSupervisor,
+  supervisorConnectionDeferred,
+  supervisorDisconnected,
+} from "./talk-to-the-supervisor.ts";
 
 export const WATCH_THE_SUPERVISOR_FLAG = `--preload=${Bun.fileURLToPath(import.meta.resolve("./start-watching-the-supervisor.ts"))}`;
 
@@ -25,25 +31,18 @@ export const watchSupervisor = Effect.gen(function* () {
     return;
   }
   yield* Ref.set(supervisorProcessId, process.ppid);
-  const stdio = yield* Stdio.Stdio;
-  const printFailure = (error: Parameters<typeof formatFailureLines>[0]) =>
-    Stream.make(`${formatFailureLines(error, null)}\n`).pipe(
-      Stream.run(stdio.stderr()),
-      Effect.ignore,
-    );
   const runMarker = yield* adoptSupervisorRunMarker.pipe(
     Effect.catchTag(["ProcRunMarkerUnreadable", "SystemLibraryNotLoaded"], (error) =>
-      printFailure(error).pipe(Effect.as(null)),
+      printFailureNow(error).pipe(Effect.as(null)),
     ),
   );
   yield* Ref.set(supervisorRunMarker, runMarker);
-  const disconnected = yield* Deferred.make<void>();
   const supervisor = yield* connectToTheSupervisor(
     supervisorSocketPath.value,
-    Deferred.done(disconnected, Exit.void).pipe(Effect.asVoid),
+    Deferred.done(supervisorDisconnected, Exit.void).pipe(Effect.asVoid),
   );
   yield* Deferred.succeed(supervisorConnectionDeferred, supervisor);
-  yield* Deferred.await(disconnected).pipe(
+  yield* Deferred.await(supervisorDisconnected).pipe(
     Effect.andThen(
       signalRunProcesses(
         {
@@ -51,13 +50,17 @@ export const watchSupervisor = Effect.gen(function* () {
           descendantsOfProcessId: process.pid,
           startedProcessGroups: processGroupsSharedWithTheSupervisor,
           runMarker,
+          sparedProcessId: null,
         },
         "SIGKILL",
       ),
     ),
     Effect.matchEffect({
-      onFailure: (error) => printFailure(error),
-      onSuccess: (success) => Effect.succeed(success),
+      onFailure: (error) => printFailureNow(error),
+      onSuccess: (unknownOwnerships) =>
+        claimUnknownOwnership(unknownOwnerships, claimUnknownOwnershipInTheRun).pipe(
+          Effect.flatMap((claimed) => Effect.forEach(claimed, printFailureNow, { discard: true })),
+        ),
     }),
     Effect.ensuring(Effect.sync(() => process.kill(process.pid, "SIGKILL"))),
   );

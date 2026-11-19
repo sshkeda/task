@@ -1,7 +1,7 @@
 import { Deferred, Duration, Effect, Exit, Layer, Option, Schema, Stream } from "effect";
 import type { Queue } from "effect";
 
-import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
+import { labelLine } from "../../../shared/label-lines.ts";
 import {
   printLine,
   standardErrorClosedDeferred,
@@ -12,29 +12,28 @@ import { StopRequested } from "../shared/main-thread-errors.ts";
 import { StopState } from "../shared/provide-stop-state.ts";
 
 const STOPPING_LINES = {
-  SIGHUP: "stopping, send SIGTERM or press ctrl-c to force",
-  SIGINT: "stopping, press ctrl-c again to force",
-  SIGTERM: "stopping, send SIGTERM or press ctrl-c again to force",
+  SIGHUP: labelLine("stopping", null, "send SIGTERM or press ctrl-c to force"),
+  SIGINT: labelLine("stopping", null, "press ctrl-c again to force"),
+  SIGTERM: labelLine("stopping", null, "send SIGTERM or press ctrl-c again to force"),
 } as const;
 
 const GRACE_AFTER_STANDARD_ERROR_CLOSED = Duration.seconds(1);
 
 const isStopRequested = Schema.is(StopRequested);
 
-const requestStopOnSignal = Effect.fn("requestStopOnSignal")(function* (
+const requestStopOnSignal = Effect.fn(function* (
   signal: (typeof STOP_SIGNALS)[number],
   hangUpHeard: Deferred.Deferred<void>,
 ) {
-  yield* Effect.annotateCurrentSpan(`${TASK_TRACE_LABEL_PREFIX}.signal`, signal);
   const shutdown = yield* StopState;
   if (signal === "SIGHUP") {
     yield* Deferred.done(hangUpHeard, Exit.void);
   }
   yield* Effect.gen(function* () {
     if (yield* shutdown.requestStop(signal)) {
-      yield* printLine("Info", STOPPING_LINES[signal]);
+      yield* printLine(STOPPING_LINES[signal]);
     }
-  }).pipe(shutdown.holdTaskLogsDuring);
+  }).pipe(shutdown.holdTaskLogsDuring, shutdown.holdStopAnnouncementsDuring);
 }, Effect.uninterruptible);
 
 const stopOnClosedTerminal = (hangUpHeard: Deferred.Deferred<void>) =>

@@ -6,12 +6,12 @@ import { Effect } from "effect";
 import { InternalInvariantBroken } from "../../../shared/invariant-errors.ts";
 import {
   SystemCallFailed,
-  ProcessArgumentsMalformed,
   ProcessCommandLineNotRead,
   ProcessTableNotRead,
   SystemLibraryNotLoaded,
 } from "../../../shared/process-errors.ts";
-import { programNameOf } from "./command-words.ts";
+import { baseNameOf, nameFromArgumentsOf, nameWithoutExecutable } from "./command-words.ts";
+import { decodeProcessArguments } from "./decode-process-arguments.ts";
 
 const SYSTEM_LIBRARY_PATH = "/usr/lib/libSystem.B.dylib";
 
@@ -59,8 +59,7 @@ const SZOMB = 5;
 const P_WEXIT = 0x20_00;
 const ENOMEM = 12;
 const EINVAL = 22;
-const EXECUTABLE_KEY = "executable_path=";
-const SIXTY_FOUR_BIT_PROCESS_POINTER_SIZE = 8;
+const PROC_PIDPATHINFO_MAXSIZE = 4096;
 
 const processStatusNames = new Map([
   [SIDL, "created"],
@@ -81,6 +80,7 @@ const openSystemLibrary = (taskName: string | null) =>
           },
           __error: { args: [], returns: FFIType.ptr },
           getsid: { args: [FFIType.i32], returns: FFIType.i32 },
+          proc_pidpath: { args: [FFIType.i32, FFIType.ptr, FFIType.u32], returns: FFIType.i32 },
         }),
       catch: (cause) =>
         new SystemLibraryNotLoaded({ taskName, libraryPath: SYSTEM_LIBRARY_PATH, cause }),
@@ -168,42 +168,21 @@ const readKernelProcesses = (
     );
   });
 
-const decodeArgumentWords = (processId: number, processArguments: Uint8Array) => {
-  const argumentCount = new DataView(processArguments.buffer).getInt32(0, true);
-  const executablePathStart = Int32Array.BYTES_PER_ELEMENT;
-  const executablePathEnd = processArguments.indexOf(0, executablePathStart);
-  const executablePrefixLength =
-    EXECUTABLE_KEY.length + executablePathEnd + 1 - executablePathStart;
-  const paddedExecutablePathLength =
-    Math.ceil(executablePrefixLength / SIXTY_FOUR_BIT_PROCESS_POINTER_SIZE) *
-      SIXTY_FOUR_BIT_PROCESS_POINTER_SIZE -
-    EXECUTABLE_KEY.length;
-  const argumentWords =
-    executablePathEnd === -1
-      ? []
-      : new TextDecoder("utf-8", { ignoreBOM: true })
-          .decode(processArguments.subarray(executablePathStart + paddedExecutablePathLength))
-          .split("\0")
-          .slice(0, -1)
-          .slice(0, Math.max(argumentCount, 0));
-  if (argumentWords.length < argumentCount) {
-    return Effect.fail(
-      new ProcessArgumentsMalformed({
-        processId,
-        argumentCount,
-        argumentsFound: argumentWords.length,
-      }),
-    );
-  }
-  return Effect.succeed(argumentWords);
-};
-
 const readCommandLineUnlessGoneWith = (
   symbols: Effect.Success<ReturnType<typeof openSystemLibrary>>,
   processId: number,
   commandName: string,
 ) =>
   Effect.gen(function* () {
+    const executablePath = new Uint8Array(PROC_PIDPATHINFO_MAXSIZE);
+    const executablePathLength = symbols.proc_pidpath(
+      processId,
+      executablePath,
+      executablePath.byteLength,
+    );
+    if (executablePathLength > 0) {
+      return baseNameOf(new TextDecoder().decode(executablePath.subarray(0, executablePathLength)));
+    }
     const argumentMaximumValue = new Uint8Array(Int32Array.BYTES_PER_ELEMENT);
     const argumentMaximum = yield* callSysctl(
       symbols,
@@ -222,13 +201,11 @@ const readCommandLineUnlessGoneWith = (
       processArguments,
     );
     if (readProcessArguments.succeeded) {
-      return programNameOf(
-        yield* decodeArgumentWords(
-          processId,
-          processArguments.subarray(0, readProcessArguments.filledSize),
-        ),
-        commandName,
+      const { argumentWords } = yield* decodeProcessArguments(
+        processId,
+        processArguments.subarray(0, readProcessArguments.filledSize),
       );
+      return nameFromArgumentsOf(argumentWords, commandName);
     }
     if (readProcessArguments.errorNumber !== EINVAL) {
       return yield* makeSystemCallFailed(
@@ -245,7 +222,7 @@ const readCommandLineUnlessGoneWith = (
     ]);
     const isGone =
       stillListed === undefined || stillListed.status === "zombie" || stillListed.isExiting;
-    return isGone ? null : commandName;
+    return isGone ? null : nameWithoutExecutable(commandName);
   });
 
 const readCommandLineUnlessGone = (

@@ -48,12 +48,12 @@ export const assertionFailure = makeTest(
         expect(contents).toContain("partial stdout");
         expect(contents).toContain("partial stderr");
       }
-      const traces = yield* fileSystem.glob("**/*.jsonl", {
-        root: `${project.home}/.sshkeda-task/traces`,
+      const traces = yield* fileSystem.glob("*/*/trace.jsonl", {
+        root: `${project.home}/.sshkeda-task/runs`,
       });
       expect(traces.length).toBeGreaterThan(0);
       const contents = yield* fileSystem.readFileString(
-        `${project.home}/.sshkeda-task/traces/${traces[0]}`,
+        `${project.home}/.sshkeda-task/runs/${traces[0]}`,
       );
       expect(contents).toContain("child trace marker");
     }),
@@ -99,7 +99,7 @@ export default hanging;`,
       expect(contents).toContain("partial stdout");
       expect(contents).toContain("partial stderr");
       expect(
-        (yield* fileSystem.glob("**/*.jsonl", { root: `${project.home}/.sshkeda-task/traces` }))
+        (yield* fileSystem.glob("*/*/trace.jsonl", { root: `${project.home}/.sshkeda-task/runs` }))
           .length,
       ).toBeGreaterThan(0);
     }),

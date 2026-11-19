@@ -1,47 +1,72 @@
 import { Context, Effect, Layer } from "effect";
 
 import { makeProcessReportClaimer } from "../../../shared/claim-processes-to-report.ts";
+import type { ProcessIdentity } from "../../../shared/claim-processes-to-report.ts";
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
 import {
   forgetEndedProcessGroups,
   killAllProcessGroups,
   killTaskProcessGroups,
+  listProcesses,
   recordLeaderExit,
-  startedProcessGroup,
+  recordStartedProcessGroup,
 } from "../../kill-leftover-processes/index.ts";
+import type { startedProcessGroup } from "../../kill-leftover-processes/index.ts";
 import {
+  claimUnknownOwnershipInTheRun,
   processGroupsSharedWithTheSupervisor,
   shareProcessGroups,
 } from "../../supervise-the-run/index.ts";
 import { RunRootTaskConfig } from "./provide-run-root-task-config.ts";
 
-const makeProcessGroups = Effect.gen(function* () {
-  const { ownsSession, runMarker, runProcessId } = yield* RunRootTaskConfig;
+export const makeProcessGroupsListingWith = (
+  {
+    ownsSession,
+    runMarker,
+    runProcessId,
+  }: Pick<
+    Context.Service.Shape<typeof RunRootTaskConfig>,
+    "ownsSession" | "runMarker" | "runProcessId"
+  >,
+  listProcessesNow: typeof listProcesses,
+) => {
   const supervisorAdoptsOrphans = ownsSession && process.platform === "linux";
   const startedProcessGroups = ownsSession
     ? processGroupsSharedWithTheSupervisor
     : new Map<number, ReturnType<typeof startedProcessGroup>>();
-  const shareWithTheSupervisor = (processGroupIds: Iterable<number>) =>
+  const shareWithTheSupervisor = (processGroupIds: readonly number[]) =>
     ownsSession ? shareProcessGroups(processGroupIds) : Effect.void;
-  const forget = (endedProcessGroupIds: ReadonlySet<number>) =>
-    forgetEndedProcessGroups(startedProcessGroups)(endedProcessGroupIds).pipe(
-      Effect.andThen(shareWithTheSupervisor(endedProcessGroupIds)),
+  const shareOnce = (processGroupId: number) => (action: "none" | "share") =>
+    action === "share" ? shareWithTheSupervisor([processGroupId]) : Effect.void;
+  const forget = (
+    endedProcessGroups: ReadonlyMap<number, ReturnType<typeof startedProcessGroup>>,
+  ) =>
+    forgetEndedProcessGroups(startedProcessGroups)(endedProcessGroups).pipe(
+      Effect.flatMap(shareWithTheSupervisor),
     );
   const { claimProcessesToReport } = makeProcessReportClaimer();
   return {
     claimProcessesToReport,
     record: (processId: number, taskName: string, leaderStartTime: string | null) =>
-      Effect.sync(() => {
-        startedProcessGroups.set(processId, startedProcessGroup(taskName, leaderStartTime, null));
-      }).pipe(Effect.andThen(shareWithTheSupervisor([processId]))),
-    recordLeaderExit: (processId: number, latestMemberStartTime: string | null) =>
-      Effect.sync(() => {
-        recordLeaderExit(startedProcessGroups, processId, latestMemberStartTime);
-      }).pipe(Effect.andThen(shareWithTheSupervisor([processId]))),
+      Effect.sync(() =>
+        recordStartedProcessGroup(startedProcessGroups, processId, taskName, leaderStartTime),
+      ).pipe(Effect.flatMap(shareOnce(processId))),
+    recordLeaderExit: (
+      processId: number,
+      taskName: string,
+      membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[],
+    ) =>
+      Effect.sync(() =>
+        recordLeaderExit(startedProcessGroups, processId, taskName, membersAtLeaderExit),
+      ).pipe(Effect.flatMap(shareOnce(processId))),
     killForTask: (taskName: string) =>
-      killTaskProcessGroups(startedProcessGroups, taskName, claimProcessesToReport).pipe(
-        Effect.flatMap(forget),
-      ),
+      killTaskProcessGroups(
+        startedProcessGroups,
+        taskName,
+        claimProcessesToReport,
+        runMarker,
+        listProcessesNow,
+      ).pipe(Effect.flatMap(forget)),
     killAll: (isForced: boolean) => {
       const killsTheSession = isForced && ownsSession;
       return killAllProcessGroups(
@@ -50,9 +75,14 @@ const makeProcessGroups = Effect.gen(function* () {
         killsTheSession ? process.pid : null,
         runMarker,
         supervisorAdoptsOrphans ? runProcessId : null,
+        claimUnknownOwnershipInTheRun,
       ).pipe(Effect.flatMap(forget));
     },
   };
+};
+
+const makeProcessGroups = Effect.gen(function* () {
+  return makeProcessGroupsListingWith(yield* RunRootTaskConfig, listProcesses);
 });
 
 export class ProcessGroups extends Context.Service<

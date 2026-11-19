@@ -5,6 +5,7 @@ import {
   FlagGivenTwice,
   FlagInvalid,
   FlagMissing,
+  FlagsInvalid,
   FlagNotFlat,
   FlagNotRead,
   FlagReadTwoWays,
@@ -210,14 +211,24 @@ export const decodeTaskFlags = <
       Effect.mapError((error) => {
         const [issue] = formatIssue(error.issue).issues;
         const [fieldName] = issue?.path ?? [];
-        const invalidField =
-          givenFields.find((given) => given.fieldName === fieldName) ?? givenFields.at(0);
-        return new FlagInvalid({
-          readingTaskName: taskName,
-          flagName: invalidField?.flagName ?? "",
-          value: invalidField?.value ?? "",
-          reason: issue?.message ?? error.message,
-        });
+        const reason = issue?.message ?? error.message;
+        const invalidField = givenFields.find((given) => given.fieldName === fieldName);
+        return invalidField === undefined
+          ? new FlagsInvalid({
+              readingTaskName: taskName,
+              givenFlags: givenFields.flatMap((given) =>
+                Object.hasOwn(values, given.flagName)
+                  ? [{ flagName: given.flagName, value: given.value }]
+                  : [],
+              ),
+              reason,
+            })
+          : new FlagInvalid({
+              readingTaskName: taskName,
+              flagName: invalidField.flagName,
+              value: invalidField.value,
+              reason,
+            });
       }),
     );
   });

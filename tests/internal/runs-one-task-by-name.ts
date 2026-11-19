@@ -3,6 +3,7 @@ import { expect } from "bun:test";
 import { Effect } from "effect";
 
 import { exists, read } from "../shared/access-files.ts";
+import { USAGE_ERROR_EXIT_CODE } from "../shared/exit-codes-of-failures.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
@@ -55,7 +56,6 @@ export const namedTask = makeTest(
       yield* expectMarkers(whole.directory, ["build", "lint", "test-a", "test-b", "ci"]);
       const picked = yield* makeProject({ "main.ts": CI_FILE });
       const ranTestB = yield* runWithArguments(picked, ["test B"]);
-      expect(ranTestB.standardError).toMatch(/^\[test B\] started$/mu);
       expect(ranTestB.standardError).toMatch(/^passed: 2 tasks, [\d.]+s$/mu);
       expect(ranTestB.exitCode).toBe(0);
       yield* expectMarkers(picked.directory, ["build", "test-b"]);
@@ -84,7 +84,7 @@ export default Task.make({ name: "main", run: Effect.void });
       });
       const ran = yield* runWithArguments(project, ["broken"]);
       expect(ran.standardError).toMatch(
-        /^\[broken\] error CommandFailed: sh exited with code 3$/mu,
+        /^error: \[broken\] main\.ts:5:13: CommandFailed: sh exited with code 3$/mu,
       );
       expect(ran.exitCode).toBe(FAILED_COMMAND_EXIT_CODE);
     }),
@@ -92,7 +92,7 @@ export default Task.make({ name: "main", run: Effect.void });
 );
 
 export const argumentsRefused = makeTest(
-  "arguments after the file that are not the name of one task made while loading fail the run with one line before any task starts",
+  "arguments after the file that are not the name of one task made while loading fail the run with one line before any task starts and exit 2",
   Effect.scoped(
     Effect.gen(function* () {
       for (const [scriptArguments, refusal] of [
@@ -111,9 +111,9 @@ export const argumentsRefused = makeTest(
       ] as const) {
         const project = yield* makeProject({ "main.ts": CI_FILE });
         const ran = yield* runWithArguments(project, scriptArguments);
-        expect(ran.standardError).toBe(`error ${refusal}`);
+        expect(ran.standardError).toBe(`error: ${refusal}`);
         expect(ran.standardOutput).toBe("");
-        expect(ran.exitCode).toBe(1);
+        expect(ran.exitCode).toBe(USAGE_ERROR_EXIT_CODE);
         yield* expectMarkers(project.directory, []);
       }
     }),

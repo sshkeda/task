@@ -2,30 +2,37 @@ import { Cause, Clock, Deferred, Effect, Exit, Logger, Result, Schema, Tracer } 
 import { RpcServer } from "effect/rpc";
 
 import { TASK_ERROR_FIELDS } from "../../../shared/error-fields.ts";
-import { causeWithPrintableErrors, reportCause } from "../../../shared/report-cause.ts";
+import { joinMessages } from "../../../shared/join-messages.ts";
+import { describeStartedTaskSpan, makeTraceTracer } from "../../../shared/make-trace-tracer.ts";
+import { reportCause, reportWrappedCause } from "../../../shared/report-cause.ts";
+import { THROWN_VALUE_WITHOUT_MESSAGE } from "../../../shared/report-errors.ts";
 import {
-  describeCauseMessage,
-  THROWN_VALUE_WITHOUT_MESSAGE,
-} from "../../../shared/report-errors.ts";
-import { TaskEvent, TaskFiberResult, TaskWorkerRpcs } from "../../../shared/rpc.ts";
+  TaskEvent,
+  TaskFiberResult,
+  TaskWorkerRpcs,
+  WorkerTraceRecord,
+} from "../../../shared/rpc.ts";
 import type { StartTaskFiber } from "../../../shared/rpc.ts";
+import { TaskSpanAnnouncements } from "../../../shared/task-spans.ts";
 import {
   forgetEndedProcessGroups,
   killTaskProcessGroups,
 } from "../../kill-leftover-processes/index.ts";
 import { makeTaskBodyRecord } from "../shared/define-task-body-record.ts";
-import { makeTraceLogRecordJson } from "../shared/make-trace-log-record.ts";
+import { makeTraceOnlyLogger } from "../shared/make-trace-log-record.ts";
 import { WorkerState, reportToMainThread } from "../shared/provide-worker-state.ts";
 import { describeCleanupFailure, describeTaskBodyResult } from "./describe-task-body-result.ts";
-import { makeTraceSpanJson } from "./make-trace-span-json.ts";
 import { runTaskBody } from "./run-task-body.ts";
 
 class TaskResultNotHandedOver extends Schema.TaggedError<TaskResultNotHandedOver>()(
   "TaskResultNotHandedOver",
   { ...TASK_ERROR_FIELDS, taskName: Schema.String, cause: Schema.Defect() },
 ) {
+  public get reportedErrors() {
+    return reportWrappedCause(this, "could not hand its result to the main thread");
+  }
   public override get message() {
-    return `could not hand the result of "${this.taskName}" to the main thread because ${describeCauseMessage(this.cause)}`;
+    return joinMessages(this.reportedErrors);
   }
 }
 
@@ -40,7 +47,7 @@ const describeResultNotHandedOver = (taskName: string, cause: TaskResultNotHande
     () => reportResultNotHandedOver(taskName, THROWN_VALUE_WITHOUT_MESSAGE),
   );
 
-const endTaskBody = Effect.fn("endTaskBody")(function* (
+const endTaskBody = Effect.fn(function* (
   startMessage: typeof StartTaskFiber.Type,
   body: ReturnType<typeof makeTaskBodyRecord>,
   taskExit: Exit.Exit<unknown, unknown>,
@@ -48,16 +55,25 @@ const endTaskBody = Effect.fn("endTaskBody")(function* (
   const elapsedMilliseconds = (yield* Clock.currentTimeMillis) - body.startedAtMilliseconds;
   const workerState = yield* WorkerState;
   const cleanupExit = yield* Effect.exit(
-    killTaskProcessGroups(body.startedProcessGroups, startMessage.taskName, (processes) =>
-      workerState.claimProcessesToReport(startMessage.taskName, processes),
+    killTaskProcessGroups(
+      body.startedProcessGroups,
+      startMessage.taskName,
+      (processes) => workerState.claimProcessesToReport(startMessage.taskName, processes),
+      workerState.runMarker,
     ).pipe(Effect.flatMap(forgetEndedProcessGroups(body.startedProcessGroups))),
   );
   const sendTaskFiberEnded = (result: typeof TaskFiberResult.Type) =>
-    reportToMainThread(
-      TaskEvent.cases.TaskFiberEnded.make({
-        taskName: startMessage.taskName,
-        result,
-      }),
+    Effect.sync(() => {
+      body.hasEnded = true;
+    }).pipe(
+      Effect.andThen(
+        reportToMainThread(
+          TaskEvent.cases.TaskFiberEnded.make({
+            taskName: startMessage.taskName,
+            result,
+          }),
+        ),
+      ),
     );
   yield* Effect.suspend((): Effect.Effect<typeof TaskFiberResult.Type> => {
     const cleanupFailure = describeCleanupFailure(body, cleanupExit, taskExit);
@@ -85,14 +101,14 @@ const endTaskBody = Effect.fn("endTaskBody")(function* (
   );
 });
 
-const startTaskFiber = Effect.fn("startTaskFiber")(function* (start: typeof StartTaskFiber.Type) {
+const startTaskFiber = Effect.fn(function* (start: typeof StartTaskFiber.Type) {
   const workerState = yield* WorkerState;
   const body = makeTaskBodyRecord();
   yield* workerState.startTaskBodyFiber(
     start.taskName,
     runTaskBody(start, body).pipe(
-      Effect.withParentSpan(Tracer.externalSpan({ traceId: start.traceId, spanId: start.spanId })),
       Effect.onExit((taskExit) => endTaskBody(start, body, taskExit)),
+      Effect.withParentSpan(Tracer.externalSpan({ traceId: start.traceId, spanId: start.spanId })),
     ),
   );
 });
@@ -116,39 +132,29 @@ const serveUntilExitRequested = Effect.gen(function* () {
 
 export const serveTheMainThread = Effect.gen(function* () {
   const workerState = yield* WorkerState;
-  const tracer = Tracer.make({
-    span: (options) => {
-      const span = new Tracer.NativeSpan(options);
-      const end = span.end.bind(span);
-      const ending = { hasEnded: false };
-      span.end = (endTime, exit) => {
-        const isExported = span.sampled && !ending.hasEnded;
-        ending.hasEnded = true;
-        end(endTime, exit);
-        const spanJson = isExported
-          ? makeTraceSpanJson(
-              span,
-              endTime,
-              Exit.isFailure(exit) ? Exit.failCause(causeWithPrintableErrors(exit.cause)) : exit,
-            )
-          : undefined;
-        if (spanJson !== undefined) {
-          workerState.recordTraceSpanNow(spanJson);
-        }
-      };
-      return span;
-    },
+  const tracer = makeTraceTracer((recorded) => {
+    workerState.recordTraceNow(WorkerTraceRecord.cases.SpanExported.make(recorded));
   });
-  const logger = Logger.make((logEntry) => {
-    const traceLogRecordJson = makeTraceLogRecordJson(logEntry);
-    if (traceLogRecordJson !== undefined) {
-      workerState.reportToMainThreadNow(
-        TaskEvent.cases.TraceLogRecordRequested.make({ traceLogRecordJson }),
-      );
-    }
-  });
+  const logger = makeTraceOnlyLogger(workerState.reportToMainThreadNow);
   yield* serveUntilExitRequested.pipe(
     Effect.provideService(Tracer.Tracer, tracer),
     Effect.provideService(Logger.CurrentLoggers, new Set([logger])),
+    Effect.provideService(TaskSpanAnnouncements, {
+      started: (span) => {
+        workerState.recordTraceNow(
+          WorkerTraceRecord.cases.TaskSpanStarted.make({ span: describeStartedTaskSpan(span) }),
+        );
+      },
+      updated: (span) => {
+        workerState.recordTraceNow(
+          WorkerTraceRecord.cases.TaskSpanUpdated.make({ span: describeStartedTaskSpan(span) }),
+        );
+      },
+      ended: (span) => {
+        workerState.recordTraceNow(
+          WorkerTraceRecord.cases.TaskSpanEnded.make({ spanId: span.spanId }),
+        );
+      },
+    }),
   );
 });

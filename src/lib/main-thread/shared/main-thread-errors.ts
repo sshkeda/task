@@ -1,7 +1,10 @@
 import { Array as Arrays, Duration, Schema } from "effect";
 
 import { TASK_ERROR_FIELDS, UNATTRIBUTED_FAILURE_FIELDS } from "../../../shared/error-fields.ts";
-import { describeCauseMessage, reportError } from "../../../shared/report-errors.ts";
+import { joinMessages } from "../../../shared/join-messages.ts";
+import { nameTask } from "../../../shared/label-lines.ts";
+import { reportTaskText, reportWrappedCause } from "../../../shared/report-cause.ts";
+import { reportError } from "../../../shared/report-errors.ts";
 import { TASK_OPTION_NAMES } from "../../../shared/resolve-task-options.ts";
 import { exitCodeAfterStopSignal, STOP_REASONS } from "../../../shared/stop-signals.ts";
 import { TaskDefinitionNotGiven, TaskNameNotString } from "../../../shared/task-errors.ts";
@@ -25,17 +28,31 @@ export class RootTaskFileUnavailable extends Schema.TaggedError<RootTaskFileUnav
   public get location() {
     return this.filePath;
   }
+  public get reportedErrors() {
+    return reportWrappedCause(this, "could not resolve the root task file");
+  }
   public override get message() {
-    return `could not resolve the root task file because ${describeCauseMessage(this.cause)}`;
+    return joinMessages(this.reportedErrors);
   }
 }
 
 export class RootTaskWorkingDirectoryUnavailable extends Schema.TaggedError<RootTaskWorkingDirectoryUnavailable>()(
   "RootTaskWorkingDirectoryUnavailable",
-  { ...TASK_ERROR_FIELDS, packageJsonDirectoryPath: Schema.String, cause: Schema.Defect() },
+  {
+    ...TASK_ERROR_FIELDS,
+    ...UNATTRIBUTED_FAILURE_FIELDS,
+    packageJsonDirectoryPath: Schema.String,
+    cause: Schema.Defect(),
+  },
 ) {
+  public get reportedErrors() {
+    return reportWrappedCause(
+      this,
+      `could not enter root task directory "${this.packageJsonDirectoryPath}"`,
+    );
+  }
   public override get message() {
-    return `could not enter root task directory "${this.packageJsonDirectoryPath}" because ${describeCauseMessage(this.cause)}`;
+    return joinMessages(this.reportedErrors);
   }
 }
 
@@ -57,21 +74,21 @@ export class TaskNameBlank extends Schema.TaggedError<TaskNameBlank>()("TaskName
   }
 }
 
-export class TaskNameMultiline extends Schema.TaggedError<TaskNameMultiline>()(
-  "TaskNameMultiline",
-  { ...TASK_ERROR_FIELDS, location: Schema.String, nameText: Schema.String },
-) {
-  public override get message() {
-    return `calls Task.make() with the name ${this.nameText}, which has a line break`;
-  }
-}
-
 export class TaskMadeMoreThanOnce extends Schema.TaggedError<TaskMadeMoreThanOnce>()(
   "TaskMadeMoreThanOnce",
   { ...TASK_ERROR_FIELDS, taskName: Schema.String, location: Schema.String, madeCount: Schema.Int },
 ) {
   public override get message() {
-    return `makes the task "${this.taskName}", which ${this.madeCount} Task.make() calls make`;
+    return `makes the task ${nameTask(this.taskName)}, which ${this.madeCount} Task.make() calls make`;
+  }
+}
+
+export class TaskMadeAtUnknownLocation extends Schema.TaggedError<TaskMadeAtUnknownLocation>()(
+  "TaskMadeAtUnknownLocation",
+  { ...TASK_ERROR_FIELDS, nameText: Schema.String },
+) {
+  public override get message() {
+    return `makes the task ${this.nameText}, but no source file is named for its Task.make() call in the call stack task can read, so task cannot tell which package the task belongs to`;
   }
 }
 
@@ -111,7 +128,7 @@ export class TaskIsolatedInBody extends Schema.TaggedError<TaskIsolatedInBody>()
   { ...TASK_ERROR_FIELDS, taskName: Schema.String, madeInTaskName: Schema.String },
 ) {
   public override get message() {
-    return `is made inside the body of "${this.madeInTaskName}", so it cannot run on a worker of its own`;
+    return `is made inside the body of ${nameTask(this.madeInTaskName)}, so it cannot run on a worker of its own`;
   }
 }
 
@@ -125,7 +142,7 @@ export class TaskOptionsUnknown extends Schema.TaggedError<TaskOptionsUnknown>()
   },
 ) {
   public override get message() {
-    return `task "${this.taskName}" has the ${this.optionNames.length === 1 ? "option" : "options"} ${this.optionNames.join(", ")} outside the task options (${TASK_OPTION_NAMES.join(", ")})`;
+    return `task ${nameTask(this.taskName)} has the ${this.optionNames.length === 1 ? "option" : "options"} ${this.optionNames.join(", ")} outside the task options (${TASK_OPTION_NAMES.join(", ")})`;
   }
 }
 
@@ -143,7 +160,7 @@ export const TaskDefinitionViolation = Schema.Union([
   TaskNameNotString,
   TaskNameEmpty,
   TaskNameBlank,
-  TaskNameMultiline,
+  TaskMadeAtUnknownLocation,
   TaskMadeMoreThanOnce,
   TaskTimeoutInvalid,
   TaskCleanupInvalid,
@@ -163,6 +180,40 @@ export class BrokenTasksFound extends Schema.TaggedError<BrokenTasksFound>()("Br
   }
   public override get message() {
     return `found ${this.violations.length} task definition ${this.violations.length === 1 ? "violation" : "violations"}`;
+  }
+}
+
+export class WorkerOutputNotRead extends Schema.TaggedError<WorkerOutputNotRead>()(
+  "WorkerOutputNotRead",
+  {
+    ...TASK_ERROR_FIELDS,
+    ...UNATTRIBUTED_FAILURE_FIELDS,
+    workerId: Schema.Int,
+    cause: Schema.Defect(),
+  },
+) {
+  public get reportedErrors() {
+    return reportWrappedCause(
+      this,
+      `could not read the output of worker ${this.workerId}, so the rest of it was lost`,
+    );
+  }
+  public override get message() {
+    return joinMessages(this.reportedErrors);
+  }
+}
+
+export class WorkerTerminationFailed extends Schema.TaggedError<WorkerTerminationFailed>()(
+  "WorkerTerminationFailed",
+  {
+    ...TASK_ERROR_FIELDS,
+    ...UNATTRIBUTED_FAILURE_FIELDS,
+    workerId: Schema.Int,
+    reason: Schema.String,
+  },
+) {
+  public override get message() {
+    return `could not terminate worker ${this.workerId}: ${this.reason}`;
   }
 }
 
@@ -186,7 +237,7 @@ export class ServingTaskRequestsItself extends Schema.TaggedError<ServingTaskReq
   { ...TASK_ERROR_FIELDS, taskName: Schema.String, cycle: Schema.Array(Schema.String) },
 ) {
   public override get message() {
-    return `requests itself while serving through ${this.cycle.join(" -> ")}, so task cannot stop each of them after the tasks that requested it`;
+    return `requests itself while serving through ${this.cycle.map(nameTask).join(" -> ")}, so task cannot stop each of them after the tasks that requested it`;
   }
 }
 
@@ -232,7 +283,7 @@ export class WorkerTerminatedForAnotherTask extends Schema.TaggedError<WorkerTer
   { ...TASK_ERROR_FIELDS, taskName: Schema.String, terminatingTaskName: Schema.String },
 ) {
   public override get message() {
-    return `its worker was terminated because "${this.terminatingTaskName}" ran past its cleanup limit on it`;
+    return `its worker was terminated because ${nameTask(this.terminatingTaskName)} ran past its cleanup limit on it`;
   }
 }
 
@@ -245,7 +296,7 @@ export class UnawaitedTasksFailed extends Schema.TaggedError<UnawaitedTasksFaile
   },
 ) {
   public override get message() {
-    return `no task awaited the failure of ${this.failedTaskNames.join(", ")}`;
+    return `no task awaited the failure of ${this.failedTaskNames.map(nameTask).join(", ")}`;
   }
 }
 
@@ -257,19 +308,61 @@ export class TasksNeverRan extends Schema.TaggedError<TasksNeverRan>()("TasksNev
 }) {
   public override get message() {
     const isOneTask = this.taskNames.length === 1;
-    return `makes ${this.taskNames.map((taskName) => `"${taskName}"`).join(", ")} but nothing ran ${isOneTask ? "it" : "them"}`;
+    return `makes ${this.taskNames.map(nameTask).join(", ")} but nothing ran ${isOneTask ? "it" : "them"}`;
   }
 }
 
+export class NoTaskStarted extends Schema.TaggedError<NoTaskStarted>()("NoTaskStarted", {
+  ...TASK_ERROR_FIELDS,
+  ...UNATTRIBUTED_FAILURE_FIELDS,
+  madeTaskNames: Schema.NonEmptyArray(Schema.String),
+  filePath: Schema.String,
+}) {
+  public override get message() {
+    return `makes ${this.madeTaskNames.map(nameTask).join(", ")} but the run started no task`;
+  }
+}
+
+const INCOMPLETE_FILES_FIELDS = {
+  failedStep: Schema.String,
+  cause: Schema.NullOr(Schema.Defect()),
+};
+
+const reportIncompleteFiles = (
+  incomplete: Parameters<typeof reportWrappedCause>[0] & { readonly failedStep: string },
+  whatIsIncomplete: string,
+) =>
+  incomplete.cause === null
+    ? reportTaskText(incomplete, incomplete.failedStep, whatIsIncomplete)
+    : reportWrappedCause(incomplete, `${incomplete.failedStep}, so ${whatIsIncomplete}`);
+
 export class TraceFileIncomplete extends Schema.TaggedError<TraceFileIncomplete>()(
   "TraceFileIncomplete",
-  { ...TASK_ERROR_FIELDS, traceFilePath: Schema.String, reason: Schema.String },
+  { ...TASK_ERROR_FIELDS, traceFilePath: Schema.String, ...INCOMPLETE_FILES_FIELDS },
 ) {
   public get location() {
     return this.traceFilePath;
   }
+  public get reportedErrors() {
+    return reportIncompleteFiles(this, "the trace file is incomplete");
+  }
   public override get message() {
-    return `the trace file is incomplete because ${this.reason}`;
+    return joinMessages(this.reportedErrors);
+  }
+}
+
+export class TaskOutputFilesIncomplete extends Schema.TaggedError<TaskOutputFilesIncomplete>()(
+  "TaskOutputFilesIncomplete",
+  { ...TASK_ERROR_FIELDS, runDirectoryPath: Schema.String, ...INCOMPLETE_FILES_FIELDS },
+) {
+  public get location() {
+    return this.runDirectoryPath;
+  }
+  public get reportedErrors() {
+    return reportIncompleteFiles(this, "the task output files are incomplete");
+  }
+  public override get message() {
+    return joinMessages(this.reportedErrors);
   }
 }
 

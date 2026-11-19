@@ -6,15 +6,23 @@ import { Effect } from "effect";
 import { exists } from "../shared/access-files.ts";
 import { countOccurrences } from "../shared/count-occurrences.ts";
 import { EXIT_CODE_AFTER_SIGINT } from "../shared/exit-codes-after-stop-signals.ts";
+import { expectOneOfTheOrders } from "../shared/expect-one-of-the-orders.ts";
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
-import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
+import { withRunLinePathNamed, withSecondsNamed } from "../shared/name-output-files.ts";
+import {
+  readAttribute,
+  readProjectRunsDirectory,
+  readTracedFailures,
+  readTraces,
+} from "../shared/read-trace-files.ts";
 import {
   TASK_ENVIRONMENT_VARIABLE_PREFIX,
   runTaskProcess,
   startTaskProcess,
 } from "../shared/run-task-processes.ts";
+import { startTaskProcessWithPipes } from "../shared/start-task-process-with-pipes.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
 const SHELL_WAITING_FOR_RELEASE = `import { ChildProcess } from "effect/process";
@@ -37,6 +45,20 @@ const release = (project: Effect.Success<ReturnType<typeof makeProject>>, fifoNa
 
 const STOPPED_LINE = "stopped: the run ended before it finished";
 
+const RUN_ENDED_EVENT = "run ended before it finished";
+
+const findTaskNamesWhoseRunEnded = (
+  project: Parameters<typeof readProjectRunsDirectory>[0],
+  ran: Parameters<typeof readProjectRunsDirectory>[1],
+  taskNames: readonly string[],
+) =>
+  Effect.gen(function* () {
+    const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
+    return taskNames.filter((taskName) =>
+      (trace?.findTaskEventNames("task", taskName) ?? []).includes(RUN_ENDED_EVENT),
+    );
+  });
+
 const fourSiblingsProject = (groupFunctionName: "all" | "allSettled") =>
   makeProject({
     "main.ts": `import { Effect } from "effect";
@@ -57,28 +79,41 @@ export default Task.make({ name: "main", run: Task.${groupFunctionName}([one, { 
   });
 
 export const everySiblingReports = makeTest(
-  "allSettled runs every sibling to completion, prints each failure and fails with a count",
+  "allSettled runs every sibling to completion and prints each failure once as it happens and recaps it at the end, while its count of failed tasks stays in the trace and the summary names both failed tasks",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* fourSiblingsProject("allSettled");
       yield* makeFifos(project, ["release-one", "release-three"]);
       const command = yield* startTaskProcess(project, "main.ts");
-      yield* command.waitForLine("error TaskError: ");
-      yield* command.waitForLine("error TaskError: ");
+      yield* command.waitForLine("error: [");
+      yield* command.waitForLine("error: [");
       yield* release(project, "release-one");
       yield* release(project, "release-three");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(1);
       expect(exited.standardError).toContain("[one] one finished after the failures");
       expect(exited.standardError).toContain("[three] three finished after the failures");
-      expect(exited.standardError).toContain("[one] passed in");
-      expect(exited.standardError).toContain("[three] passed in");
-      expect(exited.standardError).toMatch(/^\[two\] \S+: error TaskError: two broke$/mu);
-      expect(exited.standardError).toMatch(/^\[four\] \S+: error TaskError: four broke$/mu);
-      expect(exited.standardError).toContain(
-        "[main] error SettledTasksFailed: 2 of 4 tasks failed: two, four",
+      expect(exited.standardError).toMatch(
+        /^error: \[two\] main\.ts:\d+:\d+: TaskError: two broke$/mu,
       );
-      expect(exited.standardError).toMatch(/^failed: two, four \(2 of 5 tasks\), [\d.]+s$/mu);
+      expect(exited.standardError).toMatch(
+        /^error: \[four\] main\.ts:\d+:\d+: TaskError: four broke$/mu,
+      );
+      const inTheErrorAndTheRecap = 2;
+      expect(countOccurrences(exited.standardError, "TaskError: two broke")).toBe(
+        inTheErrorAndTheRecap,
+      );
+      expect(countOccurrences(exited.standardError, "TaskError: four broke")).toBe(
+        inTheErrorAndTheRecap,
+      );
+      expect(exited.standardError).not.toContain("SettledTasksFailed");
+      expect(exited.standardError).toMatch(
+        /\nfailed: \[two\] \[four\] \(2 of 5 tasks\), [\d.]+s\nrun: .+\/$/u,
+      );
+      expect(yield* readTracedFailures(project, exited)).toContainEqual({
+        taskName: "main",
+        failure: "error SettledTasksFailed: 2 of 4 tasks failed: [two], [four]",
+      });
     }),
   ),
 );
@@ -141,22 +176,21 @@ export const nothing = Task.make({ name: "nothing", run: Task.allSettled(undefin
 export default Task.make({ name: "main", run: Task.allSettled([together, settled, holes, nothing]) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.standardError).toContain(
-        '[together] main.ts:4:65: error TaskListNotGiven: Task.all() was called with "name", which is not a list or record of tasks\n',
+      const lines = ran.standardError.split("\n");
+      expect(lines).toContain(
+        'error: [together] main.ts:4:65: TaskListNotGiven: Task.all() was called with "name", which is not a list or record of tasks',
       );
-      expect(ran.standardError).toContain(
-        '[settled] main.ts:5:63: error TaskListNotGiven: Task.allSettled() was called with task "a", which is not a list or record of tasks\n',
+      expect(lines).toContain(
+        "error: [settled] main.ts:5:63: TaskListNotGiven: Task.allSettled() was called with task [a], which is not a list or record of tasks",
       );
-      expect(ran.standardError).toContain(
-        "[holes] main.ts:6:59: error TaskListNotGiven: Task.all() was called with an array, which is not a list or record of tasks\n",
+      expect(lines).toContain(
+        "error: [holes] main.ts:6:59: TaskListNotGiven: Task.all() was called with an array, which is not a list or record of tasks",
       );
-      expect(ran.standardError).toContain(
-        "[nothing] main.ts:7:63: error TaskListNotGiven: Task.allSettled() was called with undefined, which is not a list or record of tasks\n",
+      expect(lines).toContain(
+        "error: [nothing] main.ts:7:63: TaskListNotGiven: Task.allSettled() was called with undefined, which is not a list or record of tasks",
       );
-      expect(ran.standardError).toContain(
-        "[main] error SettledTasksFailed: 4 of 4 tasks failed: together, settled, holes, nothing\n",
-      );
-      expect(ran.standardError).not.toContain("[a] started");
+      expect(ran.standardError).not.toContain("SettledTasksFailed");
+      expect(yield* exists(`${project.directory}/a-started`)).toBe(false);
       expect(ran.standardOutput).toBe("");
       expect(ran.exitCode).toBe(1);
       expect(yield* exists(`${project.directory}/a-started`)).toBe(false);
@@ -165,7 +199,7 @@ export default Task.make({ name: "main", run: Task.allSettled([together, settled
 );
 
 export const failFastAll = makeTest(
-  "all still ends the run at the first failure and reports the tasks it stopped",
+  "all still ends the run at the first failure, counts the tasks it stopped, and records on each that the run ended before it finished",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* fourSiblingsProject("all");
@@ -173,24 +207,25 @@ export const failFastAll = makeTest(
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toMatch(
-        /^\[(?:two|four)\] main\.ts:\d+:\d+: error TaskError: (?:two|four) broke$/mu,
+        /^error: \[(?:two|four)\] main\.ts:\d+:\d+: TaskError: (?:two|four) broke$/mu,
       );
-      expect(ran.standardError).toMatch(
-        /^\[main\] error AwaitedTaskFailed: (?:two|four) failed$/mu,
-      );
+      expect(ran.standardError).not.toContain("AwaitedTaskFailed");
       expect(ran.standardError).not.toContain("finished after the failures");
       expect(ran.standardError).not.toContain("tasks failed");
-      expect(ran.standardError).toContain(`[one] ${STOPPED_LINE}`);
-      expect(ran.standardError).toContain(`[three] ${STOPPED_LINE}`);
+      expect(ran.standardError).not.toContain(STOPPED_LINE);
+      expect(yield* findTaskNamesWhoseRunEnded(project, ran, ["one", "three"])).toEqual([
+        "one",
+        "three",
+      ]);
       expect(ran.standardError).toMatch(
-        /^failed: (?:two, four \(2 of 5 tasks\), 2 stopped|(?:two|four) \(1 of 5 tasks\), 3 stopped), [\d.]+s$/mu,
+        /^failed: (?:\[two\] \[four\] \(2 of 5 tasks\), 2 stopped|\[(?:two|four)\] \(1 of 5 tasks\), 3 stopped), [\d.]+s$/mu,
       );
     }),
   ),
 );
 
 export const interrupt = makeTest(
-  "Ctrl-C during allSettled stops every task and exits 130",
+  "Ctrl-C during allSettled stops every task, records on each that the run ended before it finished, and exits 130",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -209,20 +244,23 @@ export default Task.make({ name: "main", run: Task.allSettled([broken, left, rig
       });
       yield* makeFifos(project, ["left-waiting", "right-waiting"]);
       const command = yield* startTaskProcess(project, "main.ts");
-      yield* command.waitForLine(": error TaskError: broken broke");
+      yield* command.waitForLine("error: [broken] ");
       yield* command.sendSignal("INT");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
-      for (const blockedTaskName of ["left", "right"]) {
-        expect(exited.standardError).toContain(
-          `[${blockedTaskName}] ${blockedTaskName} cleaned up`,
-        );
-        expect(exited.standardError).toContain(`[${blockedTaskName}] ${STOPPED_LINE}`);
-      }
-      expect(exited.standardError).toContain(`[main] ${STOPPED_LINE}`);
+      expect(exited.standardError).toContain("[left] left cleaned up");
+      expect(exited.standardError).toContain("[right] right cleaned up");
+      expect(exited.standardError).not.toContain(STOPPED_LINE);
+      expect(yield* findTaskNamesWhoseRunEnded(project, exited, ["left", "right", "main"])).toEqual(
+        ["left", "right", "main"],
+      );
       expect(exited.standardError).not.toContain("tasks failed");
       expect(exited.standardError).toMatch(
-        /^failed: broken \(1 of 4 tasks\), 3 stopped, [\d.]+s\nerror StopRequested: received SIGINT$/mu,
+        /^error: \[broken\] main\.ts:\d+:\d+: TaskError: broken broke$/mu,
+      );
+      expect(exited.standardError).not.toContain("StopRequested");
+      expect(exited.standardError).toMatch(
+        /\nfailed: \[broken\] \(1 of 4 tasks\), 3 stopped, [\d.]+s\nrun: .+\/$/u,
       );
     }),
   ),
@@ -248,21 +286,27 @@ export default Task.make({ name: "main", run: Task.all([checks, blocked]) });`,
       });
       yield* makeFifos(project, ["release-lint", "blocked-waiting"]);
       const command = yield* startTaskProcess(project, "main.ts");
-      yield* command.waitForLine("error TaskError: build broke");
+      yield* command.waitForLine("error: [build] ");
       yield* release(project, "release-lint");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(1);
-      expect(exited.standardError).toContain("[lint] passed in");
-      expect(exited.standardError).toContain(
-        "[checks] error SettledTasksFailed: 1 of 2 tasks failed: build",
-      );
-      expect(exited.standardError).toContain("[main] error AwaitedTaskFailed: checks failed\n");
-      expect(exited.standardError).toContain(
-        `[blocked] blocked cleaned up\n[blocked] ${STOPPED_LINE}`,
-      );
+      expect(exited.standardError).not.toContain("SettledTasksFailed");
+      expect(exited.standardError).not.toContain("AwaitedTaskFailed");
+      expect(exited.standardError).toContain("[blocked] blocked cleaned up");
+      expect(exited.standardError).not.toContain(STOPPED_LINE);
       expect(exited.standardError).toMatch(
-        /^failed: build \(1 of 5 tasks\), 1 stopped, [\d.]+s$/mu,
+        /^failed: \[build\] \(1 of 5 tasks\), 1 stopped, [\d.]+s$/mu,
       );
+      const tracedFailures = yield* readTracedFailures(project, exited);
+      expect(tracedFailures).toContainEqual({
+        taskName: "checks",
+        failure: "error SettledTasksFailed: 1 of 2 tasks failed: [build]",
+      });
+      expect(tracedFailures).toContainEqual({
+        taskName: "main",
+        failure: "error AwaitedTaskFailed: [checks] failed",
+      });
+      expect(yield* findTaskNamesWhoseRunEnded(project, exited, ["blocked"])).toEqual(["blocked"]);
     }),
   ),
 );
@@ -290,28 +334,33 @@ export default Task.make({ name: "main", run: Task.allSettled([pipeline, lint]) 
       });
       yield* makeFifos(project, ["release-lint", "blocked-waiting"]);
       const command = yield* startTaskProcess(project, "main.ts");
-      yield* command.waitForLine("error TaskError: build broke");
+      yield* command.waitForLine("error: [build] ");
       yield* command.waitForLine("[pipeline] pipeline stopped");
       yield* release(project, "release-lint");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(1);
-      expect(exited.standardError).toContain("[pipeline] error AwaitedTaskFailed: build failed\n");
-      expect(exited.standardError).toContain("[lint] passed in");
-      expect(exited.standardError).toContain(
-        "[main] error SettledTasksFailed: 1 of 2 tasks failed: pipeline",
-      );
-      expect(exited.standardError).toContain(
-        `[blocked] blocked cleaned up\n[blocked] ${STOPPED_LINE}`,
-      );
+      expect(exited.standardError).not.toContain("AwaitedTaskFailed");
+      expect(exited.standardError).not.toContain("SettledTasksFailed");
+      expect(exited.standardError).toContain("[blocked] blocked cleaned up");
+      expect(exited.standardError).not.toContain(STOPPED_LINE);
+      const tracedFailures = yield* readTracedFailures(project, exited);
+      expect(tracedFailures).toContainEqual({
+        taskName: "pipeline",
+        failure: "error AwaitedTaskFailed: [build] failed",
+      });
+      expect(tracedFailures).toContainEqual({
+        taskName: "main",
+        failure: "error SettledTasksFailed: 1 of 2 tasks failed: [pipeline]",
+      });
       expect(exited.standardError).toMatch(
-        /^failed: build \(1 of 5 tasks\), 1 stopped, [\d.]+s$/mu,
+        /^failed: \[build\] \(1 of 5 tasks\), 1 stopped, [\d.]+s$/mu,
       );
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, exited));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, exited));
       const recordedStates = Object.fromEntries(
         ["build", "pipeline", "blocked", "lint", "main"].map((taskName) => [
           taskName,
           readAttribute(
-            trace?.findOnlySpan(`executeTaskFiber ${taskName}`)?.attributes ?? [],
+            trace?.findTaskSpan("task", taskName)?.attributes ?? [],
             "sshkeda_task.state",
           ),
         ]),
@@ -355,21 +404,30 @@ export default Task.make({ name: "main", run: Task.all([checks, consumer]) });`,
       yield* release(project, "release-flaky");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(1);
-      expect(exited.standardError).toMatch(/^\[flaky\] \S+: error TaskError: flaky broke$/mu);
-      expect(exited.standardError).toContain("[consumer] error AwaitedTaskFailed: flaky failed");
-      expect(exited.standardError).toContain("[main] error AwaitedTaskFailed: consumer failed");
+      expect(exited.standardError).toMatch(/^error: \[flaky\] \S+: TaskError: flaky broke$/mu);
+      expect(exited.standardError).not.toContain("AwaitedTaskFailed");
       expect(exited.standardError).toContain(`[blocked] blocked cleaned up`);
-      expect(exited.standardError).toContain(`[checks] ${STOPPED_LINE}`);
+      expect(exited.standardError).not.toContain(STOPPED_LINE);
+      const tracedFailures = yield* readTracedFailures(project, exited);
+      expect(tracedFailures).toContainEqual({
+        taskName: "consumer",
+        failure: "error AwaitedTaskFailed: [flaky] failed",
+      });
+      expect(tracedFailures).toContainEqual({
+        taskName: "main",
+        failure: "error AwaitedTaskFailed: [consumer] failed",
+      });
+      expect(yield* findTaskNamesWhoseRunEnded(project, exited, ["checks"])).toEqual(["checks"]);
       expect(exited.standardError).not.toContain("tasks failed");
       expect(exited.standardError).toMatch(
-        /^failed: flaky \(1 of 5 tasks\), 2 stopped, [\d.]+s$/mu,
+        /^failed: \[flaky\] \(1 of 5 tasks\), 2 stopped, [\d.]+s$/mu,
       );
     }),
   ),
 );
 
 export const awaitedFailFastInsideGroup = makeTest(
-  "a sibling that yields a failed sibling fails with a reason naming it, and the group counts both",
+  "a sibling that yields a failed sibling fails without a second printed error, and the trace keeps its reason naming that sibling and the group's count of both",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -388,19 +446,28 @@ export default Task.make({ name: "main", run: Task.allSettled([flaky, consumer, 
       });
       yield* makeFifos(project, ["release-lint"]);
       const command = yield* startTaskProcess(project, "main.ts");
-      yield* command.waitForLine("error TaskError: flaky broke");
+      yield* command.waitForLine("error: [flaky] ");
       yield* command.waitForLine("[consumer] consumer stopped");
       yield* release(project, "release-lint");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(1);
       expect(exited.standardError).not.toContain("consumer continued");
-      expect(exited.standardError).toContain("[lint] passed in");
-      expect(exited.standardError).toContain("[consumer] error AwaitedTaskFailed: flaky failed\n");
-      expect(exited.standardError).toContain(
-        "[main] error SettledTasksFailed: 2 of 3 tasks failed: flaky, consumer",
+      expect(exited.standardError).not.toContain("AwaitedTaskFailed");
+      expect(exited.standardError).not.toContain("SettledTasksFailed");
+      const tracedFailures = yield* readTracedFailures(project, exited);
+      expect(tracedFailures).toContainEqual({
+        taskName: "consumer",
+        failure: "error AwaitedTaskFailed: [flaky] failed",
+      });
+      expect(tracedFailures).toContainEqual({
+        taskName: "main",
+        failure: "error SettledTasksFailed: 2 of 3 tasks failed: [flaky], [consumer]",
+      });
+      const inTheErrorAndTheRecap = 2;
+      expect(countOccurrences(exited.standardError, ": TaskError: flaky broke")).toBe(
+        inTheErrorAndTheRecap,
       );
-      expect(countOccurrences(exited.standardError, ": error TaskError: flaky broke")).toBe(1);
-      expect(exited.standardError).toMatch(/^failed: flaky \(1 of 4 tasks\), [\d.]+s$/mu);
+      expect(exited.standardError).toMatch(/^failed: \[flaky\] \(1 of 4 tasks\), [\d.]+s$/mu);
     }),
   ),
 );
@@ -424,18 +491,21 @@ export default Task.make({ name: "main", run: Task.allSettled([broken, slow, lat
       });
       yield* makeFifos(project, ["release-later"]);
       const command = yield* startTaskProcess(project, "main.ts");
-      yield* command.waitForLine("[slow] error TaskTimedOut: timed out after 300ms");
+      yield* command.waitForLine("error: [slow] ");
       yield* command.waitForLine("[slow] slow cleaned up");
       yield* release(project, "release-later");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(1);
       expect(exited.standardError).toContain("[later] later finished after the timeout");
-      expect(exited.standardError).toContain("[later] passed in");
-      expect(exited.standardError).toContain(
-        "[main] error SettledTasksFailed: 2 of 3 tasks failed: broken, slow",
-      );
+      expect(exited.standardError).not.toContain("SettledTasksFailed");
+      expect(yield* readTracedFailures(project, exited)).toContainEqual({
+        taskName: "main",
+        failure: "error SettledTasksFailed: 2 of 3 tasks failed: [broken], [slow]",
+      });
       expect(exited.standardError).not.toContain(STOPPED_LINE);
-      expect(exited.standardError).toMatch(/^failed: broken, slow \(2 of 4 tasks\), [\d.]+s$/mu);
+      expect(exited.standardError).toMatch(
+        /^failed: \[broken\] \[slow\] \(2 of 4 tasks\), [\d.]+s$/mu,
+      );
     }),
   ),
 );
@@ -458,11 +528,11 @@ export default Task.make({ name: "main", run: Task.allSettled([slow]).pipe(
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       const lines = ran.standardError.split("\n");
-      expect(lines).toContain("[slow] error TaskTimedOut: timed out after 300ms");
+      expect(lines).toContain("error: [slow] main.ts:3:26: TaskTimedOut: timed out after 300ms");
       expect(lines.indexOf("[main] main caught slow")).toBeGreaterThan(-1);
       expect(lines.indexOf("[main] main caught slow")).toBeLessThan(
         lines.indexOf(
-          "[slow] error TaskCleanupTimedOut: its cleanup did not finish within 2s, so the run stopped waiting for it",
+          "error: [slow] main.ts:3:26: TaskCleanupTimedOut: its cleanup did not finish within 2s, so the run stopped waiting for it",
         ),
       );
       expect(ran.standardError).not.toContain(STOPPED_LINE);
@@ -511,16 +581,15 @@ export default Task.make({ name: "main", run: broken.pipe(
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
-      expect(ran.standardError).toMatch(/^\[broken\] \S+: error TaskError: broken broke$/mu);
+      expect(ran.standardError).toMatch(/^error: \[broken\] \S+: TaskError: broken broke$/mu);
       expect(ran.standardError).toContain("[main] recovered from broken");
-      expect(ran.standardError).toContain("[main] passed in");
       expect(ran.standardError).toMatch(/^passed: 2 tasks, 1 caught failure, [\d.]+s$/mu);
     }),
   ),
 );
 
 export const caughtSettledTasksFailed = makeTest(
-  "a caught SettledTasksFailed lets the run pass and reports every task still running as stopped",
+  "a caught SettledTasksFailed lets the run pass and counts every task still running as stopped",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -541,11 +610,11 @@ export default Task.make({ name: "main", run: Task.allSettled([broken, starter])
       yield* makeFifos(project, ["blocked-waiting"]);
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
-      expect(ran.standardError).toMatch(/^\[broken\] \S+: error TaskError: broken broke$/mu);
+      expect(ran.standardError).toMatch(/^error: \[broken\] \S+: TaskError: broken broke$/mu);
       expect(ran.standardError).toContain("[main] handled 1 of 2 tasks failed");
-      expect(ran.standardError).toContain(
-        `[blocked] blocked cleaned up\n[blocked] ${STOPPED_LINE}`,
-      );
+      expect(ran.standardError).toContain("[blocked] blocked cleaned up");
+      expect(ran.standardError).not.toContain(STOPPED_LINE);
+      expect(yield* findTaskNamesWhoseRunEnded(project, ran, ["blocked"])).toEqual(["blocked"]);
       expect(ran.standardError).toMatch(
         /^passed: 4 tasks, 1 caught failure, 1 stopped, [\d.]+s$/mu,
       );
@@ -567,24 +636,47 @@ export const late = Task.make({ name: "late", run: Effect.gen(function* () {
   yield* waitForRelease("release-late");
   return yield* Effect.fail(new TaskError({ message: "late broke" }));
 }) });
-export const pipeline = Task.make({ name: "pipeline", run: Task.all([build, late]) });
+export const pipeline = Task.make({ name: "pipeline", run: Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Effect.log("pipeline stopped"));
+  yield* Task.all([build, late]);
+}) });
 export const lint = Task.make({ name: "lint", run: waitForRelease("release-lint") });
 export default Task.make({ name: "main", run: Task.allSettled([pipeline, lint]).pipe(
   Effect.catchTag("SettledTasksFailed", (failure) => Effect.log(\`handled \${failure.message}\`)),
 ) });`,
       });
-      yield* makeFifos(project, ["release-late", "release-lint"]);
-      const command = yield* startTaskProcess(project, "main.ts");
-      yield* command.waitForLine("[pipeline] error AwaitedTaskFailed: build failed");
-      yield* release(project, "release-late");
-      yield* command.waitForLine("error TaskError: late broke");
-      yield* release(project, "release-lint");
-      const exited = yield* command.waitForExit;
+      const started = yield* startTaskProcessWithPipes(project, ["release-late", "release-lint"]);
+      yield* started.releaseAfter(["ended: [build]", "ended: [pipeline]"], "release-late");
+      yield* started.releaseAfter(["ended: [late]"], "release-lint");
+      const exited = yield* started.waitForExit;
       expect(exited.exitCode).toBe(1);
-      expect(exited.standardError).toContain("[main] handled 1 of 2 tasks failed");
-      expect(exited.standardError).toContain("[main] passed in");
-      expect(exited.standardError).toMatch(
-        /^failed: build, late \(2 of 5 tasks\), [\d.]+s\nerror UnawaitedTasksFailed: no task awaited the failure of late$/mu,
+      const beforeTheEnds = [
+        "run: <run folder>/",
+        "error: [build] main.ts:13:66: TaskError: build broke",
+      ];
+      const buildEnd = [
+        "error: [build] its output is in <run folder>/4.output",
+        "ended: [build], <seconds>, failed",
+      ];
+      const pipelineStopped = "[pipeline] pipeline stopped";
+      const pipelineEnd = "ended: [pipeline], <seconds>, failed";
+      const afterTheEnds = [
+        "error: [late] main.ts:16:29: TaskError: late broke",
+        "error: [late] its output is in <run folder>/5.output",
+        "ended: [late], <seconds>, failed",
+        "[main] handled 1 of 2 tasks failed: [pipeline]",
+        "recap: [build] 4.output | main.ts:13:66: TaskError: build broke",
+        "recap: [late] 5.output | main.ts:16:29: TaskError: late broke",
+        "failed: [build] [late] (2 of 5 tasks), <seconds>",
+        "run: <run folder>/",
+      ];
+      expectOneOfTheOrders(
+        withRunLinePathNamed(withSecondsNamed(exited.standardError)).split("\n"),
+        [
+          [...beforeTheEnds, ...buildEnd, pipelineStopped, pipelineEnd, ...afterTheEnds],
+          [...beforeTheEnds, pipelineStopped, ...buildEnd, pipelineEnd, ...afterTheEnds],
+          [...beforeTheEnds, pipelineStopped, pipelineEnd, ...buildEnd, ...afterTheEnds],
+        ],
       );
     }),
   ),
@@ -607,13 +699,15 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain("[ok] passed in");
-      expect(ran.standardError).toMatch(/^\[broken\] \S+: error TaskError: broken broke$/mu);
-      expect(ran.standardError).toContain(
-        "[main] error SettledTasksFailed: 1 of 2 tasks failed: broken",
-      );
+      expect(ran.standardError).toContain("[ok] ok ran");
+      expect(ran.standardError).toMatch(/^error: \[broken\] \S+: TaskError: broken broke$/mu);
+      expect(ran.standardError).not.toContain("SettledTasksFailed");
+      expect(yield* readTracedFailures(project, ran)).toContainEqual({
+        taskName: "main",
+        failure: "error SettledTasksFailed: 1 of 2 tasks failed: [broken]",
+      });
       expect(ran.standardError).not.toContain("main body ran");
-      expect(ran.standardError).toMatch(/^failed: broken \(1 of 3 tasks\), [\d.]+s$/mu);
+      expect(ran.standardError).toMatch(/^failed: \[broken\] \(1 of 3 tasks\), [\d.]+s$/mu);
     }),
   ),
 );
@@ -634,8 +728,8 @@ export default Task.make({ name: "main", run: Task.allSettled([server, ok]) });`
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
-      expect(ran.standardError).toContain("[server] serving after");
-      expect(ran.standardError).toContain("[main] passed in");
+      expect(ran.standardError).toMatch(/^serving: \[server\], [\d.]+s$/mu);
+      expect(ran.standardError).toContain("[ok] ok ran");
       expect(ran.standardError).toContain("[server] server stopped");
       expect(ran.standardError).not.toContain(STOPPED_LINE);
       expect(ran.standardError).toMatch(/^passed: 3 tasks, [\d.]+s$/mu);
@@ -663,18 +757,25 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* waitForRelease("release-main");
 }) });`,
       });
-      yield* makeFifos(project, ["dependency-started", "release-dependency", "release-main"]);
-      const command = yield* startTaskProcess(project, "main.ts");
-      yield* command.waitForLine("[main] main stopped waiting");
-      yield* release(project, "release-dependency");
-      yield* command.waitForLine(": error TaskError: dependency broke");
-      yield* release(project, "release-main");
-      const exited = yield* command.waitForExit;
+      yield* makeFifos(project, ["dependency-started"]);
+      const started = yield* startTaskProcessWithPipes(project, [
+        "release-dependency",
+        "release-main",
+      ]);
+      yield* started.releaseAfter(["[main] main stopped waiting"], "release-dependency");
+      yield* started.releaseAfter(["ended: [dependency]"], "release-main");
+      const exited = yield* started.waitForExit;
       expect(exited.exitCode).toBe(1);
-      expect(exited.standardError).toContain("[main] passed in");
-      expect(exited.standardError).toMatch(
-        /^failed: dependency \(1 of 2 tasks\), [\d.]+s\nerror UnawaitedTasksFailed: no task awaited the failure of dependency$/mu,
-      );
+      expect(withRunLinePathNamed(withSecondsNamed(exited.standardError)).split("\n")).toEqual([
+        "run: <run folder>/",
+        "[main] main stopped waiting",
+        "error: [dependency] main.ts:16:29: TaskError: dependency broke",
+        "error: [dependency] its output is in <run folder>/2.output",
+        "ended: [dependency], <seconds>, failed",
+        "recap: [dependency] 2.output | main.ts:16:29: TaskError: dependency broke",
+        "failed: [dependency] (1 of 2 tasks), <seconds>",
+        "run: <run folder>/",
+      ]);
     }),
   ),
 );
@@ -705,14 +806,13 @@ export default Task.make({ name: "main", run: Task.all([middle, sibling]) });`,
       yield* release(project, "release-middle-finalizer");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(1);
-      expect(exited.standardError).toContain("[middle] error AwaitedTaskFailed: broken failed");
-      expect(exited.standardError).toContain("[main] error AwaitedTaskFailed: middle failed");
+      expect(exited.standardError).not.toContain("AwaitedTaskFailed");
       expect(exited.standardError).toContain("[middle] middle finalizer finished");
       expect(exited.standardError.indexOf("[sibling] sibling cleaned up")).toBeLessThan(
         exited.standardError.indexOf("[middle] middle finalizer finished"),
       );
       expect(exited.standardError).toMatch(
-        /^failed: broken \(1 of 4 tasks\), 1 stopped, [\d.]+s$/mu,
+        /^failed: \[broken\] \(1 of 4 tasks\), 1 stopped, [\d.]+s$/mu,
       );
     }),
   ),
@@ -801,7 +901,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
             Effect.gen(function* () {
               const offsetName = describeInterruptOffset(interruptOffsetMilliseconds);
               const command = yield* startTaskProcess(project, `main-${offsetName}.ts`);
-              yield* command.waitForLine(": error TaskError: dependency broke");
+              yield* command.waitForLine("error: [dependency] ");
               yield* release(project, `release-main-${offsetName}`);
               const exited = yield* command.waitForExit;
               return { offsetName, exitCode: exited.exitCode };
@@ -844,12 +944,12 @@ export const cleanupDefectAfterCaughtFailure = makeTest(
       );
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toMatch(/^\[broken\] \S+: error TaskError: broken broke$/mu);
+      expect(ran.standardError).toMatch(/^error: \[broken\] \S+: TaskError: broken broke$/mu);
       expect(ran.standardError).toMatch(
-        /^\[broken\] \S+: error TaskCleanupFailed: its cleanup failed with cleanup broke$/mu,
+        /^error: \[broken\] \S+: Error: cleanup broke\nerror: \[broken\] its cleanup failed$/mu,
       );
       expect(ran.standardError).toMatch(
-        /^failed: broken \(1 of 2 tasks\)(?:, 1 stopped)?, [\d.]+s$/mu,
+        /^failed: \[broken\] \(1 of 2 tasks\)(?:, 1 stopped)?, [\d.]+s$/mu,
       );
     }),
   ),
@@ -870,9 +970,9 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toMatch(
-        /^\[main\] \S+: error TaskCleanupFailed: its cleanup failed with cleanup broke$/mu,
+        /^error: \[main\] \S+: Error: cleanup broke\nerror: \[main\] its cleanup failed$/mu,
       );
-      expect(ran.standardError).not.toContain("TaskBodyFailed");
+      expect(ran.standardError).not.toContain("its body failed");
     }),
   ),
 );
@@ -887,9 +987,9 @@ export const workerExitDuringCleanupAfterCaughtFailure = makeTest(
       );
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toMatch(/^\[broken\] \S+: error TaskError: broken broke$/mu);
+      expect(ran.standardError).toMatch(/^error: \[broken\] \S+: TaskError: broken broke$/mu);
       expect(ran.standardError).toContain(
-        "[broken] error WorkerExited: its worker exited on its own with code 3",
+        "\nerror: [broken] main.ts:4:28: WorkerExited: its worker exited on its own with code 3",
       );
     }),
   ),
@@ -905,13 +1005,12 @@ export const cleanupDefectAfterUncaughtFailure = makeTest(
       );
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toMatch(/^\[broken\] \S+: error TaskError: broken broke$/mu);
+      expect(ran.standardError).toMatch(/^error: \[broken\] \S+: TaskError: broken broke$/mu);
       expect(ran.standardError).toMatch(
-        /^\[broken\] \S+: error TaskCleanupFailed: its cleanup failed with cleanup broke$/mu,
+        /^error: \[broken\] \S+: Error: cleanup broke\nerror: \[broken\] its cleanup failed$/mu,
       );
-      expect(ran.standardError).toMatch(
-        /^\[main\] (?:error AwaitedTaskFailed: broken failed|stopped: the run ended before it finished)$/mu,
-      );
+      expect(ran.standardError).not.toMatch(/^error: \[main\] /mu);
+      expect(ran.standardError).not.toContain(STOPPED_LINE);
     }),
   ),
 );
@@ -941,8 +1040,11 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain("[broken] cleanup started");
       expect(ran.standardError).toContain("[main] main caught it");
-      expect(ran.standardError).toContain("[broken] error TaskTimedOut: timed out after 300ms");
-      expect(ran.standardError).toContain(`[main] ${STOPPED_LINE}`);
+      expect(ran.standardError).toMatch(
+        /\nerror: \[broken\] main\.ts:13:28: TaskTimedOut: timed out after 300ms\nended: \[main\], [\d.]+s, stopped\nerror: \[broken\] main\.ts:13:28: TaskCleanupTimedOut: its cleanup did not finish within 300ms, so the run stopped waiting for it\nerror: \[broken\] its output is in \S+\/2\.output\nended: \[broken\], [\d.]+s, failed\nrecap: \[broken\] 2\.output \| main\.ts:13:28: TaskCleanupTimedOut: its cleanup did not finish within 300ms, so the run stopped waiting for it\nfailed: \[broken\] \(1 of 2 tasks\), 1 stopped, [\d.]+s\nrun: .+\/$/u,
+      );
+      expect(ran.standardError).not.toContain(STOPPED_LINE);
+      expect(yield* findTaskNamesWhoseRunEnded(project, ran, ["main"])).toEqual(["main"]);
     }),
   ),
 );
@@ -957,9 +1059,9 @@ export const workerExitDuringCleanupAfterUncaughtFailure = makeTest(
       );
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toMatch(/^\[broken\] \S+: error TaskError: broken broke$/mu);
+      expect(ran.standardError).toMatch(/^error: \[broken\] \S+: TaskError: broken broke$/mu);
       expect(ran.standardError).toContain(
-        "[broken] error WorkerExited: its worker exited on its own with code 3",
+        "\nerror: [broken] main.ts:4:28: WorkerExited: its worker exited on its own with code 3",
       );
     }),
   ),

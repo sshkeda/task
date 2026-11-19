@@ -1,25 +1,25 @@
 import { FileSystem, Path } from "effect";
 
-export const resolvePathsFromPackageDirectory = (
+export const resolvePathsFromRunDirectory = (
   path: Path.Path,
   fileSystem: FileSystem.FileSystem,
-  packageDirectoryPath: string,
+  runDirectoryPath: string,
 ) => {
   const resolve = (...pathSegments: readonly string[]) =>
-    path.resolve(packageDirectoryPath, ...pathSegments);
+    path.resolve(runDirectoryPath, ...pathSegments);
   const resolveTemporaryDirectory = <Options extends { readonly directory?: string | undefined }>(
     temporaryOptions: Options | undefined,
   ) =>
     temporaryOptions?.directory === undefined
       ? temporaryOptions
       : { ...temporaryOptions, directory: resolve(temporaryOptions.directory) };
-  const packagePath = Path.Path.of({
+  const runPath = Path.Path.of({
     ...path,
     resolve,
     relative: (fromPath, toPath) => path.relative(resolve(fromPath), resolve(toPath)),
     toFileUrl: (filePath) => path.toFileUrl(resolve(filePath)),
   });
-  const packageFileSystem = FileSystem.make({
+  const runFileSystem = FileSystem.make({
     ...fileSystem,
     access: (filePath, accessOptions) => fileSystem.access(resolve(filePath), accessOptions),
     copy: (fromPath, toPath, copyOptions) =>
@@ -57,5 +57,5 @@ export const resolvePathsFromPackageDirectory = (
     writeFile: (filePath, contents, writeOptions) =>
       fileSystem.writeFile(resolve(filePath), contents, writeOptions),
   });
-  return { path: packagePath, fileSystem: packageFileSystem };
+  return { path: runPath, fileSystem: runFileSystem };
 };

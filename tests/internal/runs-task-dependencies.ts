@@ -1,11 +1,13 @@
 import { expect } from "bun:test";
 
 import { Task } from "@sshkeda/task";
-import { Effect } from "effect";
+import { Deferred, Effect, Exit, Ref } from "effect";
 
+import { runOnce } from "../../src/lib/main-thread/lib/run-tasks-on-workers/lib/run-requested-task-once/internal/run-requested-tasks.ts";
 import { countOccurrences } from "../shared/count-occurrences.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
+import { withRunDirectoryNamed, withSecondsNamed } from "../shared/name-output-files.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 
 export const values = makeTest(
@@ -21,7 +23,6 @@ export default Task.make({ name: "main", run: Effect.gen(function* () { yield* E
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
       expect(ran.standardError).toContain("[main] got 42");
-      expect(ran.standardError).toContain("[answer] passed in");
       expect(ran.standardError).toMatch(/^passed: 2 tasks, [\d.]+s$/mu);
     }),
   ),
@@ -44,6 +45,50 @@ export default Task.make({ name: "main", run: Effect.all([left, right, shared], 
       expect(countOccurrences(ran.standardError, "[shared] shared ran")).toBe(1);
     }),
   ),
+);
+
+export const awaitedAtTheSameMoment = makeTest(
+  "two tasks that await one task at the same moment start it once and share its result, even when starting it yields",
+  Effect.gen(function* () {
+    const resultDeferreds = new Map<string, Deferred.Deferred<string>>();
+    const startCount = yield* Ref.make(0);
+    const start = (resultDeferred: Deferred.Deferred<string>) =>
+      Ref.update(startCount, (count) => count + 1).pipe(
+        Effect.andThen(Effect.yieldNow),
+        Effect.andThen(Deferred.succeed(resultDeferred, "shared ran")),
+        Effect.asVoid,
+      );
+    const [left, right] = yield* Effect.all(
+      [runOnce(resultDeferreds, "shared", start), runOnce(resultDeferreds, "shared", start)],
+      { concurrency: "unbounded" },
+    );
+    expect(left).toBe(right);
+    expect(yield* Ref.get(startCount)).toBe(1);
+    expect(yield* Deferred.await(left)).toBe("shared ran");
+  }),
+);
+
+export const requesterCancelledWhileStarting = makeTest(
+  "a requester cancelled while it starts a task still starts it, so a later requester gets that task's result",
+  Effect.gen(function* () {
+    const resultDeferreds = new Map<string, Deferred.Deferred<string>>();
+    const startCount = yield* Ref.make(0);
+    const starting = yield* Deferred.make<void>();
+    const start = (resultDeferred: Deferred.Deferred<string>) =>
+      Ref.update(startCount, (count) => count + 1).pipe(
+        Effect.andThen(Deferred.done(starting, Exit.void)),
+        Effect.andThen(Effect.yieldNow),
+        Effect.andThen(Deferred.succeed(resultDeferred, "shared ran")),
+        Effect.asVoid,
+      );
+    yield* runOnce(resultDeferreds, "shared", start).pipe(
+      Effect.raceFirst(Deferred.await(starting)),
+    );
+    const later = yield* runOnce(resultDeferreds, "shared", start);
+    expect(yield* Deferred.isDone(later)).toBe(true);
+    expect(yield* Deferred.await(later)).toBe("shared ran");
+    expect(yield* Ref.get(startCount)).toBe(1);
+  }),
 );
 
 export const parallel = makeTest(
@@ -92,7 +137,7 @@ export default Task.make({ name: "main", run: Effect.all([slow, bad], { concurre
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).not.toContain("[slow] passed");
+      expect(ran.standardError).toMatch(/^failed: \[bad\] \(1 of 4 tasks\), 1 stopped, [\d.]+s$/mu);
       expect(ran.standardError).toContain("[slow] slow cleaned up");
     }),
   ),
@@ -201,12 +246,12 @@ export default Task.make({ name: "unreadable", output: Schema.Struct({ value: Sc
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        '[deep] error TaskResultNotHandedOver: could not hand the result of "deep" to the main thread because Maximum call stack size exceeded.\n',
+        "error: [deep] main.ts:3:26: RangeError: Maximum call stack size exceeded.\nerror: [deep] could not hand its result to the main thread\n",
       );
       const unreadable = yield* runTaskProcess(project, "unreadable.ts");
       expect(unreadable.exitCode).toBe(1);
-      expect(unreadable.standardError).toContain(
-        '[unreadable] error TaskResultNotHandedOver: could not hand the result of "unreadable" to the main thread because a thrown value that has no message\n',
+      expect(unreadable.standardError).toMatch(
+        /^error: \[unreadable\] unreadable\.ts:\d+:\d+: UntaggedFailure: a thrown value that has no message\nerror: \[unreadable\] could not hand its result to the main thread$/mu,
       );
     }),
   ),
@@ -235,18 +280,16 @@ export default Task.make({ name: "main", run: Effect.gen(function* () { yield* u
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        "[deep] error RangeError: Maximum call stack size exceeded.\n",
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [deep] main.ts:3:26: RangeError: Maximum call stack size exceeded.",
       );
-      expect(ran.standardError).toContain("[main] error AwaitedTaskFailed: deep failed\n");
+      expect(ran.standardError).not.toContain("AwaitedTaskFailed");
       const unreadable = yield* runTaskProcess(project, "unreadable.ts");
       expect(unreadable.exitCode).toBe(1);
-      expect(unreadable.standardError).toContain(
-        '[unreadable] error TaskResultNotHandedOver: could not hand the result of "unreadable" to the main thread because a thrown value that has no message\n',
+      expect(unreadable.standardError).toMatch(
+        /^error: \[unreadable\] unreadable\.ts:\d+:\d+: UntaggedFailure: a thrown value that has no message\nerror: \[unreadable\] could not hand its result to the main thread$/mu,
       );
-      expect(unreadable.standardError).toContain(
-        "[main] error AwaitedTaskFailed: unreadable failed\n",
-      );
+      expect(unreadable.standardError).not.toContain("AwaitedTaskFailed");
     }),
   ),
 );
@@ -264,8 +307,8 @@ export default a;`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        "[b] error TaskWaitsOnItself: waits on itself through b -> a -> b",
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [b] main.ts:4:42: TaskWaitsOnItself: waits on itself through [b] -> [a] -> [b]",
       );
     }),
   ),
@@ -285,7 +328,7 @@ export default Task.make({ name: "main", run: Task.all([a, b]) });`,
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toMatch(
-        /\[(?:a\] error TaskWaitsOnItself: waits on itself through a -> b -> a|b\] error TaskWaitsOnItself: waits on itself through b -> a -> b)/u,
+        /^error: \[(?:a\] main\.ts:\d+:\d+: TaskWaitsOnItself: waits on itself through \[a\] -> \[b\] -> \[a\]|b\] main\.ts:\d+:\d+: TaskWaitsOnItself: waits on itself through \[b\] -> \[a\] -> \[b\])$/mu,
       );
       expect(ran.standardError).not.toContain("body finished");
     }),
@@ -449,10 +492,10 @@ export default Task.make({ name: "main", run: Effect.void });`,
       );
       expect(timedOut.standardError).toContain("discovery import waiting");
       expect(timedOut.exitCode).toBe(1);
-      expect(timedOut.standardError).toContain(
-        `error TaskSetupTimedOut: setup timed out after 1s while loading ${project.directory}/main.ts`,
+      expect(withSecondsNamed(withRunDirectoryNamed(timedOut.standardError, project))).toEndWith(
+        `\nerror: [main] TaskSetupTimedOut: setup timed out after 1s while loading ${project.directory}/main.ts\nfailed: 0 of 0 tasks, <seconds>\nrun: <run folder>/`,
       );
-      expect(timedOut.standardError).not.toContain("[main] started");
+      expect(timedOut.standardError).not.toMatch(/^\[main\] /mu);
     }),
   ),
   "30 seconds",
@@ -480,8 +523,9 @@ export default Task.make({ name: "main", run: Effect.log("body ran"), cleanup: "
       expect(timedOut.standardError).toContain("worker import waiting");
       expect(timedOut.exitCode).toBe(1);
       expect(timedOut.standardError).toContain(
-        `[main] error TaskSetupTimedOut: setup timed out after 10s while loading ${project.directory}/main.ts`,
+        `\nerror: [main] main.ts:8:21: TaskSetupTimedOut: setup timed out after 10s while loading ${project.directory}/main.ts`,
       );
+      expect(timedOut.standardError).not.toContain("[main] loading");
       expect(timedOut.standardError).not.toContain("body ran");
     }),
   ),
@@ -508,8 +552,8 @@ export default Task.make({ name: "main", run: Effect.log("body ran") });`,
         SETUP_LIMIT_LONGER_THAN_A_WORKER_START,
       );
       expect(timedOut.exitCode).toBe(1);
-      expect(timedOut.standardError).toContain(
-        `[main] error TaskSetupTimedOut: setup timed out after 10s while loading ${project.directory}/main.ts`,
+      expect(timedOut.standardError.split("\n")).toContain(
+        `error: [main] main.ts:8:21: TaskSetupTimedOut: setup timed out after 10s while loading ${project.directory}/main.ts`,
       );
       expect(timedOut.standardError).not.toContain("body ran");
     }),
@@ -598,7 +642,9 @@ export default Task.make({ name: "main", run: Effect.sleep("2 seconds").pipe(Eff
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain("[main] error TaskTimedOut: timed out after 1s");
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [main] main.ts:3:21: TaskTimedOut: timed out after 1s",
+      );
       expect(ran.standardError).not.toContain("own work done");
     }),
   ),
@@ -622,7 +668,9 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain("[main] got slow value");
-      expect(ran.standardError).toContain("[main] error TaskTimedOut: timed out after 1s");
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [main] main.ts:4:21: TaskTimedOut: timed out after 1s",
+      );
       expect(ran.standardError).not.toContain("own work done");
     }),
   ),
@@ -647,7 +695,9 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain("[main] got slow value");
-      expect(ran.standardError).toContain("[main] error TaskTimedOut: timed out after 1s");
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [main] main.ts:4:21: TaskTimedOut: timed out after 1s",
+      );
       expect(ran.standardError).not.toContain("own work done");
     }),
   ),

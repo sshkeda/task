@@ -1,5 +1,5 @@
 import type { Task } from "../lib/task/index.ts";
-import { findConstructingLocation } from "./find-user-locations-in-stack-traces.ts";
+import { filePathOfLocation, findMakingLocation } from "./find-user-locations-in-stack-traces.ts";
 import { isInsideTaskBody } from "./mark-task-worker-thread-contexts.ts";
 import { readTaskOptions } from "./resolve-task-options.ts";
 
@@ -39,13 +39,21 @@ export const findDefinitionNotGiven = (madeTask: Task) => definitionsNotGiven.ge
 export const recordTaskMade = (madeTask: Task) => {
   tasksMadeByName.set(madeTask.name, [
     ...(tasksMadeByName.get(madeTask.name) ?? []),
-    { task: madeTask, location: findConstructingLocation(), madeInTaskBody: isInsideTaskBody() },
+    { task: madeTask, location: findMakingLocation(), madeInTaskBody: isInsideTaskBody() },
   ]);
 };
 
-const LINE_AND_COLUMN = /(?::\d+){1,2}$/u;
-
-export const filePathOfLocation = (location: string) => location.replace(LINE_AND_COLUMN, "");
+export const recordTaskMadeIn = (madeTask: Task, filePath: string) => {
+  tasksMadeByName.set(
+    madeTask.name,
+    (tasksMadeByName.get(madeTask.name) ?? []).map((made) =>
+      made.task === madeTask
+        ? { task: made.task, location: filePath, madeInTaskBody: made.madeInTaskBody }
+        : made,
+    ),
+  );
+  return madeTask;
+};
 
 export const listTasksMadeWithName = (taskName: string) => tasksMadeByName.get(taskName) ?? [];
 

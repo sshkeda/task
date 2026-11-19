@@ -1,11 +1,14 @@
 import { Cause, Clock, Deferred, Effect, Exit, FiberSet, Option, Ref } from "effect";
-import type { Fiber, Schema } from "effect";
+import type { Fiber, Schema, Tracer } from "effect";
 
 import {
   dieOnInvariantFailure,
   InternalInvariantBroken,
 } from "../../../../../shared/invariant-errors.ts";
+import { nameTask } from "../../../../../shared/label-lines.ts";
+import { TASK_TRACE_LABEL_PREFIX } from "../../../../../shared/names-from-package-json.ts";
 import type { WorkerExited } from "../../../../../shared/process-errors.ts";
+import { describeTraceFailure } from "../../../../../shared/report-cause.ts";
 import type { TaskEvent, TaskFiberResult } from "../../../../../shared/rpc.ts";
 import { isAwaitedTasksFailure } from "../../../../../shared/task-errors.ts";
 import type {
@@ -13,8 +16,14 @@ import type {
   TaskBodyFailed,
   TaskCleanupFailed,
 } from "../../../../../shared/task-errors.ts";
+import {
+  endTaskSpan,
+  recordTaskSpanFailure,
+  startTaskSpan,
+} from "../../../../../shared/task-spans.ts";
 import type { findTasksMadeByRootTaskFile } from "../../../shared/find-tasks-made-by-root-task-file.ts";
 import type { WorkerTerminatedForAnotherTask } from "../../../shared/main-thread-errors.ts";
+import { printTaskEnd, printTaskStart } from "../../../shared/write-task-output-files.ts";
 import {
   isOnWorker,
   moveTaskRunOutcome,
@@ -24,10 +33,17 @@ import {
   TaskRunOutcomeEvent,
   TaskRunStatus,
 } from "./define-task-run-status.ts";
-import { hasCleanupStarted, moveTaskStopStage, TaskStopStage } from "./define-task-stop-stage.ts";
+import {
+  findStopRequestedAt,
+  hasCleanupStarted,
+  moveTaskStopStage,
+  TaskStopStage,
+} from "./define-task-stop-stage.ts";
 import type { TaskStopEvent } from "./define-task-stop-stage.ts";
 import { makeStopwatch } from "./make-stopwatch.ts";
 import { makeRootTaskStandardInput } from "./share-standard-input-with-root-task.ts";
+
+const STOP_FINISHED_EVENT = "stop finished";
 
 const makeTaskStop = () => {
   const stage = Ref.makeUnsafe<typeof TaskStopStage.Type>(TaskStopStage.cases.NotAsked.make({}));
@@ -51,6 +67,7 @@ const makeTaskStop = () => {
 export const makeTaskRun = (initial: {
   readonly status: typeof TaskRunStatus.Type;
   readonly outcome: typeof TaskRunOutcome.Type;
+  readonly taskSpan: Tracer.Span;
 }) => ({
   ...initial,
   awaitedTaskNames: new Array<string>(),
@@ -69,6 +86,11 @@ export const makeTaskRun = (initial: {
   bodyStartedAtMillisecondsDeferred: Deferred.makeUnsafe<number>(),
   stop: makeTaskStop(),
   bodyFinishedDeferred: Deferred.makeUnsafe<void>(),
+  cleanupSpan: Ref.makeUnsafe<Tracer.Span | null>(null),
+  hasExecutionEnded: false,
+  hasWorkerEndedTask: false,
+  hasPrintedStart: false,
+  hasEnded: false,
 });
 
 export const findAssignedWorkerId = (status: typeof TaskRunStatus.Type) =>
@@ -91,18 +113,6 @@ export const findTaskNamesOccupyingWorker = (
     .filter(([, taskRun]) => isUnfinishedOnWorker(taskRun, workerId) && isOccupyingWorker(taskRun))
     .map(([taskName]) => taskName);
 
-export const formatWaitingForWorker = (
-  workerId: number,
-  longestOccupyingTaskName: string,
-  otherTaskNames: readonly string[],
-) => {
-  const others =
-    otherTaskNames.length === 0
-      ? ""
-      : ` and ${otherTaskNames.length} other task${otherTaskNames.length === 1 ? "" : "s"}`;
-  return `waiting for worker ${workerId}, which is running "${longestOccupyingTaskName}"${others}`;
-};
-
 export const countWorkerLoad = (
   unfinishedTaskRunsOnWorker: readonly ReturnType<typeof makeTaskRun>[],
 ) => ({
@@ -114,7 +124,7 @@ export const countWorkerLoad = (
 const formatServedForTrace = (status: typeof TaskRunStatus.Type) =>
   TaskRunStatus.guards.Closed(status) ? "closed" : "serving";
 
-export const formatTaskRunForTrace = (taskRun: {
+const formatTaskRunForTrace = (taskRun: {
   readonly status: typeof TaskRunStatus.Type;
   readonly outcome: typeof TaskRunOutcome.Type;
 }) =>
@@ -125,6 +135,9 @@ export const formatTaskRunForTrace = (taskRun: {
     Failed: () => "failed",
     Cancelled: () => "cancelled",
   });
+
+const nameStateOnEndedLine = (state: ReturnType<typeof formatTaskRunForTrace>) =>
+  state === "cancelled" ? "stopped" : state;
 
 const withReadOnlyStatus = (
   taskRun: ReturnType<typeof makeTaskRun>,
@@ -139,13 +152,47 @@ const requireAssignedWorkerId = (taskName: string, status: typeof TaskRunStatus.
     ? Effect.die(
         new InternalInvariantBroken({
           area: "task lifecycle",
-          invariant: `"${taskName}" has an assigned worker before its body completes`,
+          invariant: `${nameTask(taskName)} has an assigned worker before its body completes`,
         }),
       )
     : Effect.succeed(workerId);
 };
 
 const hasBodyFinished = TaskRunStatus.isAnyOf(["Closed", "Finished"]);
+
+const endCleanupSpan = (taskRun: ReturnType<typeof makeTaskRun>) =>
+  Effect.gen(function* () {
+    const cleanupSpan = yield* Ref.get(taskRun.cleanupSpan);
+    if (cleanupSpan === null) {
+      return;
+    }
+    if (findStopRequestedAt(taskRun.stop.readStage()) !== null) {
+      cleanupSpan.event(STOP_FINISHED_EVENT, yield* Clock.currentTimeNanos, {});
+    }
+    yield* endTaskSpan(cleanupSpan);
+  });
+
+const printEndAndEndSpans = (taskName: string, taskRun: ReturnType<typeof makeTaskRun>) =>
+  Effect.gen(function* () {
+    const state = formatTaskRunForTrace(taskRun);
+    const endsWithoutClosedLine =
+      taskRun.hasPrintedStart && !TaskRunStatus.guards.Closed(taskRun.status);
+    if (endsWithoutClosedLine) {
+      yield* printTaskEnd(taskName, nameStateOnEndedLine(state));
+    }
+    yield* endCleanupSpan(taskRun);
+    taskRun.taskSpan.attribute(`${TASK_TRACE_LABEL_PREFIX}.state`, state);
+    yield* endTaskSpan(taskRun.taskSpan);
+  });
+
+const endTaskRun = (taskName: string, taskRun: ReturnType<typeof makeTaskRun>) =>
+  Effect.suspend(() => {
+    if (taskRun.hasEnded) {
+      return Effect.void;
+    }
+    taskRun.hasEnded = true;
+    return printEndAndEndSpans(taskName, taskRun);
+  }).pipe(Effect.uninterruptible);
 
 export const makeTaskRunsState = Effect.gen(function* () {
   const discoveredTasksByName: Effect.Success<ReturnType<typeof findTasksMadeByRootTaskFile>> =
@@ -177,10 +224,21 @@ export const makeTaskRunsState = Effect.gen(function* () {
       }
       return action;
     }).pipe(Effect.uninterruptible);
-  const moveOutcome = (taskName: string, event: typeof TaskRunOutcomeEvent.Type) => {
+  const moveOutcome = (
+    taskName: string,
+    event: typeof TaskRunOutcomeEvent.Type,
+    failure: Parameters<typeof recordTaskSpanFailure>[1] | null = null,
+  ) => {
     const taskRun = taskRunsByName.get(taskName);
-    if (taskRun !== undefined) {
-      taskRun.outcome = moveTaskRunOutcome(taskRun.outcome, event)[0];
+    if (taskRun === undefined) {
+      return;
+    }
+    const [next, action] = moveTaskRunOutcome(taskRun.outcome, event);
+    taskRun.outcome = next;
+    const failedNow =
+      failure !== null && action !== "ignored" && TaskRunOutcome.guards.Failed(next);
+    if (failedNow) {
+      recordTaskSpanFailure(taskRun.taskSpan, failure);
     }
   };
   return {
@@ -192,10 +250,11 @@ export const makeTaskRunsState = Effect.gen(function* () {
     runSpan: yield* Effect.currentSpan.pipe(
       dieOnInvariantFailure("task runs", "task execution has a run span"),
     ),
-    createRecord: (taskName: string) => {
+    createRecord: (taskName: string, taskSpan: Tracer.Span) => {
       const taskRun = makeTaskRun({
         status: TaskRunStatus.cases.Preparing.make({}),
         outcome: TaskRunOutcome.cases.Pending.make({}),
+        taskSpan,
       });
       taskRunsByName.set(taskName, taskRun);
       return withReadOnlyStatus(taskRun);
@@ -208,7 +267,7 @@ export const makeTaskRunsState = Effect.gen(function* () {
           return yield* Effect.die(
             new InternalInvariantBroken({
               area: "task lifecycle",
-              invariant: `"${taskName}" is waiting before worker assignment`,
+              invariant: `${nameTask(taskName)} is waiting before worker assignment`,
             }),
           );
         }
@@ -247,6 +306,10 @@ export const makeTaskRunsState = Effect.gen(function* () {
       Effect.sync(() => {
         moveOutcome(taskName, TaskRunOutcomeEvent.cases.Serve.make({}));
       }),
+    markServedStopped: (taskName: string) =>
+      Effect.sync(() => {
+        moveOutcome(taskName, TaskRunOutcomeEvent.cases.StopServed.make({}));
+      }),
     markPassed: (taskName: string) =>
       Effect.gen(function* () {
         const taskRun = taskRunsByName.get(taskName);
@@ -274,14 +337,82 @@ export const makeTaskRunsState = Effect.gen(function* () {
             isAwaitedTasksFailure,
           ),
         }),
+        describeTraceFailure(taskExit.cause),
       );
     },
+    printStart: (taskName: string) =>
+      Effect.gen(function* () {
+        const taskRun = taskRunsByName.get(taskName);
+        if (taskRun === undefined) {
+          return;
+        }
+        yield* printTaskStart(taskName);
+        taskRun.hasPrintedStart = true;
+      }).pipe(Effect.uninterruptible),
+    endTaskSpanAfterExecution: (taskName: string) =>
+      Effect.gen(function* () {
+        const taskRun = taskRunsByName.get(taskName);
+        if (taskRun === undefined) {
+          return;
+        }
+        taskRun.hasExecutionEnded = true;
+        const isOffWorker =
+          taskRun.hasWorkerEndedTask || TaskRunStatus.guards.Preparing(taskRun.status);
+        if (isOffWorker) {
+          yield* endTaskRun(taskName, taskRun);
+        }
+      }),
+    endTaskSpanAfterWorker: (taskName: string) =>
+      Effect.gen(function* () {
+        const taskRun = taskRunsByName.get(taskName);
+        if (taskRun === undefined) {
+          return;
+        }
+        taskRun.hasWorkerEndedTask = true;
+        yield* endCleanupSpan(taskRun);
+        if (taskRun.hasExecutionEnded) {
+          yield* endTaskRun(taskName, taskRun);
+        }
+      }),
+    openCleanupSpan: (taskName: string, startTime: bigint) =>
+      Effect.gen(function* () {
+        const taskRun = taskRunsByName.get(taskName);
+        if (taskRun === undefined) {
+          return null;
+        }
+        const openedCleanupSpan = yield* Ref.get(taskRun.cleanupSpan);
+        if (openedCleanupSpan !== null) {
+          return openedCleanupSpan;
+        }
+        const cleanupSpan = yield* startTaskSpan("cleanup", `cleanup ${taskName}`, {
+          parent: taskRun.taskSpan,
+          attributes: { [`${TASK_TRACE_LABEL_PREFIX}.task`]: taskName },
+          startTime,
+        });
+        yield* Ref.set(taskRun.cleanupSpan, cleanupSpan);
+        return cleanupSpan;
+      }),
+    recordCleanupFailure: (
+      taskName: string,
+      failure: { readonly _tag: string; readonly message: string },
+    ) =>
+      Effect.gen(function* () {
+        const taskRun = taskRunsByName.get(taskName);
+        const cleanupSpan = taskRun === undefined ? null : yield* Ref.get(taskRun.cleanupSpan);
+        if (cleanupSpan !== null) {
+          recordTaskSpanFailure(cleanupSpan, describeTraceFailure(Cause.fail(failure)));
+        }
+      }),
     recordFailureReachedAwaitingTask: (taskName: string) => {
       taskNamesWhoseFailureReachedAnAwaitingTask.add(taskName);
     },
-    markFailed: (taskName: string) =>
+    markFailed: (taskName: string, failure: { readonly _tag: string; readonly message: string }) =>
       Effect.sync(() => {
-        moveOutcome(taskName, TaskRunOutcomeEvent.cases.Fail.make({}));
+        moveOutcome(
+          taskName,
+          TaskRunOutcomeEvent.cases.Fail.make({}),
+          describeTraceFailure(Cause.fail(failure)),
+        );
       }),
   };
 });

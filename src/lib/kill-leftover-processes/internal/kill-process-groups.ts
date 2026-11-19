@@ -3,8 +3,9 @@ import { Effect } from "effect";
 import { processIdentityKey } from "../../../shared/claim-processes-to-report.ts";
 import type { ProcessIdentity } from "../../../shared/claim-processes-to-report.ts";
 import { formatFailureLines } from "../../../shared/format-error-lines.ts";
+import { labelLine } from "../../../shared/label-lines.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
-import { printLine } from "../../../shared/print-to-standard-error.ts";
+import { printLine, printLineAboutTask } from "../../../shared/print-to-standard-error.ts";
 import type { RunMarker } from "../../../shared/run-marker.ts";
 import {
   LeftoverProcessEvent,
@@ -17,7 +18,13 @@ import {
   ProcessGroupEvent,
   ProcessGroupStage,
 } from "./define-process-group-stage.ts";
+import { TrackedProcessGroupEvent } from "./define-tracked-process-group-stage.ts";
 import { findDescendantProcessIds, findSessionProcessIds } from "./find-process-ids.ts";
+import {
+  claimUnknownOwnership,
+  describeUnknownOwnership,
+  findPossibleRunProcesses,
+} from "./find-unknown-ownership.ts";
 import {
   isStillListedAs,
   listProcesses,
@@ -26,7 +33,7 @@ import {
 import { findMarkedProcesses } from "./mark-run-processes.ts";
 import { ProcessNotKillable } from "./process-cleanup-errors.ts";
 import { sendSignal } from "./send-signal.ts";
-import { findStartedGroupWitness } from "./started-process-groups.ts";
+import { findStartedGroupWitness, moveTrackedProcessGroup } from "./started-process-groups.ts";
 import type { startedProcessGroup } from "./started-process-groups.ts";
 
 const PROBE_SIGNAL = 0;
@@ -44,21 +51,26 @@ const reportKilledProcesses = (
     (killResult) =>
       Effect.gen(function* () {
         const isKilled = killResult.action === "reportKilled";
-        const startedBy = `started by ${killResult.ownerTaskName === null ? "no known task" : `"${killResult.ownerTaskName}"`}`;
+        const killedProcess = `${killResult.processId} (${killResult.command})`;
         yield* isKilled
-          ? printLine(
-              "Info",
-              `killed ${killResult.processId} (${killResult.command}), ${startedBy}`,
+          ? printLineAboutTask(
+              killResult.ownerTaskName,
+              labelLine(
+                "killed",
+                killResult.ownerTaskName,
+                killResult.ownerTaskName === null
+                  ? `${killedProcess}, started by no known task`
+                  : killedProcess,
+              ),
             )
-          : printLine(
-              "Error",
+          : printLineAboutTask(
+              killResult.ownerTaskName,
               formatFailureLines(
                 new ProcessNotKillable({
                   processId: killResult.processId,
                   command: killResult.command,
                   ownerTaskName: killResult.ownerTaskName,
                 }),
-                null,
               ),
             );
         yield* Effect.logInfo(isKilled ? "process killed" : "process could not be killed").pipe(
@@ -74,7 +86,25 @@ const reportKilledProcesses = (
     { discard: true },
   );
 
-const probeProcessGroups = Effect.fn("probeProcessGroups")(function* (
+const reportUnknownOwnership = (
+  listedProcesses: Effect.Success<ReturnType<typeof listProcesses>>,
+  possibleRunProcesses: ReadonlyMap<number, unknown>,
+  claimUnknownOwnershipToReport: Parameters<typeof claimUnknownOwnership>[1],
+) =>
+  describeUnknownOwnership(listedProcesses, possibleRunProcesses).pipe(
+    Effect.flatMap((unknownOwnerships) =>
+      claimUnknownOwnership(unknownOwnerships, claimUnknownOwnershipToReport),
+    ),
+    Effect.flatMap((claimed) =>
+      Effect.forEach(
+        claimed,
+        (unknownOwnership) => printLine(formatFailureLines(unknownOwnership)),
+        { discard: true },
+      ),
+    ),
+  );
+
+const probeProcessGroups = Effect.fn(function* (
   taskName: string | null,
   selectedProcessGroups: ReadonlyMap<number, ReturnType<typeof startedProcessGroup>>,
   sendSignalNow: typeof sendSignal,
@@ -91,25 +121,28 @@ const probeProcessGroups = Effect.fn("probeProcessGroups")(function* (
   );
 });
 
-const findEndedProcessGroupIds = (
+const findEndedProcessGroups = (
   groups: readonly {
     readonly processGroupId: number;
+    readonly startedGroup: ReturnType<typeof startedProcessGroup>;
     readonly stage: typeof ProcessGroupStage.Type;
   }[],
 ) =>
-  new Set(
+  new Map(
     groups
       .filter((group) => ProcessGroupStage.guards.Ended(group.stage))
-      .map((group) => group.processGroupId),
+      .map((group) => [group.processGroupId, group.startedGroup] as const),
   );
 
-const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(function* (input: {
+const terminateSelectedProcesses = Effect.fn(function* (input: {
   readonly startedProcessGroups: ReadonlyMap<number, ReturnType<typeof startedProcessGroup>>;
   readonly probedGroups: Effect.Success<ReturnType<typeof probeProcessGroups>>;
   readonly ownsProcess: (ownerTaskName: string | null) => boolean;
   readonly taskName: string | null;
   readonly sessionId: number | null;
   readonly runMarker: typeof RunMarker.Type | null;
+  readonly killsMarkedProcesses: boolean;
+  readonly claimUnknownOwnershipToReport: Parameters<typeof claimUnknownOwnership>[1] | null;
   readonly adoptingProcessId: number | null;
   readonly listProcessesNow: typeof listProcesses;
   readonly sendSignalNow: typeof sendSignal;
@@ -129,28 +162,54 @@ const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(funct
       : findChildProcessIds([input.adoptingProcessId]).filter(
           (processId) => processId !== process.pid,
         );
+  const probedGroupIds = new Set(input.probedGroups.map((group) => group.processGroupId));
+  const { markedProcesses, markedIdentities, unreadableProcesses } = yield* findMarkedProcesses(
+    input.runMarker,
+    input.killsMarkedProcesses
+      ? listedProcesses
+      : new Map(
+          [...listedProcesses].filter(([, listedProcess]) =>
+            probedGroupIds.has(listedProcess.processGroupId),
+          ),
+        ),
+  );
   const witnessedGroups = input.probedGroups.map((group) => ({
     ...group,
     stage: moveProcessGroupStage(
       group.stage,
       ProcessGroupEvent.cases.FindWitness.make({
         witness: ProcessGroupStage.guards.ProbedAlive(group.stage)
-          ? findStartedGroupWitness(listedProcesses, group.processGroupId, group.startedGroup)
+          ? findStartedGroupWitness(
+              listedProcesses,
+              group.processGroupId,
+              group.startedGroup,
+              markedIdentities,
+            )
           : null,
       }),
     )[0],
   }));
+  const recheckedGroups = yield* Effect.forEach(witnessedGroups, (group) =>
+    ProcessGroupStage.guards.WitnessFound(group.stage)
+      ? Effect.map(isStillListedAs(input.taskName, group.stage.witness), (isStillTheSame) => ({
+          ...group,
+          stage: moveProcessGroupStage(
+            group.stage,
+            ProcessGroupEvent.cases.Recheck.make({ isStillTheSame }),
+          )[0],
+        }))
+      : Effect.succeed(group),
+  );
   const killableGroups = new Map(
-    witnessedGroups
-      .filter((group) => ProcessGroupStage.guards.WitnessFound(group.stage))
+    recheckedGroups
+      .filter((group) => ProcessGroupStage.guards.StillTheSame(group.stage))
       .map((group) => [group.processGroupId, group.startedGroup.taskName] as const),
   );
 
-  const markedProcesses = yield* findMarkedProcesses(input.runMarker, listedProcesses.keys());
   const processIds = [
     ...findDescendantProcessIds(listedProcesses, [...childProcessIds, ...adoptedProcessIds]),
     ...findSessionProcessIds(listedProcesses, input.sessionId),
-    ...markedProcesses.keys(),
+    ...(input.killsMarkedProcesses ? markedProcesses.keys() : []),
     ...[...listedProcesses]
       .filter(([, listedProcess]) => killableGroups.has(listedProcess.processGroupId))
       .map(([processId]) => processId),
@@ -161,10 +220,6 @@ const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(funct
       const isGone = listedProcess === undefined || listedProcess.hasEnded;
       return isGone ? [] : [[processId, listedProcess] as const];
     }),
-  );
-  yield* Effect.annotateCurrentSpan(
-    `${TASK_TRACE_LABEL_PREFIX}.processes.listed`,
-    processRows.size,
   );
 
   const findOwner = (processId: number): string | null => {
@@ -217,17 +272,6 @@ const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(funct
           : [];
       }),
   )).flat();
-  const recheckedGroups = yield* Effect.forEach(witnessedGroups, (group) =>
-    ProcessGroupStage.guards.WitnessFound(group.stage)
-      ? Effect.map(isStillListedAs(input.taskName, group.stage.witness), (isStillTheSame) => ({
-          ...group,
-          stage: moveProcessGroupStage(
-            group.stage,
-            ProcessGroupEvent.cases.Recheck.make({ isStillTheSame }),
-          )[0],
-        }))
-      : Effect.succeed(group),
-  );
   const signalledLeftovers = yield* Effect.forEach(leftovers, (leftover) =>
     Effect.gen(function* () {
       const [rechecked] = moveLeftoverProcessStage(
@@ -301,35 +345,57 @@ const terminateSelectedProcesses = Effect.fn("terminateSelectedProcesses")(funct
     return isReported ? [{ ...killResult, action }] : [];
   });
   const killed = reportedResults.filter((killResult) => killResult.action === "reportKilled");
-  yield* Effect.annotateCurrentSpan({
-    [`${TASK_TRACE_LABEL_PREFIX}.processes.killed`]: killed.length,
-    [`${TASK_TRACE_LABEL_PREFIX}.processes.killed.executable_names`]: killed.map(
-      (killResult) => killResult.command,
-    ),
-  });
+  yield* Effect.logInfo("listed processes to clean up").pipe(
+    Effect.annotateLogs({
+      ...(input.taskName === null ? {} : { [`${TASK_TRACE_LABEL_PREFIX}.task`]: input.taskName }),
+      [`${TASK_TRACE_LABEL_PREFIX}.processes.listed`]: processRows.size,
+      [`${TASK_TRACE_LABEL_PREFIX}.processes.killed`]: killed.length,
+      [`${TASK_TRACE_LABEL_PREFIX}.processes.killed.executable_names`]: killed.map(
+        (killResult) => killResult.command,
+      ),
+    }),
+  );
   yield* reportKilledProcesses(reportedResults);
-  return findEndedProcessGroupIds(checkedGroups);
+  if (input.claimUnknownOwnershipToReport !== null) {
+    yield* reportUnknownOwnership(
+      listedProcesses,
+      findPossibleRunProcesses(listedProcesses, unreadableProcesses, [
+        ...childProcessIds,
+        ...adoptedProcessIds,
+        ...(input.adoptingProcessId === null ? [] : [input.adoptingProcessId]),
+        ...processIds,
+      ]),
+      input.claimUnknownOwnershipToReport,
+    );
+  }
+  return findEndedProcessGroups(checkedGroups);
 });
 
 export const forgetEndedProcessGroups =
   (startedProcessGroups: Map<number, ReturnType<typeof startedProcessGroup>>) =>
-  (endedProcessGroupIds: ReadonlySet<number>) =>
-    Effect.sync(() => {
-      for (const endedProcessGroupId of endedProcessGroupIds) {
-        startedProcessGroups.delete(endedProcessGroupId);
-      }
-    });
+  (endedProcessGroups: ReadonlyMap<number, ReturnType<typeof startedProcessGroup>>) =>
+    Effect.sync(() =>
+      [...endedProcessGroups].flatMap(([processGroupId, endedGroup]) =>
+        moveTrackedProcessGroup(
+          startedProcessGroups,
+          processGroupId,
+          TrackedProcessGroupEvent.cases.End.make({ endedGroup }),
+        ) === "share"
+          ? [processGroupId]
+          : [],
+      ),
+    );
 
-export const killTaskProcessGroups = Effect.fn("killTaskProcessGroups")(function* (
+export const killTaskProcessGroups = Effect.fn(function* (
   startedProcessGroups: ReadonlyMap<number, ReturnType<typeof startedProcessGroup>>,
   taskName: string,
   claimProcessesToReport: Parameters<
     typeof terminateSelectedProcesses
   >[0]["claimProcessesToReport"],
+  runMarker: typeof RunMarker.Type | null,
   listProcessesNow: typeof listProcesses = listProcesses,
   sendSignalNow: typeof sendSignal = sendSignal,
 ) {
-  yield* Effect.annotateCurrentSpan(`${TASK_TRACE_LABEL_PREFIX}.task`, taskName);
   const probedGroups = yield* probeProcessGroups(
     taskName,
     new Map(
@@ -337,29 +403,31 @@ export const killTaskProcessGroups = Effect.fn("killTaskProcessGroups")(function
     ),
     sendSignalNow,
   );
-  const endedProcessGroupIds = findEndedProcessGroupIds(probedGroups);
+  const endedProcessGroups = findEndedProcessGroups(probedGroups);
   const liveGroups = probedGroups.filter((group) =>
     ProcessGroupStage.guards.ProbedAlive(group.stage),
   );
   if (liveGroups.length === 0) {
-    return endedProcessGroupIds;
+    return endedProcessGroups;
   }
-  const terminatedProcessGroupIds = yield* terminateSelectedProcesses({
+  const terminatedProcessGroups = yield* terminateSelectedProcesses({
     startedProcessGroups,
     probedGroups: liveGroups,
     ownsProcess: (ownerTaskName) => ownerTaskName === taskName,
     taskName,
     sessionId: null,
-    runMarker: null,
+    runMarker,
+    killsMarkedProcesses: false,
+    claimUnknownOwnershipToReport: null,
     adoptingProcessId: null,
     listProcessesNow,
     sendSignalNow,
     claimProcessesToReport,
   });
-  return new Set([...endedProcessGroupIds, ...terminatedProcessGroupIds]);
+  return new Map([...endedProcessGroups, ...terminatedProcessGroups]);
 });
 
-export const killAllProcessGroups = Effect.fn("killAllProcessGroups")(function* (
+export const killAllProcessGroups = Effect.fn(function* (
   startedProcessGroups: ReadonlyMap<number, ReturnType<typeof startedProcessGroup>>,
   claimProcessesToReport: Parameters<
     typeof terminateSelectedProcesses
@@ -367,19 +435,22 @@ export const killAllProcessGroups = Effect.fn("killAllProcessGroups")(function* 
   sessionId: number | null,
   runMarker: typeof RunMarker.Type | null,
   adoptingProcessId: number | null,
+  claimUnknownOwnershipToReport: Parameters<typeof claimUnknownOwnership>[1],
 ) {
   const probedGroups = yield* probeProcessGroups(null, startedProcessGroups, sendSignal);
-  const terminatedProcessGroupIds = yield* terminateSelectedProcesses({
+  const terminatedProcessGroups = yield* terminateSelectedProcesses({
     startedProcessGroups,
     probedGroups: probedGroups.filter((group) => ProcessGroupStage.guards.ProbedAlive(group.stage)),
     ownsProcess: () => true,
     taskName: null,
     sessionId,
     runMarker,
+    killsMarkedProcesses: true,
+    claimUnknownOwnershipToReport,
     adoptingProcessId,
     listProcessesNow: listProcesses,
     sendSignalNow: sendSignal,
     claimProcessesToReport,
   });
-  return new Set([...findEndedProcessGroupIds(probedGroups), ...terminatedProcessGroupIds]);
+  return new Map([...findEndedProcessGroups(probedGroups), ...terminatedProcessGroups]);
 });

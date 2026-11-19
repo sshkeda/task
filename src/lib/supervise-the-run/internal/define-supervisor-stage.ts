@@ -23,6 +23,7 @@ const LiveStage = Schema.TaggedUnion(LIVE_STAGES);
 export const SupervisorStage = Schema.TaggedUnion({
   ...LIVE_STAGES,
   Suspended: { resumeTo: LiveStage },
+  SweepingBeforeExit: {},
   SweepingAfterExit: {},
   SweepingAfterGrace: {},
   SweepingAfterFailure: {},
@@ -32,6 +33,7 @@ export const SupervisorStage = Schema.TaggedUnion({
 
 export const SupervisorEvent = Schema.TaggedUnion({
   AcknowledgeStop: { signal: StopSignal },
+  ChangeChild: {},
   EndSweep: {},
   Exit: { bySignal: Schema.Boolean },
   FailJobControl: {},
@@ -40,10 +42,13 @@ export const SupervisorEvent = Schema.TaggedUnion({
   ReportReady: {},
   Resume: {},
   Stop: { signal: StopSignal },
+  StopTerminalCommand: {},
   Suspend: {},
+  SweepBeforeExit: {},
 });
 
 export const SupervisorAction = Schema.TaggedUnion({
+  FindStoppedTerminalCommands: {},
   Forward: { signal: StopSignal },
   Ignore: {},
   None: {},
@@ -183,9 +188,16 @@ const moveOnStop = (stage: typeof LiveStage.Type, signal: (typeof STOP_SIGNALS)[
   });
 };
 
+const suspend = (stage: typeof LiveStage.Type) =>
+  to(
+    SupervisorStage.cases.Suspended.make({ resumeTo: stage }),
+    SupervisorAction.cases.Suspend.make({}),
+  );
+
 const moveLive = (stage: typeof LiveStage.Type, event: typeof SupervisorEvent.Type) =>
   SupervisorEvent.match(event, {
     AcknowledgeStop: ({ signal }) => moveOnAcknowledge(stage, signal),
+    ChangeChild: () => to(stage, SupervisorAction.cases.FindStoppedTerminalCommands.make({})),
     EndSweep: () => ignore(stage),
     Exit: ({ bySignal }) => moveOnExit(stage, bySignal),
     FailJobControl: () => sweep(SupervisorStage.cases.SweepingAfterFailure.make({})),
@@ -198,16 +210,18 @@ const moveLive = (stage: typeof LiveStage.Type, event: typeof SupervisorEvent.Ty
         : releaseHeld(stage),
     Resume: () => to(stage, SupervisorAction.cases.Resume.make({})),
     Stop: ({ signal }) => moveOnStop(stage, signal),
-    Suspend: () =>
-      to(
-        SupervisorStage.cases.Suspended.make({ resumeTo: stage }),
-        SupervisorAction.cases.Suspend.make({}),
-      ),
+    StopTerminalCommand: () => suspend(stage),
+    Suspend: () => suspend(stage),
+    SweepBeforeExit: () =>
+      isForced(stage) ? none(SupervisorStage.cases.SweepingBeforeExit.make({})) : ignore(stage),
   });
 
 const moveSuspended = (resumeTo: typeof LiveStage.Type, event: typeof SupervisorEvent.Type) => {
   if (SupervisorEvent.guards.Resume(event)) {
     return to(resumeTo, SupervisorAction.cases.Resume.make({}));
+  }
+  if (SupervisorEvent.guards.StopTerminalCommand(event)) {
+    return ignore(SupervisorStage.cases.Suspended.make({ resumeTo }));
   }
   const [next, action] = SupervisorEvent.guards.Suspend(event)
     ? to(resumeTo, SupervisorAction.cases.Suspend.make({}))
@@ -236,6 +250,10 @@ export const moveSupervisorStage = (
     Forced: (live) => moveLive(live, event),
     Swept: (live) => moveLive(live, event),
     Suspended: ({ resumeTo }) => moveSuspended(resumeTo, event),
+    SweepingBeforeExit: () =>
+      SupervisorEvent.guards.Exit(event)
+        ? none(SupervisorStage.cases.SweepingAfterExit.make({}))
+        : endSweep(stage, SupervisorStage.cases.Swept.make({}), event),
     SweepingAfterExit: () => endSweep(stage, SupervisorStage.cases.Done.make({}), event),
     SweepingAfterGrace: () => endSweep(stage, SupervisorStage.cases.Swept.make({}), event),
     SweepingAfterFailure: () => endSweep(stage, SupervisorStage.cases.Failed.make({}), event),

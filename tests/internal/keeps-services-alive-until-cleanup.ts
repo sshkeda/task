@@ -9,6 +9,7 @@ import { findKilledProcesses } from "../shared/find-killed-processes.ts";
 import { isProcessAlive } from "../shared/is-process-alive.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
+import { readShellExecutableName } from "../shared/read-shell-executable-name.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 
 export const users = makeTest(
@@ -33,13 +34,13 @@ export default Task.make({ name: "main", run: Effect.all([first, second], { conc
 
       const told = ran.standardError
         .split("\n")
-        .filter((line) => / (?:up|used \d+|down|closed)$/u.test(line));
+        .filter((line) => / (?:up|used \d+|down)$|^closed: /u.test(line));
       expect(told).toEqual([
         "[server] server up",
         "[first] first used 1234",
         "[second] second used 1234",
         "[server] server down",
-        "[server] closed",
+        "closed: [server]",
       ]);
     }),
   ),
@@ -97,12 +98,12 @@ export default Task.make({ name: "main", run: ${mainBody} });`,
           expect(ran.exitCode, variant).toBe(variant === "fails" ? 1 : 0);
           const told = ran.standardError
             .split("\n")
-            .filter((line) => / (?:down.*|closed)$/u.test(line));
+            .filter((line) => / down.*$|^closed: /u.test(line));
           expect(told, `${variant}\n${ran.standardError}`).toEqual([
             "[server] server down, used db-url",
-            "[server] closed",
+            "closed: [server]",
             "[database] database down",
-            "[database] closed",
+            "closed: [database]",
           ]);
         }),
       ),
@@ -175,12 +176,12 @@ export default Task.make({ name: "main", run: server.pipe(Effect.andThen(${fails
           const ran = yield* runTaskProcess(project, "main.ts");
           expect(ran.exitCode, ran.standardError).toBe(fails ? 1 : 0);
           expect(
-            ran.standardError.split("\n").filter((line) => / (?:down.*|closed)$/u.test(line)),
+            ran.standardError.split("\n").filter((line) => / down.*$|^closed: /u.test(line)),
           ).toEqual([
             "[server] server down, used db-url",
-            "[server] closed",
+            "closed: [server]",
             "[database] database down",
-            "[database] closed",
+            "closed: [database]",
           ]);
         }),
       ),
@@ -218,13 +219,13 @@ export default Task.make({ name: "main", run: Effect.andThen(server, Effect.gen(
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(1);
       expect(ran.standardError).toContain(
-        "[database] error ServingTaskRequestsItself: requests itself while serving through database -> server -> database, so task cannot stop each of them after the tasks that requested it\n",
+        "\nerror: [database] main.ts:5:30: ServingTaskRequestsItself: requests itself while serving through [database] -> [server] -> [database], so task cannot stop each of them after the tasks that requested it\n",
       );
       expect(ran.standardError).toContain("[server] server down\n");
       expect(ran.standardError).toContain("[database] database down\n");
-      expect(ran.standardError).toContain("[server] closed\n");
-      expect(ran.standardError).toContain("[database] database down\n[database] closed\n");
-      expect(ran.standardError).toMatch(/^failed: database \(1 of 3 tasks\), [\d.]+s$/mu);
+      expect(ran.standardError).toContain("closed: [server]\n");
+      expect(ran.standardError).toContain("[database] database down\nclosed: [database]\n");
+      expect(ran.standardError).toMatch(/^failed: \[database\] \(1 of 3 tasks\), [\d.]+s$/mu);
     }),
   ),
 );
@@ -254,7 +255,7 @@ export default Task.make({ name: "main", run: Effect.andThen(api, Effect.gen(fun
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(0);
       expect(ran.standardError).toContain("[api] seeded http://api\n");
-      expect(ran.standardError).toContain("[api] api down\n[api] closed\n");
+      expect(ran.standardError).toContain("[api] api down\nclosed: [api]\n");
       expect(ran.standardError).not.toContain("ServingTaskRequestsItself");
       expect(ran.standardError).toMatch(/^passed: 3 tasks, [\d.]+s$/mu);
     }),
@@ -277,8 +278,8 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       });
 
       const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.standardError).toContain("[main] cleaned up\n[main] passed in");
-      expect(ran.standardError).not.toContain("killed ");
+      expect(ran.standardError).toMatch(/\[main\] cleaned up\npassed: 1 task, /u);
+      expect(ran.standardError).not.toContain("killed:");
     }),
   ),
 );
@@ -301,7 +302,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
 
       const command = yield* startTaskProcess(project, "main.ts");
       const gate = yield* fileSystem.open(`${project.directory}/gate`, { flag: "r+" });
-      yield* command.waitForLine("main is serving");
+      yield* command.waitForLine("serving: [main],");
       const timeoutWitness = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
@@ -309,14 +310,15 @@ export const witness = Task.make({ name: "witness", run: Effect.never, timeout: 
 export default witness;`,
       });
       const witnessRun = yield* runTaskProcess(timeoutWitness, "main.ts");
-      expect(witnessRun.standardError).toContain(
-        "[witness] error TaskTimedOut: timed out after 5s",
+      expect(witnessRun.standardError).toMatch(
+        /^run: \S+\/\nerror: \[witness\] main\.ts:3:29: TaskTimedOut: timed out after 5s\nerror: \[witness\] its output is in \S+\/1\.output\nended: \[witness\], [\d.]+s, failed\nrecap: \[witness\] 1\.output \| main\.ts:3:29: TaskTimedOut: timed out after 5s\nfailed: \[witness\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
       yield* gate.write(new TextEncoder().encode("\n"));
 
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(0);
-      expect(exited.standardError).toContain("[main] closed");
+      expect(exited.standardError).toContain("closed: [main]");
+      expect(exited.standardError).not.toContain("main is serving");
       expect(exited.standardError).toMatch(/^passed: 1 task, [\d.]+s$/mu);
     }),
   ),
@@ -336,8 +338,8 @@ export default Task.make({ name: "main", output: Schema.Struct({ port: Schema.Fi
 
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        "[main] error TaskOutputInvalid: served a value that does not match the task's output at .port: Expected number\n",
+      expect(ran.standardError).toMatch(
+        /^run: \S+\/\nerror: \[main\] main\.ts:3:21: TaskOutputInvalid: served a value that does not match the task's output at \.port: Expected number\nerror: \[main\] its output is in \S+\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:3:21: TaskOutputInvalid: served a value that does not match the task's output at \.port: Expected number\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
       expect(ran.standardError).not.toContain("4010");
     }),
@@ -383,7 +385,7 @@ const cleaned = (directory: string, standardError: string) =>
     const processId = Number(
       /\[server\] cleaning up in (?<processId>\d+)/u.exec(standardError)?.[1],
     );
-    expect(standardError).toContain("[server] closed");
+    expect(standardError).toContain("closed: [server]");
     expect(yield* exists(`${directory}/marker`)).toBe(true);
     expect(findKilledProcesses(standardError)).toEqual([]);
     expect(yield* isProcessAlive(processId)).toBe(false);
@@ -423,7 +425,7 @@ export const finalizers = makeTest(
         Effect.gen(function* () {
           const failing = yield* startRootWithCleanupGate("fail.ts");
           const ran = yield* failing.finishWhenCleanupStarted;
-          expect(ran.standardError).toMatch(/^\[fail\] \S+: error TaskError: boom$/mu);
+          expect(ran.standardError).toMatch(/^error: \[fail\] \S+: TaskError: boom$/mu);
           yield* cleaned(failing.project.directory, ran.standardError);
         }),
       ),
@@ -450,7 +452,7 @@ export const failedTaskFinalizerAwaitsTask = makeTest(
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
-export const notify = Task.make({ name: "notify", run: Effect.log("notifying") });
+export const notify = Task.make({ name: "notify", run: Effect.log("notifying").pipe(Effect.andThen(Effect.never)) });
 export const build = Task.make({ name: "build", run: Effect.gen(function* () {
   yield* Effect.addFinalizer(() => notify.pipe(Effect.catchCause(() => Effect.log("notify ended"))));
   return yield* Effect.fail(new TaskError({ message: "build broke" }));
@@ -549,14 +551,16 @@ export default Task.make({ name: "main", run: Effect.asVoid(server) });`,
       const ran = yield* command.waitForExit;
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(
-        "[server] error TaskCleanupTimedOut: its cleanup did not finish within 500ms, so the run stopped waiting for it",
+        "\nerror: [server] main.ts:4:28: TaskCleanupTimedOut: its cleanup did not finish within 500ms, so the run stopped waiting for it",
       );
       const killed = findKilledProcesses(ran.standardError);
-      expect(killed.map((each) => `${each.command} by ${each.by}`).toSorted()).toEqual([
-        'sh by "server"',
-        'sleep by "server"',
-        'sleep by "server"',
-      ]);
+      expect(killed.map((each) => `${each.command} by ${each.by}`).toSorted()).toEqual(
+        [
+          `${yield* readShellExecutableName} by [server]`,
+          "sleep by [server]",
+          "sleep by [server]",
+        ].toSorted(),
+      );
       for (const each of killed) {
         expect(yield* isProcessAlive(each.processId)).toBe(false);
       }
@@ -579,11 +583,9 @@ export default Task.make({ name: "main", run: Effect.asVoid(server) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain("[main] passed in");
-      expect(ran.standardError).toContain(
-        "[server] error TaskCleanupTimedOut: its cleanup did not finish within 200ms, so the run stopped waiting for it",
+      expect(ran.standardError).toMatch(
+        /\nerror: \[server\] main\.ts:3:28: TaskCleanupTimedOut: its cleanup did not finish within 200ms, so the run stopped waiting for it\nclosed: \[server\]\nerror: \[server\] its output is in \S+\/2\.output\nrecap: \[server\] 2\.output \| main\.ts:3:28: TaskCleanupTimedOut: its cleanup did not finish within 200ms, so the run stopped waiting for it\nfailed: \[server\] \(1 of 2 tasks\), [\d.]+s\nrun: \S+\/$/u,
       );
-      expect(ran.standardError).toMatch(/^failed: server \(1 of 2 tasks\), [\d.]+s$/mu);
     }),
   ),
 );
@@ -610,7 +612,9 @@ export default Task.make({ name: "main", run: Effect.asVoid(server) });`,
           });
           const ran = yield* runTaskProcess(project, "main.ts");
           expect(ran.exitCode, `${closedBy}\n${ran.standardError}`).toBe(1);
-          expect(ran.standardError, closedBy).toMatch(/^\[server\] .*error CloseFailed/mu);
+          expect(ran.standardError, closedBy).toMatch(
+            /^error: \[server\] \S+: CloseFailed: CloseFailed$/mu,
+          );
         }),
       ),
     { concurrency: "unbounded", discard: true },

@@ -15,10 +15,10 @@ import {
   dieOnInvariantFailure,
   InternalInvariantBroken,
 } from "../../../../../shared/invariant-errors.ts";
-import { TASK_TRACE_LABEL_PREFIX } from "../../../../../shared/names-from-package-json.ts";
-import { printLine, printTaskLines } from "../../../../../shared/print-to-standard-error.ts";
+import { labelLine, labelLines } from "../../../../../shared/label-lines.ts";
+import { printLine } from "../../../../../shared/print-to-standard-error.ts";
 import { WorkerExited } from "../../../../../shared/process-errors.ts";
-import { TaskFiberResult } from "../../../../../shared/rpc.ts";
+import { TaskFiberResult, WorkerLine } from "../../../../../shared/rpc.ts";
 import type { TaskMadeInBody } from "../../../../../shared/rpc.ts";
 import {
   TaskCleanupFailed,
@@ -30,16 +30,27 @@ import { WorkerEnding } from "../../../shared/define-worker-stage.ts";
 import { failRun, failTask } from "../../../shared/fail-run.ts";
 import { WorkerTerminatedForAnotherTask } from "../../../shared/main-thread-errors.ts";
 import { ProcessGroups } from "../../../shared/provide-process-groups.ts";
+import { RunRootTaskConfig } from "../../../shared/provide-run-root-task-config.ts";
 import { StopState } from "../../../shared/provide-stop-state.ts";
 import { FromWorker, WorkerEvent, WorkerPool } from "../../../shared/provide-worker-pool.ts";
 import { reportFailure } from "../../../shared/report-task-failure.ts";
+import {
+  addStackFrames,
+  endClosedTask,
+  keepStackFrames,
+  printStreamOutput,
+  printStreamOutputs,
+  printTaskLines,
+  printTaskOutputs,
+  settleHeldOutput,
+} from "../../../shared/write-task-output-files.ts";
 import { TraceFile } from "../../../shared/write-trace-file.ts";
 import { findAssignedWorkerId, isUnfinishedOnWorker } from "../shared/define-task-run-state.ts";
 import type { makeTaskRunsState } from "../shared/define-task-run-state.ts";
 import { isEndedByTheRun, TaskRunEvent, TaskRunOutcome } from "../shared/define-task-run-status.ts";
 import { TaskStopEvent } from "../shared/define-task-stop-stage.ts";
 
-const sendDependencyResultToWorker = Effect.fn("sendDependencyResultToWorker")(function* (
+const sendDependencyResultToWorker = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   requestDependencyTaskResult: (
     dependencyTaskName: string,
@@ -49,10 +60,6 @@ const sendDependencyResultToWorker = Effect.fn("sendDependencyResultToWorker")(f
   ) => Effect.Effect<Schema.Json | undefined, typeof TaskRequestFailure.Type>,
   messageFromWorker: typeof FromWorker.cases.TaskFiberRequestedTask.Type,
 ) {
-  yield* Effect.annotateCurrentSpan({
-    [`${TASK_TRACE_LABEL_PREFIX}.task`]: messageFromWorker.taskName,
-    [`${TASK_TRACE_LABEL_PREFIX}.wanted_task`]: messageFromWorker.dependencyTaskName,
-  });
   const requestingTaskRun = yield* Effect.fromNullishOr(
     taskRunsState.runsByTaskName.get(messageFromWorker.taskName),
   ).pipe(dieOnInvariantFailure("task requests", "a task that requests another task has a run"));
@@ -91,6 +98,24 @@ const isTaskCleanupFailed = Schema.is(TaskCleanupFailed);
 
 const isWorkerTerminatedForAnotherTask = Schema.is(WorkerTerminatedForAnotherTask);
 
+const isCleanupEndingFailure = Schema.is(
+  Schema.Union([TaskCleanupFailed, WorkerExited, WorkerTerminatedForAnotherTask]),
+);
+
+const isFailedResult = Schema.is(TaskFiberResult.cases.Failed);
+
+const isCleanupFailedResult = Schema.is(TaskFiberResult.cases.CleanupFailed);
+
+const keepStackFramesOf = (taskName: string, result: typeof TaskFiberResult.Type) => {
+  if (isCleanupFailedResult(result)) {
+    return result.stackFrames === undefined
+      ? Effect.void
+      : addStackFrames(taskName, result.stackFrames);
+  }
+  const stackFrames = isFailedResult(result) ? result.stackFrames : undefined;
+  return stackFrames === undefined ? Effect.void : keepStackFrames(taskName, stackFrames);
+};
+
 const bodyEnding = (taskName: string, result: typeof TaskFiberResult.Type) =>
   TaskFiberResult.match(result, {
     Returned: (
@@ -110,6 +135,7 @@ const bodyEnding = (taskName: string, result: typeof TaskFiberResult.Type) =>
           failures: failed.failures,
           details: failed.details,
           failedCommandExitCode: failed.failedCommandExitCode,
+          awaitedTaskNames: failed.awaitedTaskNames,
         }),
       ),
     AwaitedTasksFailed: (awaitedTasksFailed) => Exit.fail(awaitedTasksFailed.failure),
@@ -124,7 +150,7 @@ const bodyEnding = (taskName: string, result: typeof TaskFiberResult.Type) =>
     Interrupted: () => Exit.interrupt(),
   });
 
-const settleBodyOutcome = Effect.fn("settleBodyOutcome")(function* (
+const settleBodyOutcome = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   ending: Exit.Exit<
@@ -147,12 +173,17 @@ const settleBodyOutcome = Effect.fn("settleBodyOutcome")(function* (
         isEndedByTheRun(taskRun.outcome) ? isTaskBodyFailed(bodyFailure) : false,
       );
   Deferred.doneUnsafe(taskRun.bodyOutcomeDeferred, ending);
+  const { rootTaskName } = yield* RunRootTaskConfig;
+  const runEndingRootTaskBodyFailure = Option.filter(failure, () => taskName === rootTaskName);
+  if (Option.isSome(runEndingRootTaskBodyFailure)) {
+    yield* (yield* StopState).recordFirstFailure(runEndingRootTaskBodyFailure.value);
+  }
   if (Option.isSome(failedAfterTaskEnded)) {
     yield* failTask(failedAfterTaskEnded.value, taskRunsState.markFailed);
   }
 });
 
-const reportFailureAfterOutcome = Effect.fn("reportFailureAfterOutcome")(function* (
+const reportFailureAfterOutcome = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   ending: Exit.Exit<
@@ -165,31 +196,31 @@ const reportFailureAfterOutcome = Effect.fn("reportFailureAfterOutcome")(functio
   if (Option.isNone(failure)) {
     return;
   }
+  const stopState = yield* StopState;
   const failureEndsRun =
     isTaskCleanupFailed(failure.value) ||
     isWorkerExited(failure.value) ||
     isWorkerTerminatedForAnotherTask(failure.value);
   if (failureEndsRun) {
-    yield* (yield* StopState).recordFirstFailure(failure.value);
+    yield* stopState.recordFirstFailure(failure.value);
     return yield* failTask(failure.value, taskRunsState.markFailed);
   }
   if (!served) {
     return;
   }
 
-  yield* failRun(
-    new ServedTaskFailed({
-      taskName,
-      failures: isTaskBodyFailed(failure.value)
-        ? failure.value.failures
-        : reportFailure(failure.value),
-      details: isTaskBodyFailed(failure.value) ? failure.value.details : undefined,
-    }),
-    taskRunsState.markFailed,
-  );
+  const servedTaskFailed = new ServedTaskFailed({
+    taskName,
+    failures: isTaskBodyFailed(failure.value)
+      ? failure.value.failures
+      : reportFailure(failure.value),
+    details: isTaskBodyFailed(failure.value) ? failure.value.details : undefined,
+  });
+  yield* stopState.recordFirstFailure(servedTaskFailed);
+  yield* failTask(servedTaskFailed, taskRunsState.markFailed);
 });
 
-const endTask = Effect.fn("endTask")(function* (
+const endTask = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   ending: Exit.Exit<
@@ -201,21 +232,30 @@ const endTask = Effect.fn("endTask")(function* (
   if (action === "ignored") {
     return;
   }
+  const cleanupFailure = Option.filter(Exit.findErrorOption(ending), isCleanupEndingFailure);
+  if (Option.isSome(cleanupFailure)) {
+    yield* taskRunsState.recordCleanupFailure(taskName, cleanupFailure.value);
+  }
   taskRunsState.refreshBodyClocks(taskName, yield* Clock.currentTimeMillis);
-  if (action === "close") {
-    yield* printTaskLines("Info", taskName, "closed");
+  const closes = action === "close" || action === "closeFailed";
+  if (closes) {
+    yield* printTaskLines(taskName, labelLine("closed", taskName, ""));
   }
   yield* action === "settleOutcome"
     ? settleBodyOutcome(taskRunsState, taskName, ending)
     : reportFailureAfterOutcome(taskRunsState, taskName, ending, action === "close");
+  if (closes) {
+    yield* endClosedTask(taskName);
+  }
   const taskRun = taskRunsState.runsByTaskName.get(taskName);
   const workerId = taskRun === undefined ? null : findAssignedWorkerId(taskRun.status);
   if (workerId !== null) {
     yield* WorkerPool.use((workerPool) => workerPool.recordTaskEnded(workerId));
   }
+  yield* taskRunsState.endTaskSpanAfterWorker(taskName);
 });
 
-const failTasksOnWorker = Effect.fn("failTasksOnWorker")(function* (
+const failTasksOnWorker = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskNames: readonly string[],
   makeFailure: (taskName: string) => WorkerExited | WorkerTerminatedForAnotherTask,
@@ -229,7 +269,7 @@ const failTasksOnWorker = Effect.fn("failTasksOnWorker")(function* (
   );
 });
 
-const endTasksOfExitedWorker = Effect.fn("endTasksOfExitedWorker")(function* (
+const endTasksOfExitedWorker = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   workerEvent: typeof WorkerEvent.cases.ExitedWithCode.Type,
 ) {
@@ -270,7 +310,7 @@ const endTasksOfExitedWorker = Effect.fn("endTasksOfExitedWorker")(function* (
   });
 });
 
-const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
+const onMessageAboutTask = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   requestDependencyTaskResult: Parameters<typeof sendDependencyResultToWorker>[1],
   messageFromWorker: Exclude<
@@ -297,7 +337,11 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
             ),
           ),
       TaskFiberProcessLeaderExited: (exited) =>
-        processGroups.recordLeaderExit(exited.processId, exited.latestMemberStartTime),
+        processGroups.recordLeaderExit(
+          exited.processId,
+          exited.taskName,
+          exited.membersAtLeaderExit,
+        ),
       TaskFiberClaimingProcessReports: (claiming) =>
         processGroups
           .claimProcessesToReport(claiming.processes)
@@ -315,6 +359,8 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
           messageFromWorker.taskName,
           TaskRunEvent.cases.StartBody.make({}),
         ),
+      TaskFiberBodyEnded: (ended) =>
+        taskRunsState.openCleanupSpan(ended.taskName, ended.endedAtUnixNano),
       TaskFiberStartedCleanUp: () => taskRun.stop.move(TaskStopEvent.cases.StartCleanup.make({})),
       TaskFiberStoppedBeforeBody: () =>
         taskRun.stop.move(TaskStopEvent.cases.StopBeforeBody.make({})),
@@ -363,6 +409,7 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
       TaskFiberFailedBeforeCleanup: (failed) =>
         Effect.gen(function* () {
           yield* taskRun.stop.move(TaskStopEvent.cases.FailBeforeCleanup.make({}));
+          yield* keepStackFramesOf(failed.taskName, failed.failure);
           const action = yield* taskRunsState.moveTaskRun(
             failed.taskName,
             TaskRunEvent.cases.FailBeforeCleanup.make({}),
@@ -370,6 +417,10 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
           if (action === "settleOutcome") {
             const ending = yield* Effect.exit(bodyEnding(failed.taskName, failed.failure));
             yield* settleBodyOutcome(taskRunsState, failed.taskName, ending);
+          }
+          if (action === "reportServedFailure") {
+            const ending = yield* Effect.exit(bodyEnding(failed.taskName, failed.failure));
+            yield* reportFailureAfterOutcome(taskRunsState, failed.taskName, ending, true);
           }
         }),
       TaskFiberServed: (served) =>
@@ -384,7 +435,8 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
           }
         }),
       TaskFiberEnded: (ended) =>
-        Effect.exit(bodyEnding(ended.taskName, ended.result)).pipe(
+        keepStackFramesOf(ended.taskName, ended.result).pipe(
+          Effect.andThen(Effect.exit(bodyEnding(ended.taskName, ended.result))),
           Effect.flatMap((ending) => endTask(taskRunsState, messageFromWorker.taskName, ending)),
         ),
     }),
@@ -392,25 +444,192 @@ const onMessageAboutTask = Effect.fn("onMessageAboutTask")(function* (
   taskRunsState.refreshBodyClocks(messageFromWorker.taskName, yield* Clock.currentTimeMillis);
 });
 
-const printLoggedLine = (line: typeof FromWorker.cases.StandardErrorLineRequested.Type) =>
-  Effect.gen(function* () {
-    const traceFile = yield* TraceFile;
-    if (line.traceLogRecordJson !== undefined) {
-      traceFile.writeWorkerLogRecord(line.traceLogRecordJson);
-    }
-    return yield* printLine(line.logLevel, line.text);
+const printWorkerLine = (workerId: number, line: typeof WorkerLine.Type) =>
+  WorkerLine.match(line, {
+    Logged: ({ taskName, text }) => printTaskOutputs(taskName, [text]),
+    StreamWrote: ({ taskName, streamId, pieces, heldBytes, printedTo }) =>
+      WorkerPool.use((workerPool) =>
+        printStreamOutput(
+          taskName,
+          streamId,
+          pieces,
+          workerPool.releaseTaskOutputBytes(workerId, heldBytes),
+          printedTo,
+        ),
+      ),
+    HeldOutputSettled: ({ taskName, streamIds, outcome }) =>
+      settleHeldOutput(taskName, streamIds, outcome),
+    Reported: ({ taskName, label, text }) =>
+      printTaskLines(taskName, labelLines(label, taskName, text).join("\n")),
+    Printed: ({ taskName, text }) =>
+      taskName === null ? printLine(text) : printTaskLines(taskName, text),
   });
 
-const handleWorkerEventInSpan = Effect.fn("handleWorkerEvent")(function* (
+const printLoggedLine = (
+  workerId: number,
+  requested: typeof FromWorker.cases.StandardErrorLineRequested.Type,
+) =>
+  Effect.gen(function* () {
+    const traceFile = yield* TraceFile;
+    if (requested.traceLogRecordJson !== undefined) {
+      traceFile.writeWorkerLogRecord(requested.traceLogRecordJson);
+    }
+    return yield* printWorkerLine(workerId, requested.line);
+  });
+
+const isMessageReceived = WorkerEvent.isAnyOf(["MessageReceived"]);
+
+const isConsoleLineWrittenEvent = WorkerEvent.isAnyOf(["ConsoleLineWritten"]);
+
+const isExitedWithCode = WorkerEvent.isAnyOf(["ExitedWithCode"]);
+
+const isMessageUnreadable = WorkerEvent.isAnyOf(["MessageUnreadable"]);
+
+const isStandardErrorLineRequested = FromWorker.isAnyOf(["StandardErrorLineRequested"]);
+
+const isStreamWrote = WorkerLine.isAnyOf(["StreamWrote"]);
+
+const isLogged = WorkerLine.isAnyOf(["Logged"]);
+
+const LOGGED_RUN_CHARACTER_LIMIT = 4_194_304;
+
+const loggedLineOf = (workerEvent: typeof WorkerEvent.Type) => {
+  if (!isMessageReceived(workerEvent)) {
+    return null;
+  }
+  const { message } = workerEvent;
+  const isLoggedLine = isStandardErrorLineRequested(message) && isLogged(message.line);
+  return isLoggedLine
+    ? {
+        taskName: message.line.taskName,
+        text: message.line.text,
+        traceLogRecordJson: message.traceLogRecordJson,
+      }
+    : null;
+};
+
+const printLoggedRun = (loggedLines: readonly NonNullable<ReturnType<typeof loggedLineOf>>[]) =>
+  Effect.gen(function* () {
+    const traceFile = yield* TraceFile;
+    for (const { traceLogRecordJson } of loggedLines) {
+      if (traceLogRecordJson !== undefined) {
+        traceFile.writeWorkerLogRecord(traceLogRecordJson);
+      }
+    }
+    const [firstLine] = loggedLines;
+    if (firstLine !== undefined) {
+      yield* printTaskOutputs(
+        firstLine.taskName,
+        loggedLines.map(({ text }) => text),
+      );
+    }
+  });
+
+const streamWriteOf = (workerEvent: typeof WorkerEvent.Type) => {
+  if (isConsoleLineWrittenEvent(workerEvent)) {
+    return {
+      ...workerEvent,
+      printedTo: "terminal and file" as const,
+      traceLogRecordJson: undefined,
+      isConsoleLine: true,
+    };
+  }
+  if (!isMessageReceived(workerEvent)) {
+    return null;
+  }
+  const { message, workerId } = workerEvent;
+  const isStreamWrite = isStandardErrorLineRequested(message) && isStreamWrote(message.line);
+  return isStreamWrite
+    ? {
+        workerId,
+        ...message.line,
+        traceId: null,
+        spanId: null,
+        writtenAtMilliseconds: 0,
+        traceLogRecordJson: message.traceLogRecordJson,
+        isConsoleLine: false,
+      }
+    : null;
+};
+
+const writeTraceRecordsOf = (
+  traceFile: TraceFile["Service"],
+  writes: readonly NonNullable<ReturnType<typeof streamWriteOf>>[],
+) => {
+  const run = { first: Option.none<(typeof writes)[number]>(), texts: new Array<string>() };
+  const writeRun = () => {
+    if (Option.isSome(run.first)) {
+      traceFile.writeConsoleLogRecord(run.first.value, run.texts.join("\n"));
+    }
+    run.first = Option.none();
+    run.texts = [];
+  };
+  for (const write of writes) {
+    if (!write.isConsoleLine) {
+      writeRun();
+      if (write.traceLogRecordJson !== undefined) {
+        traceFile.writeWorkerLogRecord(write.traceLogRecordJson);
+      }
+      continue;
+    }
+    const first = Option.getOrUndefined(run.first);
+    const continuesRun =
+      first?.taskName === write.taskName &&
+      first.streamId === write.streamId &&
+      first.traceId === write.traceId &&
+      first.spanId === write.spanId &&
+      first.writtenAtMilliseconds === write.writtenAtMilliseconds;
+    if (!continuesRun) {
+      writeRun();
+      run.first = Option.some(write);
+    }
+    for (const piece of write.pieces) {
+      run.texts.push(piece.text);
+    }
+  }
+  writeRun();
+};
+
+const printStreamWrites = (
+  workerId: number,
+  writes: readonly NonNullable<ReturnType<typeof streamWriteOf>>[],
+) =>
+  Effect.gen(function* () {
+    writeTraceRecordsOf(yield* TraceFile, writes);
+    const workerPool = yield* WorkerPool;
+    yield* printStreamOutputs(
+      writes.map((write) => ({
+        taskName: write.taskName,
+        streamId: write.streamId,
+        pieces: write.pieces,
+        printedTo: write.printedTo,
+      })),
+      workerPool.releaseTaskOutputBytes(
+        workerId,
+        writes.reduce((heldBytes, write) => heldBytes + write.heldBytes, 0),
+      ),
+    );
+  });
+
+const handleMessageOrExit = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   requestDependencyTaskResult: Parameters<typeof sendDependencyResultToWorker>[1],
   workerEvent: typeof WorkerEvent.Type,
 ) {
-  yield* Effect.annotateCurrentSpan(`${TASK_TRACE_LABEL_PREFIX}.worker`, workerEvent.workerId);
-  if (WorkerEvent.guards.ExitedWithCode(workerEvent)) {
+  if (isConsoleLineWrittenEvent(workerEvent)) {
+    return yield* printStreamWrites(workerEvent.workerId, [
+      {
+        ...workerEvent,
+        printedTo: "terminal and file" as const,
+        traceLogRecordJson: undefined,
+        isConsoleLine: true,
+      },
+    ]);
+  }
+  if (isExitedWithCode(workerEvent)) {
     return yield* endTasksOfExitedWorker(taskRunsState, workerEvent);
   }
-  if (WorkerEvent.guards.MessageUnreadable(workerEvent)) {
+  if (isMessageUnreadable(workerEvent)) {
     return yield* Effect.die(
       new InternalInvariantBroken({
         area: "worker protocol",
@@ -421,32 +640,88 @@ const handleWorkerEventInSpan = Effect.fn("handleWorkerEvent")(function* (
   }
   const messageFromWorker = workerEvent.message;
   if (FromWorker.guards.StandardErrorLineRequested(messageFromWorker)) {
-    return yield* printLoggedLine(messageFromWorker);
+    return yield* printLoggedLine(workerEvent.workerId, messageFromWorker);
   }
   if (FromWorker.guards.TraceLogRecordRequested(messageFromWorker)) {
     const traceFile = yield* TraceFile;
     traceFile.writeWorkerLogRecord(messageFromWorker.traceLogRecordJson);
     return;
   }
-  yield* Effect.annotateCurrentSpan({
-    [`${TASK_TRACE_LABEL_PREFIX}.message`]: messageFromWorker._tag,
-    [`${TASK_TRACE_LABEL_PREFIX}.task`]: messageFromWorker.taskName,
-  });
   yield* onMessageAboutTask(taskRunsState, requestDependencyTaskResult, messageFromWorker);
   if (FromWorker.guards.TaskFiberStarted(messageFromWorker)) {
     yield* WorkerPool.use((workerPool) => workerPool.recordBodyStartHandled(workerEvent.workerId));
   }
 });
 
-export const handleWorkerEvent = (
+const handleWorkerEvent = (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   requestDependencyTaskResult: Parameters<typeof sendDependencyResultToWorker>[1],
   workerEvent: typeof WorkerEvent.Type,
 ) => {
   const isStandardErrorLine =
-    WorkerEvent.guards.MessageReceived(workerEvent) &&
-    FromWorker.guards.StandardErrorLineRequested(workerEvent.message);
+    isMessageReceived(workerEvent) && isStandardErrorLineRequested(workerEvent.message);
   return isStandardErrorLine
-    ? printLoggedLine(workerEvent.message)
-    : handleWorkerEventInSpan(taskRunsState, requestDependencyTaskResult, workerEvent);
+    ? printLoggedLine(workerEvent.workerId, workerEvent.message)
+    : handleMessageOrExit(taskRunsState, requestDependencyTaskResult, workerEvent);
+};
+
+export const splitWorkerEvents = (
+  taskRunsState: Effect.Success<typeof makeTaskRunsState>,
+  requestDependencyTaskResult: Parameters<typeof sendDependencyResultToWorker>[1],
+  workerEvents: readonly (typeof WorkerEvent.Type)[],
+) => {
+  const steps: (
+    | ReturnType<typeof handleWorkerEvent>
+    | ReturnType<typeof printLoggedRun>
+    | ReturnType<typeof printStreamWrites>
+  )[] = [];
+  const waiting = {
+    writes: new Array<NonNullable<ReturnType<typeof streamWriteOf>>>(),
+    loggedLines: new Array<NonNullable<ReturnType<typeof loggedLineOf>>>(),
+    loggedCharacters: 0,
+  };
+  const printWaitingLoggedLines = () => {
+    if (waiting.loggedLines.length > 0) {
+      steps.push(printLoggedRun(waiting.loggedLines));
+      waiting.loggedLines = [];
+      waiting.loggedCharacters = 0;
+    }
+  };
+  const printWaitingWrites = () => {
+    const [firstWrite] = waiting.writes;
+    if (firstWrite !== undefined) {
+      steps.push(printStreamWrites(firstWrite.workerId, waiting.writes));
+      waiting.writes = [];
+    }
+  };
+  for (const workerEvent of workerEvents) {
+    const loggedLine = loggedLineOf(workerEvent);
+    if (loggedLine !== null) {
+      printWaitingWrites();
+      const endsTheRun =
+        waiting.loggedLines[0]?.taskName !== loggedLine.taskName ||
+        waiting.loggedCharacters + loggedLine.text.length > LOGGED_RUN_CHARACTER_LIMIT;
+      if (endsTheRun) {
+        printWaitingLoggedLines();
+      }
+      waiting.loggedLines.push(loggedLine);
+      waiting.loggedCharacters += loggedLine.text.length;
+      continue;
+    }
+    printWaitingLoggedLines();
+    const write = streamWriteOf(workerEvent);
+    if (write === null) {
+      printWaitingWrites();
+      steps.push(handleWorkerEvent(taskRunsState, requestDependencyTaskResult, workerEvent));
+      continue;
+    }
+    const isFromAnotherWorker = waiting.writes[0]?.workerId !== write.workerId;
+    if (isFromAnotherWorker) {
+      printWaitingWrites();
+    }
+    waiting.writes.push(write);
+  }
+  printWaitingWrites();
+  printWaitingLoggedLines();
+  return steps;
 };

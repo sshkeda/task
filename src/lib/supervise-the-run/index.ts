@@ -3,6 +3,7 @@ import { Ref } from "effect";
 import { supervisorProcessId, supervisorRunMarker } from "./internal/watch-the-supervisor.ts";
 
 export { acknowledgeStops } from "./internal/acknowledge-stops.ts";
+export { claimUnknownOwnershipInTheRun } from "./internal/claim-unknown-ownership-in-the-run.ts";
 export { reportReady } from "./internal/report-ready.ts";
 export {
   processGroupsSharedWithTheSupervisor,
@@ -12,6 +13,7 @@ export { superviseRun } from "./internal/supervise-run.ts";
 export {
   awaitTheSupervisorTerminalCommandExit,
   runInTheSupervisorTerminal,
+  sweepBeforeExit,
 } from "./internal/talk-to-the-supervisor.ts";
 
 export const readSupervisorProcessId = Ref.get(supervisorProcessId);

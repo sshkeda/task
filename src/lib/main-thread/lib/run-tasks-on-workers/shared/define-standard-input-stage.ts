@@ -1,20 +1,21 @@
 import { Schema } from "effect";
 
 import { StandardInputRead } from "../../../../../shared/rpc.ts";
+import { PrintableError } from "../../../../errors/index.ts";
 
 export const StandardInputStage = Schema.TaggedUnion({
   NotOpened: {},
   Reading: {},
   Idle: {},
   Ended: {},
-  Failed: { reason: Schema.String },
+  Failed: { reason: PrintableError },
 });
 
 export const StandardInputEvent = Schema.TaggedUnion({
   Read: { rootTaskName: Schema.String, taskName: Schema.String },
   ReceiveChunks: { chunks: Schema.NonEmptyArray(Schema.Uint8Array) },
   ReceiveEnd: {},
-  ReceiveFailure: { reason: Schema.String },
+  ReceiveFailure: { reason: PrintableError },
 });
 
 export const StandardInputAction = Schema.TaggedUnion({

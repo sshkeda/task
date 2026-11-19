@@ -23,7 +23,7 @@ export const invalidLifecycleStates = makeTest(
         typeCheckSource(`import type { Effect } from "effect";
 import type { makeTaskRunsState } from ${taskRunStateModule};
 import type { TaskRunOutcome, TaskRunStatus } from ${taskRunStatusModule};
-const serving: typeof TaskRunStatus.Type = { _tag: "Serving" };
+const serving: typeof TaskRunStatus.Type = { _tag: "Serving", failed: false };
 const preparing: typeof TaskRunStatus.Type = { _tag: "Preparing", workerId: 1 };
 const running: typeof TaskRunStatus.Type = { _tag: "Running", workerId: null };
 const failed: typeof TaskRunOutcome.Type = { _tag: "Failed", workerId: 1, causedByAwaitedTasks: false };
@@ -58,7 +58,7 @@ export const states: ReadonlyArray<typeof TaskRunStatus.Type> = [
   { _tag: "Assigned", workerId: 0 },
   { _tag: "Loading", workerId: 0 },
   { _tag: "Running", workerId: 0 },
-  { _tag: "Serving", workerId: 0 },
+  { _tag: "Serving", workerId: 0, failed: false },
   { _tag: "Failing", workerId: 0 },
   { _tag: "Finished", workerId: 0 },
   { _tag: "Closed", workerId: 0 },

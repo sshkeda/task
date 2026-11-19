@@ -1,6 +1,7 @@
 import { Schema } from "effect";
 
 import { TASK_ERROR_FIELDS } from "../../../shared/error-fields.ts";
+import { nameTask } from "../../../shared/label-lines.ts";
 
 export class FlagNotRead extends Schema.TaggedError<FlagNotRead>()("FlagNotRead", {
   ...TASK_ERROR_FIELDS,
@@ -35,7 +36,7 @@ export class FlagMissing extends Schema.TaggedError<FlagMissing>()("FlagMissing"
   flagName: Schema.String,
 }) {
   public override get message() {
-    return `the task "${this.readingTaskName}" reads the flag --${this.flagName}, which was not given`;
+    return `the task ${nameTask(this.readingTaskName)} reads the flag --${this.flagName}, which was not given`;
   }
 }
 
@@ -47,7 +48,23 @@ export class FlagInvalid extends Schema.TaggedError<FlagInvalid>()("FlagInvalid"
   reason: Schema.String,
 }) {
   public override get message() {
-    return `the flag --${this.flagName} is "${this.value}", which the task "${this.readingTaskName}" does not accept: ${this.reason}`;
+    return `the flag --${this.flagName} is "${this.value}", which the task ${nameTask(this.readingTaskName)} does not accept: ${this.reason}`;
+  }
+}
+
+export class FlagsInvalid extends Schema.TaggedError<FlagsInvalid>()("FlagsInvalid", {
+  ...TASK_ERROR_FIELDS,
+  readingTaskName: Schema.String,
+  givenFlags: Schema.Array(Schema.Struct({ flagName: Schema.String, value: Schema.String })),
+  reason: Schema.String,
+}) {
+  public override get message() {
+    const shownFlags = this.givenFlags
+      .map((given) => `--${given.flagName} "${given.value}"`)
+      .join(" ");
+    return this.givenFlags.length === 0
+      ? `the task ${nameTask(this.readingTaskName)} does not accept being run without flags: ${this.reason}`
+      : `the flags ${shownFlags} are not accepted together by the task ${nameTask(this.readingTaskName)}: ${this.reason}`;
   }
 }
 
@@ -58,7 +75,7 @@ export class FlagReadTwoWays extends Schema.TaggedError<FlagReadTwoWays>()("Flag
   flagName: Schema.String,
 }) {
   public override get message() {
-    return `the task "${this.switchTaskName}" reads the flag --${this.flagName} as a switch without a value, but the task "${this.valueTaskName}" reads it with a value`;
+    return `the task ${nameTask(this.switchTaskName)} reads the flag --${this.flagName} as a switch without a value, but the task ${nameTask(this.valueTaskName)} reads it with a value`;
   }
 }
 
@@ -68,7 +85,7 @@ export class FlagNotFlat extends Schema.TaggedError<FlagNotFlat>()("FlagNotFlat"
   flagName: Schema.String,
 }) {
   public override get message() {
-    return `the task "${this.readingTaskName}" reads the flag --${this.flagName} as a value a command line cannot carry`;
+    return `the task ${nameTask(this.readingTaskName)} reads the flag --${this.flagName} as a value a command line cannot carry`;
   }
 }
 
@@ -78,6 +95,6 @@ export class FlagReserved extends Schema.TaggedError<FlagReserved>()("FlagReserv
   flagName: Schema.String,
 }) {
   public override get message() {
-    return `the task "${this.readingTaskName}" reads the flag --${this.flagName}, which is kept for printing what the file accepts`;
+    return `the task ${nameTask(this.readingTaskName)} reads the flag --${this.flagName}, which is kept for printing what the file accepts`;
   }
 }

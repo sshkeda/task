@@ -2,7 +2,6 @@ import { Effect, FileSystem, Formatter, Option, Predicate, Schema, Struct } from
 import type { PlatformError } from "effect";
 
 import { dieOnInvariantFailure } from "../../../shared/invariant-errors.ts";
-import { describeCauseMessage } from "../../../shared/report-errors.ts";
 import {
   PackageJsonFieldInvalid,
   PackageJsonNameBlank,
@@ -53,13 +52,11 @@ export const parsePackageJsonObject = (packageJsonFilePath: string, packageJsonT
           catch: (cause) =>
             new PackageJsonNotJson({
               filePath: packageJsonFilePath,
-              parserMessage: describeCauseMessage(cause),
+              cause,
             }),
         }).pipe(
           Effect.andThen(
-            Effect.fail(
-              new PackageJsonNotJson({ filePath: packageJsonFilePath, parserMessage: null }),
-            ),
+            Effect.fail(new PackageJsonNotJson({ filePath: packageJsonFilePath, cause: null })),
           ),
         ),
       ),

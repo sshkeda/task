@@ -11,28 +11,27 @@ import {
   Schema,
 } from "effect";
 
-import {
-  formatTaskPassed,
-  formatTaskServing,
-} from "../../../../../../../shared/format-task-lines.ts";
 import { dieOnInvariantFailure } from "../../../../../../../shared/invariant-errors.ts";
+import { labelLine, nameTask } from "../../../../../../../shared/label-lines.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../../../../../shared/names-from-package-json.ts";
-import { printTaskLines } from "../../../../../../../shared/print-to-standard-error.ts";
 import { WorkerExited } from "../../../../../../../shared/process-errors.ts";
 import { TaskSetupTimedOut, TaskTimedOut } from "../../../../../../../shared/task-errors.ts";
+import { withTaskSpan } from "../../../../../../../shared/task-spans.ts";
 import { failRun, failTask } from "../../../../../shared/fail-run.ts";
+import { formatSeconds } from "../../../../../shared/format-task-lines.ts";
 import { WorkerTerminatedForAnotherTask } from "../../../../../shared/main-thread-errors.ts";
 import { RunRootTaskConfig } from "../../../../../shared/provide-run-root-task-config.ts";
 import { StopState } from "../../../../../shared/provide-stop-state.ts";
 import { FromWorker, WorkerPool } from "../../../../../shared/provide-worker-pool.ts";
 import { reportTaskFailure } from "../../../../../shared/report-task-failure.ts";
-import {
-  findTaskNamesOccupyingWorker,
-  formatTaskRunForTrace,
-  formatWaitingForWorker,
-} from "../../../shared/define-task-run-state.ts";
+import { printTaskLines, TaskOutputFiles } from "../../../../../shared/write-task-output-files.ts";
 import type { makeTaskRunsState } from "../../../shared/define-task-run-state.ts";
-import { isBeforeBody, isOnWorker, TaskRunStatus } from "../../../shared/define-task-run-status.ts";
+import {
+  isBeforeBody,
+  isOnWorker,
+  TaskRunOutcome,
+  TaskRunStatus,
+} from "../../../shared/define-task-run-status.ts";
 import type { makeStopwatch } from "../../../shared/make-stopwatch.ts";
 import { stopTask } from "../../../shared/stop-task.ts";
 import { awaitWithinCountedLimit } from "./await-within-counted-limit.ts";
@@ -40,11 +39,9 @@ import { makeTaskSetupClock } from "./make-task-setup-clock.ts";
 
 const isTaskTimedOut = Schema.is(TaskTimedOut);
 
-const STILL_BEFORE_BODY_NOTICE_SECONDS = 2;
-
-const STILL_BEFORE_BODY_NOTICE_AFTER = Duration.seconds(STILL_BEFORE_BODY_NOTICE_SECONDS);
-
 const isTaskSetupTimedOut = Schema.is(TaskSetupTimedOut);
+
+const RUN_ENDED_EVENT = "run ended before it finished";
 
 const taskTimedOut = (taskName: string, timeoutDuration: Duration.Duration) =>
   new TaskTimedOut({ taskName, timeoutMilliseconds: Duration.toMillis(timeoutDuration) });
@@ -63,7 +60,7 @@ const awaitWithinTimeout = <Success, Failure, Services>(
     ),
   );
 
-const failRunWhenCleanupOutlastsTimeout = Effect.fn("failRunWhenCleanupOutlastsTimeout")(function* (
+const failRunWhenCleanupOutlastsTimeout = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   timeoutDuration: Duration.Duration,
@@ -92,9 +89,8 @@ const endsRunDirectly = Schema.is(
   Schema.Union([TaskSetupTimedOut, WorkerExited, WorkerTerminatedForAnotherTask]),
 );
 
-export const executeTask = Effect.fn("executeTaskFiber")(
+export const executeTask = Effect.fn(
   function* (taskRunsState: Effect.Success<typeof makeTaskRunsState>, taskName: string) {
-    yield* Effect.annotateCurrentSpan(`${TASK_TRACE_LABEL_PREFIX}.task`, taskName);
     yield* Effect.logInfo("task started").pipe(
       Effect.annotateLogs(`${TASK_TRACE_LABEL_PREFIX}.task`, taskName),
     );
@@ -105,17 +101,15 @@ export const executeTask = Effect.fn("executeTaskFiber")(
       dieOnInvariantFailure("task execution", "the requested task is registered and started"),
     );
 
-    const { rootTaskFilePath } = yield* RunRootTaskConfig;
-    const span = yield* Effect.currentSpan.pipe(
-      dieOnInvariantFailure("task execution", "the task has a tracing span"),
-    );
+    const { rootTaskFilePath, rootTaskPackageJsonDirectoryPath } = yield* RunRootTaskConfig;
+    const { commandRecapDirectoryPath } = yield* TaskOutputFiles;
     const setupClock = yield* makeTaskSetupClock(
       taskRunsState,
       taskName,
       discoveredTask.cleanupDuration,
     );
     const waitingForWorkerIdRef = yield* Ref.make<number | null>(null);
-    const describeStepBeforeBody = (isWorkerHeldByOtherTasks: boolean) => {
+    const describeStepBeforeBody = () => {
       const waitingForWorkerId = Ref.getUnsafe(waitingForWorkerIdRef);
       if (!isBeforeBody(taskRun.status)) {
         return null;
@@ -123,62 +117,44 @@ export const executeTask = Effect.fn("executeTaskFiber")(
       if (waitingForWorkerId === null) {
         return "starting a worker";
       }
-      const occupyingTaskNames = findTaskNamesOccupyingWorker(
-        taskRunsState.runsByTaskName,
-        waitingForWorkerId,
-      ).filter((occupyingTaskName) => occupyingTaskName !== taskName);
-      const [longestOccupyingTaskName, ...otherTaskNames] = occupyingTaskNames;
-      const isWaitingOnAnOccupyingTask =
-        isWorkerHeldByOtherTasks && longestOccupyingTaskName !== undefined;
-      if (isWaitingOnAnOccupyingTask) {
-        return formatWaitingForWorker(waitingForWorkerId, longestOccupyingTaskName, otherTaskNames);
-      }
       return TaskRunStatus.guards.Loading(taskRun.status)
         ? `loading ${rootTaskFilePath}`
         : `waiting for worker ${waitingForWorkerId} to take it`;
     };
     const awaitBodyStart = Effect.gen(function* () {
-      yield* printTaskLines("Info", taskName, "started");
-
+      yield* taskRunsState.printStart(taskName);
       const workerPool = yield* WorkerPool;
-      const workerId = yield* workerPool.selectWorkerIdForTask(
-        taskRunsState.readWorkerLoad,
-        (selectedWorkerId) => taskRunsState.recordWorkerAssignment(taskName, selectedWorkerId),
-        discoveredTask.madeOnWorkerId,
-        discoveredTask.isolated,
-        taskRunsState.awaitNextWorkerLoadChange,
-      );
+      const workerId = yield* workerPool
+        .selectWorkerIdForTask(
+          taskRunsState.readWorkerLoad,
+          (selectedWorkerId) => taskRunsState.recordWorkerAssignment(taskName, selectedWorkerId),
+          discoveredTask.madeOnWorkerId,
+          discoveredTask.isolated,
+          taskRunsState.awaitNextWorkerLoadChange,
+        )
+        .pipe(withTaskSpan("setup", "wait for worker"));
       yield* setupClock.recordWorkerAssignment(workerId);
-      yield* workerPool.startTaskFiber(workerId, {
-        taskName,
-        rootTaskFilePath,
-        taskFilePath: discoveredTask.filePath,
-        taskPackageDirectoryPath: discoveredTask.packageJsonDirectoryPath,
-        cleanup: discoveredTask.cleanupDuration,
-        traceId: span.traceId,
-        spanId: span.spanId,
-        standardInput: taskRunsState.rootTaskStandardInput.standardInput,
-      });
-      yield* Ref.set(waitingForWorkerIdRef, workerId);
-      const awaitBodyStarted = Deferred.await(taskRun.bodyStartedAtMillisecondsDeferred).pipe(
-        Effect.raceFirst(Deferred.await(taskRun.bodyFinishedDeferred)),
+      yield* Effect.gen(function* () {
+        yield* workerPool.startTaskFiber(workerId, {
+          taskName,
+          rootTaskFilePath,
+          taskFilePath: discoveredTask.filePath,
+          runDirectoryPath: rootTaskPackageJsonDirectoryPath,
+          commandRecapDirectoryPath,
+          cleanup: discoveredTask.cleanupDuration,
+          traceId: taskRun.taskSpan.traceId,
+          spanId: taskRun.taskSpan.spanId,
+          standardInput: taskRunsState.rootTaskStandardInput.standardInput,
+        });
+        yield* Ref.set(waitingForWorkerIdRef, workerId);
+        yield* Deferred.await(taskRun.bodyStartedAtMillisecondsDeferred).pipe(
+          Effect.raceFirst(Deferred.await(taskRun.bodyFinishedDeferred)),
+        );
+      }).pipe(
+        withTaskSpan("setup", "start task", { [`${TASK_TRACE_LABEL_PREFIX}.worker`]: workerId }),
       );
-      const startedBeforeNotice = yield* awaitBodyStarted.pipe(
-        Effect.timeoutOption(STILL_BEFORE_BODY_NOTICE_AFTER),
-      );
-      const stepAtNotice = describeStepBeforeBody(
-        yield* setupClock.isWorkerHeldByOtherTasks(workerId),
-      );
-      const isStillBeforeBodyAtNotice = Option.isNone(startedBeforeNotice) && stepAtNotice !== null;
-      if (isStillBeforeBodyAtNotice) {
-        yield* printTaskLines("Info", taskName, stepAtNotice);
-      }
-      yield* awaitBodyStarted;
     }).pipe((setup) =>
-      setupClock.limit(
-        setup,
-        () => describeStepBeforeBody(false) ?? "waiting for its body to start",
-      ),
+      setupClock.limit(setup, () => describeStepBeforeBody() ?? "waiting for its body to start"),
     );
     const timeoutDuration = discoveredTask.timeoutDuration;
     const awaitBodyOutcome = Effect.gen(function* () {
@@ -234,16 +210,20 @@ export const executeTask = Effect.fn("executeTaskFiber")(
       taskRun.bodyStartedAtMillisecondsDeferred,
     );
     if (FromWorker.guards.TaskFiberServed(outcome)) {
+      const servingAfterMilliseconds =
+        (yield* Clock.currentTimeMillis) - taskBodyStartedAtMilliseconds;
       yield* printTaskLines(
-        "Info",
         taskName,
-        formatTaskServing((yield* Clock.currentTimeMillis) - taskBodyStartedAtMilliseconds),
+        labelLine(
+          "serving",
+          null,
+          `${nameTask(taskName)}, ${formatSeconds(servingAfterMilliseconds)}`,
+        ),
       );
       return outcome.value;
     }
 
     yield* taskRunsState.markPassed(taskName);
-    yield* printTaskLines("Info", taskName, formatTaskPassed(outcome.elapsedMilliseconds));
     return outcome.value;
   },
   (effect, taskRunsState, taskName) =>
@@ -258,10 +238,9 @@ export const executeTask = Effect.fn("executeTaskFiber")(
           }
 
           taskRunsState.markEndedFromExit(taskName, taskExit);
-          yield* Effect.annotateCurrentSpan(
-            `${TASK_TRACE_LABEL_PREFIX}.state`,
-            formatTaskRunForTrace(taskRun),
-          );
+          if (TaskRunOutcome.guards.Cancelled(taskRun.outcome)) {
+            taskRun.taskSpan.event(RUN_ENDED_EVENT, yield* Clock.currentTimeNanos, {});
+          }
           const failure = Exit.findErrorOption(taskExit);
           const failedUnreportedWithMoreThanInterrupts =
             Exit.isFailure(taskExit) &&
@@ -274,6 +253,7 @@ export const executeTask = Effect.fn("executeTaskFiber")(
           if (failureEndsRun) {
             yield* (yield* StopState).recordFirstFailure(failure.value);
           }
+          yield* taskRunsState.endTaskSpanAfterExecution(taskName);
         }),
       ),
     ),
