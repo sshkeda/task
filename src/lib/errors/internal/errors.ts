@@ -131,32 +131,64 @@ const OUTPUT_LINES_IN_MESSAGE = 20;
 const OUTPUT_CHARACTERS_IN_MESSAGE = 4096;
 
 const startOfLastLines = (text: string, lineCount: number, end: number): number => {
-  const lineBreak = text.lastIndexOf("\n", end - 1);
+  const lineBreak = end === 0 ? -1 : text.lastIndexOf("\n", end - 1);
   const keepsNoEarlierLine = lineBreak === -1 || lineCount === 1;
   return keepsNoEarlierLine ? lineBreak + 1 : startOfLastLines(text, lineCount - 1, lineBreak);
 };
 
-const lastLinesOf = (text: string) =>
-  text.slice(startOfLastLines(text, OUTPUT_LINES_IN_MESSAGE, text.length));
+const splitsSurrogatePair = (text: string, index: number) =>
+  !text.slice(index - 1, index).isWellFormed() && text.slice(index - 1, index + 1).isWellFormed();
 
-const endOfOutput = (output: string) => {
-  const trimmed = output.trimEnd();
+const selectShownOutput = (trimmed: string) => {
+  const lastLinesStart = startOfLastLines(trimmed, OUTPUT_LINES_IN_MESSAGE, trimmed.length);
   if (trimmed.length <= OUTPUT_CHARACTERS_IN_MESSAGE) {
-    return lastLinesOf(trimmed);
+    return { start: lastLinesStart, startsMidLine: false };
   }
-  const cutAt = trimmed.length - OUTPUT_CHARACTERS_IN_MESSAGE;
-  const cut = trimmed.slice(cutAt);
-  const tail = cut.isWellFormed() ? cut : cut.slice(1);
-  if (trimmed[cutAt - 1] === "\n") {
-    return lastLinesOf(tail);
-  }
-  const firstLineBreak = tail.indexOf("\n");
-  return firstLineBreak === -1 ? `…${tail}` : lastLinesOf(tail.slice(firstLineBreak + 1));
+  const characterCut = trimmed.length - OUTPUT_CHARACTERS_IN_MESSAGE;
+  const cutAt = splitsSurrogatePair(trimmed, characterCut) ? characterCut + 1 : characterCut;
+  const lineStart = trimmed[cutAt - 1] === "\n" ? cutAt : trimmed.indexOf("\n", cutAt) + 1;
+  return lineStart === 0
+    ? { start: cutAt, startsMidLine: true }
+    : { start: Math.max(lineStart, lastLinesStart), startsMidLine: false };
 };
 
-const describeOutputEnd = (outputName: string, output: string) => {
-  const shownOutput = endOfOutput(output);
-  return shownOutput === "" ? [] : [`${outputName}:`, shownOutput];
+const countLineBreaksBefore = (text: string, end: number) =>
+  text.slice(0, end).split("\n").length - 1;
+
+const counted = (count: number, noun: string) =>
+  `${String(count)} ${noun}${count === 1 ? "" : "s"}`;
+
+const describeLeftOut = (
+  trimmed: string,
+  start: number,
+  startsMidLine: boolean,
+  fieldName: string,
+) => {
+  const leftOutLines = countLineBreaksBefore(trimmed, start);
+  const leftOutCharacters = startsMidLine ? start - trimmed.lastIndexOf("\n", start - 1) - 1 : 0;
+  const parts = [
+    ...(leftOutLines > 0 ? [counted(leftOutLines, "earlier line")] : []),
+    ...(leftOutCharacters > 0
+      ? [`the first ${counted(leftOutCharacters, "character")} of this line`]
+      : []),
+  ];
+  const isOneThing = parts.length === 1 && leftOutLines + leftOutCharacters === 1;
+  return parts.length === 0
+    ? []
+    : [`(${parts.join(" and ")} ${isOneThing ? "is" : "are"} not shown; see ${fieldName})`];
+};
+
+const describeOutputEnd = (outputName: string, fieldName: string, output: string) => {
+  const trimmed = output.trimEnd();
+  if (trimmed === "") {
+    return [];
+  }
+  const { start, startsMidLine } = selectShownOutput(trimmed);
+  return [
+    `${outputName}:`,
+    ...describeLeftOut(trimmed, start, startsMidLine, fieldName),
+    trimmed.slice(start),
+  ];
 };
 
 export class CommandFailed extends Schema.TaggedError<CommandFailed>()(
@@ -174,8 +206,8 @@ export class CommandFailed extends Schema.TaggedError<CommandFailed>()(
   public override get message() {
     return [
       this.printedMessage,
-      ...describeOutputEnd("standard output", this.standardOutput),
-      ...describeOutputEnd("standard error", this.standardError),
+      ...describeOutputEnd("standard output", "standardOutput", this.standardOutput),
+      ...describeOutputEnd("standard error", "standardError", this.standardError),
     ].join("\n");
   }
 

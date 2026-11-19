@@ -116,33 +116,52 @@ const SURROGATE_PAIRS = 4096;
 
 const SURROGATE_PAIRS_KEPT_WHOLE = 2047;
 
+const SURROGATE_CODE_UNITS_LEFT_OUT = 4098;
+
 const writtenLines = (count: number) =>
   Array.from({ length: count }, (_unused, index) => `line ${String(index + 1)}`);
 
 const ERROR_HEADING = "c exited with code 1\nstandard error:";
 
+const ONE_ERROR_LINE_LEFT_OUT = "(1 earlier line is not shown; see standardError)";
+
+const LINE_AND_CHARACTERS_LEFT_OUT = `(1 earlier line and the first ${String(LONG_LINE_CHARACTERS - MESSAGE_CHARACTERS)} characters of this line are not shown; see standardError)`;
+
 const failedWith = (standardError: string) =>
   new CommandFailed({ command: "c", code: 1, standardOutput: "", standardError }).message;
 
 export const commandFailedMessageBound = makeTest(
-  "a CommandFailed message carries at most the last 20 lines and 4096 characters of each of standard output and standard error, from its first whole line, under the name of each stream, and a CapturedCommandFailed message carries none",
+  "a CommandFailed message carries at most the last 20 lines and 4096 characters of each of standard output and standard error, from its first whole line, under the name of each stream, says in one note how many earlier lines and how many characters at the start of the shown line it left out and which field holds them, and a CapturedCommandFailed message carries none",
   Effect.sync(() => {
     expect(failedWith(`${writtenLines(WRITTEN_LINES).join("\n")}\n\n`)).toBe(
-      [ERROR_HEADING, ...writtenLines(WRITTEN_LINES).slice(WRITTEN_LINES - MESSAGE_LINES)].join(
-        "\n",
-      ),
+      [
+        ERROR_HEADING,
+        `(${String(WRITTEN_LINES - MESSAGE_LINES)} earlier lines are not shown; see standardError)`,
+        ...writtenLines(WRITTEN_LINES).slice(WRITTEN_LINES - MESSAGE_LINES),
+      ].join("\n"),
     );
     expect(failedWith(`first\n${"y".repeat(LONG_LINE_CHARACTERS)}`)).toBe(
-      `${ERROR_HEADING}\n…${"y".repeat(MESSAGE_CHARACTERS)}`,
+      `${ERROR_HEADING}\n${LINE_AND_CHARACTERS_LEFT_OUT}\n${"y".repeat(MESSAGE_CHARACTERS)}`,
     );
     expect(failedWith(`${"\u{1F600}".repeat(SURROGATE_PAIRS)}b`)).toBe(
-      `${ERROR_HEADING}\n…${"\u{1F600}".repeat(SURROGATE_PAIRS_KEPT_WHOLE)}b`,
+      `${ERROR_HEADING}\n(the first ${String(SURROGATE_CODE_UNITS_LEFT_OUT)} characters of this line are not shown; see standardError)\n${"\u{1F600}".repeat(SURROGATE_PAIRS_KEPT_WHOLE)}b`,
+    );
+    expect(failedWith(`q${"x".repeat(MESSAGE_CHARACTERS)}`)).toBe(
+      `${ERROR_HEADING}\n(the first 1 character of this line is not shown; see standardError)\n${"x".repeat(MESSAGE_CHARACTERS)}`,
+    );
+    expect(failedWith("\nok")).toBe(`${ERROR_HEADING}\n\nok`);
+    expect(failedWith("…data")).toBe(`${ERROR_HEADING}\n…data`);
+    expect(failedWith(`a\n…${"x".repeat(MESSAGE_CHARACTERS - 1)}`)).toBe(
+      `${ERROR_HEADING}\n${ONE_ERROR_LINE_LEFT_OUT}\n…${"x".repeat(MESSAGE_CHARACTERS - 1)}`,
+    );
+    expect(failedWith(`a\n${"x".repeat(MESSAGE_CHARACTERS - 1)}\uD800`)).toBe(
+      `${ERROR_HEADING}\n${ONE_ERROR_LINE_LEFT_OUT}\n${"x".repeat(MESSAGE_CHARACTERS - 1)}\uD800`,
     );
     expect(failedWith(`cut ${"z".repeat(MESSAGE_CHARACTERS)}\nwhole\n`)).toBe(
-      `${ERROR_HEADING}\nwhole`,
+      `${ERROR_HEADING}\n${ONE_ERROR_LINE_LEFT_OUT}\nwhole`,
     );
     expect(failedWith(`a\n${"x".repeat(MESSAGE_CHARACTERS)}`)).toBe(
-      `${ERROR_HEADING}\n${"x".repeat(MESSAGE_CHARACTERS)}`,
+      `${ERROR_HEADING}\n${ONE_ERROR_LINE_LEFT_OUT}\n${"x".repeat(MESSAGE_CHARACTERS)}`,
     );
     expect(
       new CommandFailed({
@@ -155,9 +174,11 @@ export const commandFailedMessageBound = makeTest(
       [
         "c exited with code 1",
         "standard output:",
+        `(${String(WRITTEN_LINES - MESSAGE_LINES)} earlier lines are not shown; see standardOutput)`,
         ...writtenLines(WRITTEN_LINES).slice(WRITTEN_LINES - MESSAGE_LINES),
         "standard error:",
-        `…${"y".repeat(MESSAGE_CHARACTERS)}`,
+        LINE_AND_CHARACTERS_LEFT_OUT,
+        "y".repeat(MESSAGE_CHARACTERS),
       ].join("\n"),
     );
     expect(
