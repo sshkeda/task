@@ -3,22 +3,22 @@ import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 const resolveWorkingDirectories = (
   path: Path.Path,
-  packageDirectoryPath: string,
+  runDirectoryPath: string,
   command: ChildProcess.Command,
 ): ChildProcess.Command =>
   ChildProcess.isStandardCommand(command)
-    ? ChildProcess.setCwd(command, path.resolve(packageDirectoryPath, command.options.cwd ?? "."))
+    ? ChildProcess.setCwd(command, path.resolve(runDirectoryPath, command.options.cwd ?? "."))
     : ChildProcess.pipeTo(
-        resolveWorkingDirectories(path, packageDirectoryPath, command.left),
-        resolveWorkingDirectories(path, packageDirectoryPath, command.right),
+        resolveWorkingDirectories(path, runDirectoryPath, command.left),
+        resolveWorkingDirectories(path, runDirectoryPath, command.right),
         command.options,
       );
 
-export const runCommandsInPackageDirectory = (
+export const runCommandsInRunDirectory = (
   path: Path.Path,
-  packageDirectoryPath: string,
+  runDirectoryPath: string,
   spawn: ChildProcessSpawner.ChildProcessSpawner["Service"]["spawn"],
 ) =>
   ChildProcessSpawner.make((command) =>
-    spawn(resolveWorkingDirectories(path, packageDirectoryPath, command)),
+    spawn(resolveWorkingDirectories(path, runDirectoryPath, command)),
   );

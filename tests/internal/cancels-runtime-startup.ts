@@ -14,6 +14,7 @@ import { makeProjectUsingTaskFrom } from "../shared/make-projects.ts";
 import { makeScratchDirectory } from "../shared/make-temporary-directories.ts";
 import { makeTest } from "../shared/make-tests.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
+import { expectNoRunDirectoryOrBothRunLines } from "../shared/split-run-lines.ts";
 
 const STARTUP_PAUSE_SOURCE = `yield* Effect.addFinalizer(() => Effect.sync(() => { process.stderr.write("startup cleaned up\\n"); }));
 yield* Effect.sync(() => { process.stderr.write("startup paused\\n"); });
@@ -51,10 +52,10 @@ const cancelsStartup = (
   Effect.scoped(
     Effect.gen(function* () {
       const engine = yield* copyEngineWithEdits([{ file, before, replacement }]);
-      for (const [signal, exitCode] of [
-        ["INT", EXIT_CODE_AFTER_SIGINT],
-        ["TERM", EXIT_CODE_AFTER_SIGTERM],
-        ["HUP", EXIT_CODE_AFTER_SIGHUP],
+      for (const [signal, exitCode, stoppingLine] of [
+        ["INT", EXIT_CODE_AFTER_SIGINT, "stopping: press ctrl-c again to force"],
+        ["TERM", EXIT_CODE_AFTER_SIGTERM, "stopping: send SIGTERM or press ctrl-c again to force"],
+        ["HUP", EXIT_CODE_AFTER_SIGHUP, "stopping: send SIGTERM or press ctrl-c to force"],
       ] as const) {
         const project = yield* makeProjectUsingTaskFrom({
           taskPackageDirectoryPath: engine,
@@ -69,12 +70,12 @@ export default Task.make({ name: "main", run: Effect.log("ROOT EXECUTED") });`,
         yield* command.sendSignal(signal);
         const result = yield* command.waitForExit;
         expect(result.exitCode).toBe(exitCode);
-        expect(result.standardError).toContain(`received SIG${signal}`);
+        expect(result.standardError.split("\n")).toContain(stoppingLine);
         expect(countOccurrences(result.standardError, "startup cleaned up")).toBe(1);
         expect(result.standardError).not.toContain("ROOT EXECUTED");
-        expect(result.standardError).not.toContain("[main] started");
-        if (result.standardError.includes("\nwrote the trace to")) {
-          expect(result.standardError.indexOf("wrote the trace to")).toBeGreaterThan(
+        yield* expectNoRunDirectoryOrBothRunLines(result.standardError);
+        if (result.standardError.includes("\nrun: ")) {
+          expect(result.standardError.lastIndexOf("\nrun: ")).toBeGreaterThan(
             result.standardError.indexOf("startup cleaned up"),
           );
         }
@@ -157,10 +158,9 @@ export const releasesEarlierStartupResources = makeTest(
       const failedRun = yield* runTaskProcess(project, "main.ts");
       expect(failedRun.exitCode).toBe(1);
       const expectedError =
-        "main.ts: error TaskModuleImportFailed: could not import task module because injected import failure";
+        "main.ts: Error: injected import failure\nerror: could not import task module\n";
       expect(failedRun.standardError).toContain(expectedError);
       expect(failedRun.standardError).not.toContain("body ran");
-      expect(failedRun.standardError).not.toContain("[main] started");
       const finalErrorIndex = failedRun.standardError.lastIndexOf(expectedError);
       for (const resourceName of ["config", "task discovery"]) {
         const releasedLines = failedRun.standardError

@@ -49,7 +49,7 @@ import type { Duration } from "effect";
 import { Task } from "@sshkeda/task";
 const settings: { readonly timeout?: Duration.Input; readonly directory?: string; readonly concurrency?: number } = {};
 export const listed = Task.make({ name: "listed", output: Schema.String, run: Effect.gen(function* () {
-  const text: string = yield* Task.exec("ls", [], { cwd: settings.directory, env: undefined, stdin: undefined });
+  const text: string = yield* Task.exec("ls", [], { cwd: settings.directory, env: undefined, stdin: undefined, print: undefined });
   return text;
 }), timeout: settings.timeout, cleanup: undefined });
 export default Task.make({ name: "main", run: Effect.gen(function* () {

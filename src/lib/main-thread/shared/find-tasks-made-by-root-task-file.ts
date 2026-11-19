@@ -1,13 +1,13 @@
 import { inspect } from "node:util";
 
-import { Array as Arrays, Duration, Effect, Path, Predicate } from "effect";
+import { Array as Arrays, Duration, Effect, Formatter, Path, Predicate } from "effect";
 
-import { makeNodeModulesPackageFinder } from "../../../shared/find-node-modules-package-directory.ts";
+import { filePathOfLocation } from "../../../shared/find-user-locations-in-stack-traces.ts";
+import { nameTask } from "../../../shared/label-lines.ts";
 import { makeRootTaskGroup } from "../../../shared/make-root-task-group.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
 import {
   findDefinitionNotGiven,
-  filePathOfLocation,
   findTasksMadeWithName,
   listTasksMade,
   listTasksMadeWithName,
@@ -21,25 +21,23 @@ import {
   TaskNameNotString,
   TaskSetupTimedOut,
 } from "../../../shared/task-errors.ts";
-import { requirePackageJsonDirectoryPath } from "./find-package-directories.ts";
+import { withTaskSpan } from "../../../shared/task-spans.ts";
 import {
   BrokenTasksFound,
   RootTaskNotMadeWhileLoading,
   TaskCleanupInvalid,
   TaskIsolatedInvalid,
+  TaskMadeAtUnknownLocation,
   TaskMadeMoreThanOnce,
   TaskNameBlank,
   TaskNameEmpty,
-  TaskNameMultiline,
   TaskOptionsUnknown,
   TaskTimeoutInvalid,
 } from "./main-thread-errors.ts";
 import type { TaskDefinitionViolation } from "./main-thread-errors.ts";
 import { RunRootTaskConfig } from "./provide-run-root-task-config.ts";
 
-const LINE_BREAK = /[\n\r]/u;
-
-export const checkTasksMadeWithName = Effect.fn("checkTasksMadeWithName")(function* (
+export const checkTasksMadeWithName = (
   taskName: string,
   madeTasks: readonly {
     readonly location: string | undefined;
@@ -47,15 +45,12 @@ export const checkTasksMadeWithName = Effect.fn("checkTasksMadeWithName")(functi
     readonly definitionNotGiven?: ReturnType<typeof findDefinitionNotGiven>;
   }[],
   madeOnWorkerId: number | null,
-) {
-  const { rootTaskFilePath, rootTaskPackageJsonDirectoryPath } = yield* RunRootTaskConfig;
+) => {
   const violations: (typeof TaskDefinitionViolation.Type)[] = [];
   const [madeTask, ...otherMadeTasks] = madeTasks;
   if (madeTask === undefined) {
     return { violations, discovered: null };
   }
-  const location = madeTask.location ?? rootTaskFilePath;
-  const taskFilePath = filePathOfLocation(location);
   const definitionsNotGiven = madeTasks.flatMap((made) => made.definitionNotGiven ?? []);
   if (Arrays.isArrayNonEmpty(definitionsNotGiven)) {
     violations.push(
@@ -63,13 +58,25 @@ export const checkTasksMadeWithName = Effect.fn("checkTasksMadeWithName")(functi
         (notGiven) =>
           new TaskDefinitionNotGiven({
             given: notGiven.given,
-            location: notGiven.location ?? rootTaskFilePath,
+            location: notGiven.location,
           }),
       ),
     );
     return { violations, discovered: null };
   }
   const name: unknown = taskName;
+  const locations = madeTasks.flatMap((made) => made.location ?? []);
+  const location = madeTask.location;
+  const isAnyLocationUnknown = location === undefined || locations.length < madeTasks.length;
+  if (isAnyLocationUnknown) {
+    violations.push(
+      new TaskMadeAtUnknownLocation({
+        nameText: Predicate.isString(name) ? nameTask(name) : Formatter.format(name),
+      }),
+    );
+    return { violations, discovered: null };
+  }
+  const taskFilePath = filePathOfLocation(location);
   if (typeof name !== "string") {
     violations.push(new TaskNameNotString({ location, nameText: inspect(name) }));
     return { violations, discovered: null };
@@ -82,22 +89,13 @@ export const checkTasksMadeWithName = Effect.fn("checkTasksMadeWithName")(functi
     violations.push(new TaskNameBlank({ location }));
     return { violations, discovered: null };
   }
-  if (LINE_BREAK.test(name)) {
-    violations.push(
-      new TaskNameMultiline({
-        location,
-        nameText: `"${name.replaceAll("\n", String.raw`\n`).replaceAll("\r", String.raw`\r`)}"`,
-      }),
-    );
-    return { violations, discovered: null };
-  }
   if (otherMadeTasks.length > 0) {
     violations.push(
-      ...madeTasks.map(
-        (made) =>
+      ...locations.map(
+        (madeLocation) =>
           new TaskMadeMoreThanOnce({
             taskName,
-            location: made.location ?? rootTaskFilePath,
+            location: madeLocation,
             madeCount: madeTasks.length,
           }),
       ),
@@ -128,23 +126,18 @@ export const checkTasksMadeWithName = Effect.fn("checkTasksMadeWithName")(functi
   if (isMissingDuration) {
     return { violations, discovered: null };
   }
-  const taskPackageJsonDirectoryPath =
-    makeNodeModulesPackageFinder(rootTaskPackageJsonDirectoryPath)(taskFilePath) === null
-      ? yield* requirePackageJsonDirectoryPath(taskFilePath)
-      : rootTaskPackageJsonDirectoryPath;
   return {
     violations,
     discovered: {
       location,
       filePath: taskFilePath,
-      packageJsonDirectoryPath: taskPackageJsonDirectoryPath,
       timeoutDuration: timeout.duration,
       cleanupDuration: cleanup.duration ?? STOP_GRACE_PERIOD,
       isolated: isolated === true,
       madeOnWorkerId,
     },
   };
-});
+};
 
 const readTasksMade = (madeTasks: ReturnType<typeof listTasksMadeWithName>) =>
   madeTasks.map((made) => ({
@@ -153,19 +146,12 @@ const readTasksMade = (madeTasks: ReturnType<typeof listTasksMadeWithName>) =>
     definitionNotGiven: findDefinitionNotGiven(made.task),
   }));
 
-export const findTaskMadeLate = Effect.fn("findTaskMadeLate")(function* (
-  taskName: string,
-  taskFilePath: string,
-) {
+export const findTaskMadeLate = Effect.fn(function* (taskName: string, taskFilePath: string) {
   yield* Effect.promise(() => import(taskFilePath));
-  return yield* checkTasksMadeWithName(
-    taskName,
-    readTasksMade(listTasksMadeWithName(taskName)),
-    null,
-  );
+  return checkTasksMadeWithName(taskName, readTasksMade(listTasksMadeWithName(taskName)), null);
 });
 
-export const findTasksMadeByRootTaskFile = Effect.fn("findTasksMadeByRootTaskFile")(function* () {
+export const findTasksMadeByRootTaskFile = Effect.fn(function* () {
   const path = yield* Path.Path;
   const runRootTaskConfig = yield* RunRootTaskConfig;
   const { rootTaskName, rootTaskGroup, rootTaskFilePath, rootTaskPackageJsonDirectoryPath } =
@@ -185,21 +171,19 @@ export const findTasksMadeByRootTaskFile = Effect.fn("findTasksMadeByRootTaskFil
           }),
         ),
     }),
-    Effect.withSpan("import task file", {
-      attributes: {
-        [`${TASK_TRACE_LABEL_PREFIX}.file`]: path.relative(
-          rootTaskPackageJsonDirectoryPath,
-          rootTaskFilePath,
-        ),
-      },
+    withTaskSpan("import", "import task file", {
+      [`${TASK_TRACE_LABEL_PREFIX}.file`]: path.relative(
+        rootTaskPackageJsonDirectoryPath,
+        rootTaskFilePath,
+      ),
     }),
   );
-  yield* makeRootTaskGroup(rootTaskGroup);
+  yield* makeRootTaskGroup(rootTaskGroup, rootTaskFilePath);
 
   const violations: (typeof TaskDefinitionViolation.Type)[] = [];
   const discoveredTaskEntries = [];
   for (const [taskName, madeTasks] of listTasksMade()) {
-    const checked = yield* checkTasksMadeWithName(taskName, readTasksMade(madeTasks), null);
+    const checked = checkTasksMadeWithName(taskName, readTasksMade(madeTasks), null);
     violations.push(...checked.violations);
     if (checked.discovered !== null) {
       discoveredTaskEntries.push([taskName, checked.discovered] as const);
@@ -214,23 +198,30 @@ export const findTasksMadeByRootTaskFile = Effect.fn("findTasksMadeByRootTaskFil
   return new Map(discoveredTaskEntries);
 });
 
-export const findUnexportedRootFileTaskNames = Effect.fn("findUnexportedRootFileTaskNames")(
-  function* () {
-    const { rootTaskFilePath } = yield* RunRootTaskConfig;
-    const rootTaskFile = yield* Effect.promise((): Promise<unknown> => import(rootTaskFilePath));
-    const exportedValues = new Set(
-      Predicate.isObject(rootTaskFile) ? Object.values(rootTaskFile) : [],
-    );
-    return listTasksMade().flatMap(([taskName, madeTasks]) =>
-      madeTasks.some((madeTask) => {
-        const isMadeByTheRootFile =
-          madeTask.location !== undefined &&
-          filePathOfLocation(madeTask.location) === rootTaskFilePath;
-        const isLeftOut = !madeTask.madeInTaskBody && !exportedValues.has(madeTask.task);
-        return isMadeByTheRootFile && isLeftOut;
-      })
-        ? [taskName]
-        : [],
-    );
-  },
-);
+export const findRootFileTaskNames = Effect.fn(function* () {
+  const { rootTaskFilePath } = yield* RunRootTaskConfig;
+  const rootTaskFile = yield* Effect.promise((): Promise<unknown> => import(rootTaskFilePath));
+  const exportedValues = new Set(
+    Predicate.isObject(rootTaskFile) ? Object.values(rootTaskFile) : [],
+  );
+  const tasksMadeByTheRootFile = listTasksMade().map(([taskName, madeTasks]) => ({
+    taskName,
+    madeTasks: madeTasks.filter(
+      (madeTask) =>
+        madeTask.location !== undefined &&
+        filePathOfLocation(madeTask.location) === rootTaskFilePath,
+    ),
+  }));
+  return {
+    made: tasksMadeByTheRootFile
+      .filter(({ madeTasks }) => Arrays.isArrayNonEmpty(madeTasks))
+      .map(({ taskName }) => taskName),
+    unexported: tasksMadeByTheRootFile
+      .filter(({ madeTasks }) =>
+        madeTasks.some(
+          (madeTask) => !madeTask.madeInTaskBody && !exportedValues.has(madeTask.task),
+        ),
+      )
+      .map(({ taskName }) => taskName),
+  };
+});

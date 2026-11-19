@@ -62,7 +62,7 @@ const SUPERVISOR_SOCKET_ARGUMENT_PREFIX = `--${packageNameParts.join("-")}-super
 
 const RUN_ARGUMENT_PREFIX = `--${packageNameParts.join("-")}-run=`;
 
-export const LOG_LEVEL_NAMES = ["info", "error"] as const;
+export const LOG_LEVEL_NAMES = ["debug", "info", "error"] as const;
 
 const RunArgument = Schema.fromJsonString(
   Schema.Struct({
@@ -156,7 +156,7 @@ const isWholeDecimalNumberAboveZero = Schema.is(
   Schema.String.check(Schema.isPattern(/^0*[1-9]\d*$/u)),
 );
 
-export const readStateDirectory = Effect.fn("readStateDirectory")(function* () {
+export const readStateDirectory = Effect.fn(function* () {
   const path = yield* Path.Path;
   const configuredStateDirectoryPath = yield* readEnvironmentVariable(
     STATE_DIRECTORY_VARIABLE_NAME,
@@ -186,7 +186,7 @@ export const readStateDirectory = Effect.fn("readStateDirectory")(function* () {
   };
 });
 
-export const readWorkerCount = Effect.fn("readWorkerCount")(function* () {
+export const readWorkerCount = Effect.fn(function* () {
   const configuredWorkerCount = yield* readEnvironmentVariable(WORKER_COUNT_VARIABLE_NAME);
   if (Option.isNone(configuredWorkerCount)) {
     return yield* availableParallelism;
@@ -214,7 +214,7 @@ const DEFAULT_SETUP_LIMIT = Duration.minutes(1);
 
 const decodeDurationOption = Schema.decodeUnknownOption(Schema.DurationFromString);
 
-export const readSetupLimit = Effect.fn("readSetupLimit")(function* () {
+export const readSetupLimit = Effect.fn(function* () {
   const configuredSetupLimit = yield* readEnvironmentVariable(SETUP_LIMIT_VARIABLE_NAME);
   if (Option.isNone(configuredSetupLimit)) {
     return DEFAULT_SETUP_LIMIT;
@@ -237,7 +237,7 @@ const LOG_LEVEL_VARIABLE_NAME = `${TASK_ENVIRONMENT_VARIABLE_PREFIX}_LOG`;
 
 const decodeLogLevelName = Schema.decodeUnknownOption(Schema.Literals(LOG_LEVEL_NAMES));
 
-export const readLogLevelName = Effect.fn("readLogLevelName")(function* () {
+export const readLogLevelName = Effect.fn(function* () {
   const configuredLogLevelName = yield* readEnvironmentVariable(LOG_LEVEL_VARIABLE_NAME);
   if (Option.isNone(configuredLogLevelName)) {
     return "info";
@@ -256,6 +256,10 @@ export const readLogLevelName = Effect.fn("readLogLevelName")(function* () {
 export const inheritedEnvironment = Effect.sync(() => ({ ...process.env }));
 
 export const RUN_MARKERS_VARIABLE_NAME = `${TASK_ENVIRONMENT_VARIABLE_PREFIX}_RUN_MARKERS`;
+
+export const RECAP_FILE_VARIABLE_NAME = `${TASK_ENVIRONMENT_VARIABLE_PREFIX}_RECAP_FILE`;
+
+export const inheritedRecapFile = readEnvironmentVariableNow(RECAP_FILE_VARIABLE_NAME);
 
 export const inheritedRunMarkers = readEnvironmentVariableNow(RUN_MARKERS_VARIABLE_NAME).pipe(
   Effect.map((runMarkers) =>
@@ -297,7 +301,7 @@ export const requireSupportedBunVersion = (
   bunVersion: string,
   supportedRange: string = TASK_PACKAGE.engines.bun,
 ) =>
-  Bun.semver.satisfies(bunVersion.replace(/[-+].*$/u, ""), supportedRange)
+  Bun.semver.satisfies(bunVersion, supportedRange)
     ? Effect.void
     : Effect.fail(
         new BunVersionUnsupported({

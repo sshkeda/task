@@ -6,6 +6,7 @@ import { TaskCleanupTimedOut } from "../../../../../shared/main-thread-errors.ts
 import { RunRootTaskConfig } from "../../../../../shared/provide-run-root-task-config.ts";
 import type { StopState } from "../../../../../shared/provide-stop-state.ts";
 import { WorkerPool } from "../../../../../shared/provide-worker-pool.ts";
+import type { TaskOutputFiles } from "../../../../../shared/write-task-output-files.ts";
 import { findTaskNamesOccupyingWorker } from "../../../shared/define-task-run-state.ts";
 import type { makeTaskRunsState } from "../../../shared/define-task-run-state.ts";
 import { isInBody } from "../../../shared/define-task-run-status.ts";
@@ -15,7 +16,7 @@ const WORKER_ANSWERS_WITHIN_MILLISECONDS = 200;
 
 const WORKER_ANSWERS_WITHIN = Duration.millis(WORKER_ANSWERS_WITHIN_MILLISECONDS);
 
-export const makeTaskSetupClock = Effect.fn("makeTaskSetupClock")(function* (
+export const makeTaskSetupClock = Effect.fn(function* (
   taskRunsState: Effect.Success<typeof makeTaskRunsState>,
   taskName: string,
   cleanupDuration: Duration.Duration,
@@ -108,7 +109,11 @@ export const makeTaskSetupClock = Effect.fn("makeTaskSetupClock")(function* (
   const awaitSetupWithinLimit = <Success, Failure>(
     setupFiber: Fiber.Fiber<Success, Failure>,
     describeUnfinishedStep: () => string,
-  ): Effect.Effect<Exit.Exit<Success, Failure> | null, never, RunRootTaskConfig | StopState> =>
+  ): Effect.Effect<
+    Exit.Exit<Success, Failure> | null,
+    never,
+    RunRootTaskConfig | StopState | TaskOutputFiles
+  > =>
     Effect.gen(function* () {
       const setupExit = yield* awaitWithinCountedLimit(
         Fiber.await(setupFiber),
@@ -142,7 +147,6 @@ export const makeTaskSetupClock = Effect.fn("makeTaskSetupClock")(function* (
           ),
         ),
       ),
-    isWorkerHeldByOtherTasks,
     limit: <Success, Failure, Services>(
       setup: Effect.Effect<Success, Failure, Services>,
       describeUnfinishedStep: () => string,

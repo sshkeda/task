@@ -1,7 +1,7 @@
 import { expect } from "bun:test";
 
 import { Task } from "@sshkeda/task";
-import { Effect, Exit, FileSystem, Stream } from "effect";
+import { Effect, Exit, FileSystem, PlatformError, Stream } from "effect";
 import { ChildProcess } from "effect/process";
 
 import { listProcessesFromProcDirectory } from "../../src/lib/kill-leftover-processes/internal/list-linux-processes-from-proc.ts";
@@ -12,6 +12,7 @@ import { REPOSITORY_DIRECTORY } from "../shared/find-repository-directory.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeScratchDirectory } from "../shared/make-temporary-directories.ts";
 import { makeTest } from "../shared/make-tests.ts";
+import { readShellExecutableName } from "../shared/read-shell-executable-name.ts";
 import { makeTaskProcessEnvironment } from "../shared/run-task-processes.ts";
 
 const FIXTURE_PROCESS_ID = 300;
@@ -84,7 +85,7 @@ export default Task.make({ name: "main", run: ownProcess });`,
 );
 
 export const spawnedTree = makeTest(
-  "the process list shows a started sh and the perl it starts with their parent process ids, process group and program names",
+  "the process list shows a started sh and the perl it starts with their parent process ids, process group and the names of the executables they run",
   Effect.scoped(
     Effect.gen(function* () {
       const shell = yield* ChildProcess.make("sh", [
@@ -103,7 +104,7 @@ export const spawnedTree = makeTest(
       expect(listedPerl.processGroupId).toBe(shellProcessGroupId);
       expect(listedShell.hasEnded).toBe(false);
       expect(listedPerl.hasEnded).toBe(false);
-      expect(yield* listedShell.readCommandLineUnlessGone).toBe("sh");
+      expect(yield* listedShell.readCommandLineUnlessGone).toBe(yield* readShellExecutableName);
       expect(yield* listedPerl.readCommandLineUnlessGone).toBe("perl");
     }),
   ),
@@ -165,15 +166,13 @@ sleep;`,
   ),
 );
 
-export const namedByFirstArgument = makeTest(
-  "a process is named by the base name of its argv[0], without its arguments",
+export const namedByExecutable = makeTest(
+  "a process is named by the base name of the executable it runs, not by its argv[0]",
   Effect.scoped(
     Effect.gen(function* () {
       const perl = yield* ChildProcess.make("perl", [
         "-e",
-        `$| = 1; print "$$\\n"; sleep 1000`,
-        "\uFEFFleading",
-        "inside\uFEFFword",
+        `exec { $^X } "\uFEFFpostgres", "-e", '$| = 1; print "$$\\n"; sleep 1000'`,
       ]);
       const perlProcessId = Number(yield* readFirstLine(perl.stdout));
       yield* killWhenDone(perlProcessId);
@@ -200,34 +199,113 @@ export const exitedAfterListing = makeTest(
   ),
 );
 
-export const linuxByteOrderMarks = makeTest(
-  "the Linux process list names a process by its argv[0] with one U+FEFF dropped from its start, and without its other arguments",
+const listFixtureProcess = (readExecutableLink: FileSystem.FileSystem["readLink"]) =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const fixtures = yield* makeScratchDirectory;
+    yield* fileSystem.writeFileString(
+      `${fixtures}/stat`,
+      `${FIXTURE_PROCESS_ID} (perl) S 1 ${FIXTURE_PROCESS_ID} ${FIXTURE_PROCESS_ID} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 10\n`,
+    );
+    yield* fileSystem.writeFileString(
+      `${fixtures}/cmdline`,
+      "\uFEFF\uFEFFpostgres\0\uFEFF\uFEFFsecond\0",
+    );
+    const fixturePathOf = (filePath: string) =>
+      filePath.replace(`/proc/${FIXTURE_PROCESS_ID}`, fixtures);
+    const listed = yield* listProcessesFromProcDirectory(null).pipe(
+      Effect.provideService(
+        FileSystem.FileSystem,
+        FileSystem.makeNoop({
+          readDirectory: () => Effect.succeed([String(FIXTURE_PROCESS_ID)]),
+          readFile: (filePath) => fileSystem.readFile(fixturePathOf(filePath)),
+          readFileString: (filePath) => fileSystem.readFileString(fixturePathOf(filePath)),
+          readLink: readExecutableLink,
+        }),
+      ),
+    );
+    const listedPerl = yield* Effect.fromNullishOr(listed.get(FIXTURE_PROCESS_ID));
+    return yield* listedPerl.readCommandLineUnlessGone;
+  });
+
+export const linuxExecutable = makeTest(
+  "the Linux process list names a process by the base name of the executable /proc/<pid>/exe links to, not by its argv[0]",
   Effect.scoped(
     Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
-      const fixtures = yield* makeScratchDirectory;
-      yield* fileSystem.writeFileString(
-        `${fixtures}/stat`,
-        `${FIXTURE_PROCESS_ID} (perl) S 1 ${FIXTURE_PROCESS_ID} ${FIXTURE_PROCESS_ID} 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 10\n`,
-      );
-      yield* fileSystem.writeFileString(
-        `${fixtures}/cmdline`,
-        "\uFEFF\uFEFFperl\0\uFEFF\uFEFFsecond\0",
-      );
-      const fixturePathOf = (filePath: string) =>
-        filePath.replace(`/proc/${FIXTURE_PROCESS_ID}`, fixtures);
-      const listed = yield* listProcessesFromProcDirectory(null).pipe(
-        Effect.provideService(
-          FileSystem.FileSystem,
-          FileSystem.makeNoop({
-            readDirectory: () => Effect.succeed([String(FIXTURE_PROCESS_ID)]),
-            readFile: (filePath) => fileSystem.readFile(fixturePathOf(filePath)),
-            readFileString: (filePath) => fileSystem.readFileString(fixturePathOf(filePath)),
-          }),
-        ),
-      );
-      const listedPerl = yield* Effect.fromNullishOr(listed.get(FIXTURE_PROCESS_ID));
-      expect(yield* listedPerl.readCommandLineUnlessGone).toBe("\uFEFFperl");
+      expect(yield* listFixtureProcess(() => Effect.succeed("/usr/bin/perl"))).toBe("perl");
     }),
   ),
+);
+
+export const linuxUnreadableExecutable = makeTest(
+  "the Linux process list says the executable is unknown for a name it took from argv[0], keeping its leading U+FEFF characters, when /proc/<pid>/exe cannot be read",
+  Effect.scoped(
+    Effect.gen(function* () {
+      expect(
+        yield* listFixtureProcess((filePath) =>
+          Effect.fail(
+            PlatformError.systemError({
+              _tag: "PermissionDenied",
+              module: "FileSystem",
+              method: "readLink",
+              pathOrDescriptor: filePath,
+              cause: Object.assign(new Error("EACCES: denied"), { code: "EACCES" }),
+            }),
+          ),
+        ),
+      ).toBe("\uFEFF\uFEFFpostgres, executable unknown");
+    }),
+  ),
+);
+
+const ELECTRON_PROCESS_ID = 74_697;
+
+const RUNNING_FLAGS = 4_194_560;
+
+const EXITING_FLAGS = 4_194_564;
+
+const listElectronMainProcess = (flags: number) =>
+  Effect.gen(function* () {
+    const listed = yield* listProcessesFromProcDirectory(null).pipe(
+      Effect.provideService(
+        FileSystem.FileSystem,
+        FileSystem.makeNoop({
+          readDirectory: () => Effect.succeed([String(ELECTRON_PROCESS_ID)]),
+          readFile: () => Effect.succeed(new Uint8Array()),
+          readFileString: () =>
+            Effect.succeed(
+              `${ELECTRON_PROCESS_ID} (ChatGPT) R 1 ${ELECTRON_PROCESS_ID} ${ELECTRON_PROCESS_ID} 0 -1 ${flags} 100 0 0 0 1 2 0 0 20 0 1 0 98765 1000 10\n`,
+            ),
+          readLink: (filePath) =>
+            Effect.fail(
+              PlatformError.systemError({
+                _tag: "NotFound",
+                module: "FileSystem",
+                method: "readLink",
+                pathOrDescriptor: filePath,
+                cause: Object.assign(new Error("ENOENT: gone"), { code: "ENOENT" }),
+              }),
+            ),
+        }),
+      ),
+    );
+    const listedProcess = yield* Effect.fromNullishOr(listed.get(ELECTRON_PROCESS_ID));
+    return {
+      hasEnded: listedProcess.hasEnded,
+      name: yield* listedProcess.readCommandLineUnlessGone,
+    };
+  });
+
+export const linuxExitingProcessEnded = makeTest(
+  "the Linux process list shows a process whose stat flags say it is exiting as ended and unnamed, while a running one whose executable and arguments are gone is named by its process name with its executable unknown",
+  Effect.gen(function* () {
+    expect(yield* listElectronMainProcess(EXITING_FLAGS)).toEqual({
+      hasEnded: true,
+      name: null,
+    });
+    expect(yield* listElectronMainProcess(RUNNING_FLAGS)).toEqual({
+      hasEnded: false,
+      name: "ChatGPT, executable unknown",
+    });
+  }),
 );

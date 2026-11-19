@@ -3,11 +3,16 @@ import { Cause, Effect, Exit, Option, Schema } from "effect";
 import { reportCause } from "../../../shared/report-cause.ts";
 import { TaskFiberResult } from "../../../shared/rpc.ts";
 import type { StartTaskFiber } from "../../../shared/rpc.ts";
-import { failuresOfCause, failureValuesOfReason } from "../../../shared/select-cause-reasons.ts";
+import {
+  failuresOfCause,
+  failureValuesOfCause,
+  failureValuesOfReason,
+} from "../../../shared/select-cause-reasons.ts";
 import { isAwaitedTaskFailed, isAwaitedTasksFailure } from "../../../shared/task-errors.ts";
 import { CapturedCommandFailed, CommandFailed } from "../../errors/index.ts";
 import type { makeTaskBodyRecord } from "../shared/define-task-body-record.ts";
 import { encodeTaskOutput } from "../shared/encode-task-output.ts";
+import { collectStackFrames } from "./collect-stack-frames.ts";
 
 const isCommandFailed = Schema.is(Schema.Union([CommandFailed, CapturedCommandFailed]));
 
@@ -31,6 +36,12 @@ const withoutRepeatedAwaitedFailures = (cause: Cause.Cause<unknown>) => {
   );
 };
 
+const reportWithStackFrames = (cause: Cause.Cause<unknown>, failureValues: readonly unknown[]) => {
+  const report = reportCause(cause);
+  const stackFrames = collectStackFrames(failureValues);
+  return { ...report, ...(stackFrames.length === 0 ? {} : { stackFrames }) };
+};
+
 export const describeBodyFailure = (bodyCause: Cause.Cause<unknown>) => {
   const cause = withoutRepeatedAwaitedFailures(bodyCause);
   const failureCause = failuresOfCause(cause);
@@ -46,9 +57,17 @@ export const describeBodyFailure = (bodyCause: Cause.Cause<unknown>) => {
     Option.flatMapNullishOr(failedCommand, (failure) => failure.code),
   );
   const hasOnlyCommandFailure = hasOnlyOneFailure && failedCommandExitCode !== null;
+  const awaitedTaskNames = failureValuesOfCause(failureCause)
+    .filter((failureValue) => isAwaitedTasksFailure(failureValue))
+    .flatMap((awaitedFailure) =>
+      isAwaitedTaskFailed(awaitedFailure)
+        ? [awaitedFailure.awaitedTaskName]
+        : awaitedFailure.failedTaskNames,
+    );
   return TaskFiberResult.cases.Failed.make({
-    ...reportCause(cause),
+    ...reportWithStackFrames(cause, failureValuesOfCause(failureCause)),
     ...(hasOnlyCommandFailure ? { failedCommandExitCode } : {}),
+    ...(awaitedTaskNames.length === 0 ? {} : { awaitedTaskNames }),
   });
 };
 
@@ -120,9 +139,11 @@ export const describeCleanupFailure = (
     : [];
   const reasonsOfProcessCleanup = Exit.isFailure(cleanupExit) ? cleanupExit.cause.reasons : [];
   const cleanupFailureReasons = [...reasonsOfProcessCleanup, ...reasonsAddedByFinalizers];
-  return cleanupFailureReasons.length === 0
-    ? null
-    : TaskFiberResult.cases.CleanupFailed.make(
-        reportCause(Cause.fromReasons(cleanupFailureReasons)),
-      );
+  if (cleanupFailureReasons.length === 0) {
+    return null;
+  }
+  const cleanupCause = Cause.fromReasons(cleanupFailureReasons);
+  return TaskFiberResult.cases.CleanupFailed.make(
+    reportWithStackFrames(cleanupCause, failureValuesOfCause(cleanupCause)),
+  );
 };

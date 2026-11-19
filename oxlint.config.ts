@@ -19,25 +19,34 @@ export default lintConfig({
     allow: ["pollsWithADeadline", "spawnsCommands"],
   },
   "tests/internal/kills-processes-that-leave-their-session.ts": { allow: ["pollsWithADeadline"] },
+  "tests/shared/is-process-alive.ts": { allow: ["pollsWithADeadline"] },
+  "tests/shared/start-task-process-with-pipes.ts": { allow: ["pollsWithADeadline"] },
   "src/lib/task/internal/run-root-task.ts": {
     allow: ["exitsTheProcess", "importsDynamically", "writesToTheTerminal", "handlesEveryFailure"],
   },
   "src/shared/task-services.ts": { services: ["Tasks", "Serving"] },
+  "src/shared/task-spans.ts": { services: ["TaskSpanAnnouncements"] },
   "src/shared/read-environment-config.ts": { allow: ["readsConfig"] },
+  "src/shared/command-recap-file.ts": {
+    allow: ["fallsBackToFixedValues"],
+    services: ["CommandRecapFiles"],
+  },
   "src/shared/run-in-terminal.ts": { allow: ["spawnsCommands"], services: ["TerminalCommands"] },
   "src/lib/supervise-the-run/internal/supervise-run.ts": {
     allow: ["spawnsCommands", "handlesEveryFailure"],
   },
   "src/shared/mark-task-worker-thread-contexts.ts": {
-    services: ["InsideTaskBody", "CommandLineFlags"],
+    services: ["InsideTaskBody", "CommandLineFlags", "TaskLines"],
   },
   "src/lib/main-thread/shared/find-tasks-made-by-root-task-file.ts": {
     allow: ["importsDynamically"],
   },
   "src/lib/main-thread/shared/provide-discovered-tasks.ts": { services: ["DiscoveredTasks"] },
   "src/lib/main-thread/shared/provide-process-groups.ts": { services: ["ProcessGroups"] },
+  "src/lib/main-thread/internal/provide-run-directory.ts": { services: ["RunDirectory"] },
   "src/lib/main-thread/shared/provide-run-root-task-config.ts": { services: ["RunRootTaskConfig"] },
   "src/lib/main-thread/shared/provide-stop-state.ts": { services: ["StopState"] },
+  "src/lib/main-thread/shared/write-task-output-files.ts": { services: ["TaskOutputFiles"] },
   "src/lib/main-thread/shared/write-trace-file.ts": { services: ["TraceFile"] },
   "src/lib/worker-thread/internal/run-task-body.ts": { allow: ["importsDynamically"] },
   "src/lib/worker-thread/internal/start-worker-thread.ts": {
@@ -46,7 +55,7 @@ export default lintConfig({
   "src/lib/worker-thread/lib/provide-task-services/internal/spawn-commands-with-bun.ts": {
     allow: ["spawnsCommands", "handlesEveryFailure"],
   },
-  "src/lib/worker-thread/lib/provide-task-services/internal/run-commands-in-package-directory.ts": {
+  "src/lib/worker-thread/lib/provide-task-services/internal/run-commands-in-run-directory.ts": {
     allow: ["spawnsCommands"],
   },
   "src/lib/worker-thread/lib/provide-task-services/internal/provide-task-services.ts": {
@@ -56,6 +65,9 @@ export default lintConfig({
     allow: ["spawnsCommands", "handlesEveryFailure"],
   },
   "src/lib/supervise-the-run/internal/watch-the-supervisor.ts": {
+    allow: ["handlesEveryFailure"],
+  },
+  "src/shared/print-to-standard-error.ts": {
     allow: ["writesToTheTerminal", "handlesEveryFailure"],
   },
   "src/lib/worker-thread/lib/provide-task-services/internal/read-standard-input-from-main-thread.ts":
@@ -131,7 +143,7 @@ export default lintConfig({
     },
   "src/lib/main-thread/shared/provide-worker-pool.ts": {
     services: ["WorkerPool"],
-    allow: ["writesToTheTerminal", "handlesEveryFailure", "fallsBackToFixedValues"],
+    allow: ["handlesEveryFailure", "fallsBackToFixedValues"],
   },
   "src/lib/supervise-the-run/internal/adopt-orphans-on-linux.ts": {
     allow: ["handlesEveryFailure"],
@@ -141,6 +153,10 @@ export default lintConfig({
   },
   "src/lib/worker-thread/internal/serve-on-the-parent-port.ts": {
     allow: ["handlesEveryFailure"],
+  },
+  "src/lib/worker-thread/internal/attribute-console-calls.ts": {
+    services: ["CurrentConsoleOwner"],
+    allow: ["handlesEveryFailure", "replacesTheConsole"],
   },
   "src/lib/worker-thread/shared/provide-worker-state.ts": {
     services: ["WorkerState"],

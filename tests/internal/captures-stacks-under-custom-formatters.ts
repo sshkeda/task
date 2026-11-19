@@ -15,7 +15,7 @@ export const customFormatter = Task.make({
 // Babel wraps the existing formatter and forwards the captured error to it.
 const nativeFormatter = Error.prepareStackTrace;
 Error.prepareStackTrace = (error, frames) => nativeFormatter(error, frames);
-export default Task.make({ name: "main", run: Task.exec("bun", ["--eval", "console.log('formatted command ran')"]) });`,
+export default Task.make({ name: "main", run: Task.exec("bun", ["--eval", "console.log('formatted command ran')"], { print: true }) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);

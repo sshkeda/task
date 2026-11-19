@@ -6,6 +6,7 @@ import { Effect } from "effect";
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
+import { readTracedFailures } from "../shared/read-trace-files.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
@@ -196,19 +197,21 @@ export default Task.make({ name: "main", run: Task.allSettled([one, { two, three
       for (const failedTaskName of ["one", "three", "five"]) {
         expect(ran.standardError).toMatch(
           new RegExp(
-            `^\\[${failedTaskName}\\] \\S+: error TaskError: ${failedTaskName} broke$`,
+            `^error: \\[${failedTaskName}\\] main\\.ts:\\d+:\\d+: TaskError: ${failedTaskName} broke$`,
             "mu",
           ),
         );
       }
       expect(ran.standardError).toContain("[two] two ran");
       expect(ran.standardError).toContain("[four] four ran");
-      expect(ran.standardError).toContain("[two] passed in");
-      expect(ran.standardError).toContain("[four] passed in");
-      expect(ran.standardError).toContain(
-        "[main] error SettledTasksFailed: 3 of 5 tasks failed: one, three, five",
+      expect(ran.standardError).not.toContain("SettledTasksFailed");
+      expect(yield* readTracedFailures(project, ran)).toContainEqual({
+        taskName: "main",
+        failure: "error SettledTasksFailed: 3 of 5 tasks failed: [one], [three], [five]",
+      });
+      expect(ran.standardError).toMatch(
+        /^failed: \[one\] \[three\] \[five\] \(3 of 6 tasks\), [\d.]+s$/mu,
       );
-      expect(ran.standardError).toMatch(/^failed: one, three, five \(3 of 6 tasks\), [\d.]+s$/mu);
     }),
   ),
 );

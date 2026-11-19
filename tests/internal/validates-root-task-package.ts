@@ -19,12 +19,30 @@ export default Task.make({ name: "main", run: Effect.log("body ran") });`,
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode).toBe(1);
-      expect(result.standardError).toContain(
-        "main.ts: error MissingPackageJson: no package.json found in its directory or any parent directory",
+      expect(result.standardError.split("\n")).toContain(
+        "error: main.ts: MissingPackageJson: no package.json found in its directory or any parent directory",
       );
       expect(findMisprintedErrorLines(result.standardError)).toEqual([]);
       expect(result.standardError).not.toContain("body ran");
-      expect(result.standardError).not.toContain("[main] started");
+    }),
+  ),
+);
+
+export const missingPackageJsonPrintsOneErrorLine = makeTest(
+  "a root task without a package.json above it prints only its lowercase error: line, written by Task's error printer",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeStandaloneDirectory({
+        "dev.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "dev", run: Effect.log("body ran") });`,
+      });
+      const result = yield* runTaskProcess(project, "dev.ts");
+      expect(result.exitCode).toBe(1);
+      expect(result.standardError).toBe(
+        "error: dev.ts: MissingPackageJson: no package.json found in its directory or any parent directory",
+      );
+      expect(result.standardOutput).toBe("");
     }),
   ),
 );
@@ -85,7 +103,7 @@ export default Task.make({ name: "main", run: Effect.log("body ran") });`,
       expect(result.exitCode, result.standardError).toBe(0);
       expect(result.standardError).toContain("[main] body ran");
       expect(result.standardError).toContain(
-        `wrote the trace to ${project.home}/.sshkeda-task/traces/${path.basename(project.directory)}/`,
+        `run: ${project.home}/.sshkeda-task/runs/${path.basename(project.directory)}/`,
       );
     }),
   ),
@@ -99,21 +117,21 @@ export const invalidPackageName = makeTest(
       for (const [manifest, expectedLine] of [
         [
           { name: "" },
-          'package.json: error PackageJsonNameBlank: has the "name" "", which is blank',
+          'error: package.json: PackageJsonNameBlank: has the "name" "", which is blank',
         ],
         [
           { name: "   " },
-          'package.json: error PackageJsonNameBlank: has the "name" "   ", which is blank',
+          'error: package.json: PackageJsonNameBlank: has the "name" "   ", which is blank',
         ],
         [
           { name: 123 },
-          'package.json: error PackageJsonNameNotString: has the "name" 123, which is not a string',
+          'error: package.json: PackageJsonNameNotString: has the "name" 123, which is not a string',
         ],
-        ...["../escaped-traces", "@scope/../escaped-traces", ".escaped-traces", "a/b"].map(
+        ...["../escaped-runs", "@scope/../escaped-runs", ".escaped-runs", "a/b"].map(
           (name) =>
             [
               { name },
-              `package.json: error PackageJsonNameInvalid: has the "name" "${name}", which is not a package name: "name" or "@scope/name" with no part starting with "."`,
+              `error: package.json: PackageJsonNameInvalid: has the "name" "${name}", which is not a package name: "name" or "@scope/name" with no part starting with "."`,
             ] as const,
         ),
       ] as const) {
@@ -127,10 +145,8 @@ export default Task.make({ name: "main", run: Effect.log("body ran") });`,
         expect(result.exitCode).toBe(1);
         expect(result.standardError).toMatch(new RegExp(`^${RegExp.escape(expectedLine)}$`, "mu"));
         expect(result.standardError).not.toContain("SchemaError");
-        expect(result.standardError).not.toContain("[main] started");
-        expect(yield* fileSystem.exists(`${project.home}/.sshkeda-task/escaped-traces`)).toBe(
-          false,
-        );
+        expect(result.standardError).not.toContain("body ran");
+        expect(yield* fileSystem.exists(`${project.home}/.sshkeda-task/escaped-runs`)).toBe(false);
       }
       const scoped = yield* makeProject({
         "package.json": yield* encodeJson({ name: "@scope/project", type: "module" }),
@@ -141,33 +157,28 @@ export default Task.make({ name: "main", run: Effect.log("body ran") });`,
       const scopedResult = yield* runTaskProcess(scoped, "main.ts");
       expect(scopedResult.exitCode, scopedResult.standardError).toBe(0);
       expect(scopedResult.standardError).toContain(
-        `wrote the trace to ${scoped.home}/.sshkeda-task/traces/@scope/project/`,
+        `run: ${scoped.home}/.sshkeda-task/runs/@scope/project/`,
       );
     }),
   ),
 );
 
-export const missingImportedPackageJson = makeTest(
-  "a named root refuses an imported task file without an enclosing package.json",
+export const importedFileWithoutPackageJson = makeTest(
+  "a task imported from a file without an enclosing package.json runs, and its commands run in the folder of the package.json nearest the file run",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeStandaloneDirectory({
         "app/package.json": yield* encodeJson({ name: "project", type: "module" }),
         "loose.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export const loose = Task.make({ name: "loose", run: Effect.log("LOOSE BODY RAN") });`,
+export const loose = Task.make({ name: "loose", run: Effect.flatMap(Task.exec("pwd"), (directory) => Effect.log(\`ran in \${directory.trim()}\`)) });`,
         "app/main.ts": `import { Task } from "@sshkeda/task";
 import { loose } from "../loose.ts";
 export default Task.make({ name: "main", run: loose });`,
       });
       const result = yield* runTaskProcess(project, "app/main.ts");
-      expect(result.exitCode).toBe(1);
-      expect(result.standardError).toContain(
-        "loose.ts: error MissingPackageJson: no package.json found in its directory or any parent directory",
-      );
-      expect(findMisprintedErrorLines(result.standardError)).toEqual([]);
-      expect(result.standardError).not.toContain("LOOSE BODY RAN");
-      expect(result.standardError).not.toContain("[main] started");
+      expect(result.exitCode, result.standardError).toBe(0);
+      expect(result.standardError).toContain(`[loose] ran in ${project.directory}/app\n`);
     }),
   ),
 );

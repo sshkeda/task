@@ -1,22 +1,27 @@
 import { Array as Arrays, Cause, Formatter, Option, Predicate, Result, Schema } from "effect";
 
-import { PrintableError } from "../lib/errors/index.ts";
+import type { PrintableError } from "../lib/errors/index.ts";
 import { CommandRefusal } from "./command-errors.ts";
+import { PRINTABLE_ERROR_FIELDS } from "./error-fields.ts";
 import { findUserLocationInStack } from "./find-user-locations-in-stack-traces.ts";
+import { joinMessages } from "./join-messages.ts";
 import {
   CauseWithoutFailure,
   describeCauseMessage,
   ErrorStack,
+  PlatformErrorValue,
   reportError,
+  restatesItsCause,
   TaskRaisedError,
-  UntaggedFailure,
+  UNTAGGED_FAILURE_TAG,
 } from "./report-errors.ts";
 import { failureValuesOfReason } from "./select-cause-reasons.ts";
+import { StandardInputNotRead } from "./standard-input-not-read.ts";
 import { TASK_PACKAGE } from "./task-package.ts";
 
 const TaskRaisedContainer = Schema.Struct({
   raisedBy: Schema.Literal(TASK_PACKAGE.name),
-  reportedErrors: Schema.NonEmptyArray(PrintableError),
+  reportedErrors: Schema.NonEmptyArray(Schema.Struct(PRINTABLE_ERROR_FIELDS)),
 });
 
 const UserError = Schema.Struct({ name: Schema.String, message: Schema.String });
@@ -47,6 +52,12 @@ const ErrorWithInnerErrors = Schema.Struct({ errors: Schema.Array(Schema.Unknown
 
 const AggregateErrorValue = Schema.instanceOf(AggregateError);
 
+const messageToPrint = (value: unknown, message: string) =>
+  Option.match(Schema.decodeUnknownOption(TaskRaisedError)(value), {
+    onNone: () => message,
+    onSome: (taskRaised) => taskRaised.printedMessage ?? message,
+  });
+
 const withInnerErrors = (
   innerErrors: Option.Option<typeof ErrorWithInnerErrors.Type>,
   printedText: string,
@@ -58,9 +69,8 @@ const withInnerErrors = (
         Option.match(Schema.decodeUnknownOption(UserError)(innerError), {
           onSome: (userError) => {
             const innerTag = Option.getOrElse(userTagOf(innerError), () => userError.name);
-            return userError.message === ""
-              ? `  ${innerTag}`
-              : `  ${innerTag}: ${userError.message}`;
+            const innerMessage = messageToPrint(innerError, userError.message);
+            return innerMessage === "" ? `  ${innerTag}` : `  ${innerTag}: ${innerMessage}`;
           },
           onNone: () => `  ${describeCauseMessage(innerError)}`,
         }),
@@ -102,23 +112,19 @@ const withCauseChain = (
       onNone: () => printedText,
       onSome: ({ cause, causeError }) => {
         const causeTag = Option.getOrElse(userTagOf(cause), () => causeError.name);
+        const causeMessage = messageToPrint(cause, causeError.message);
         const causeLine =
-          causeError.message === ""
-            ? `caused by ${causeTag}`
-            : `caused by ${causeTag}: ${causeError.message}`;
-        const isRestated =
-          causeError.message !== "" &&
-          printedText
-            .split("\n")
-            .some(
-              (printedLine) =>
-                printedLine === causeError.message ||
-                printedLine.endsWith(`: ${causeError.message}`),
-            );
-        return withCauseChain(cause, isRestated ? printedText : `${printedText}\n${causeLine}`, [
-          ...followedValues,
+          causeMessage === "" ? `caused by ${causeTag}` : `caused by ${causeTag}: ${causeMessage}`;
+        return withCauseChain(
           cause,
-        ]);
+          Option.exists(
+            Schema.decodeUnknownOption(PlatformErrorValue)(failureValue),
+            (platformError) => restatesItsCause(platformError.reason),
+          )
+            ? printedText
+            : `${printedText}\n${causeLine}`,
+          [...followedValues, cause],
+        );
       },
     },
   );
@@ -126,29 +132,13 @@ const withCauseChain = (
 
 const ErrorCausedByCommandRefusal = Schema.Struct({ cause: CommandRefusal });
 
-const ENGINE_ERROR_NAMES = new Set(["TypeError", "ReferenceError"]);
+const StandardInputNotReadValue = Schema.instanceOf(StandardInputNotRead);
 
-const ENGINE_SOURCE_EXCERPT =
-  /^(?<statement>[\s\S]*?) \(In '[\s\S]*'(?:, (?<valueNote>'[\s\S]*' is [\s\S]*))?\)$/u;
-
-const withoutEngineSourceExcerpt = (errorName: string, defectMessage: string) => {
-  const [, statement, valueNote] = ENGINE_ERROR_NAMES.has(errorName)
-    ? (ENGINE_SOURCE_EXCERPT.exec(defectMessage) ?? [])
-    : [];
-  if (statement === undefined) {
-    return defectMessage;
-  }
-  return valueNote === undefined ? statement : `${statement} (${valueNote})`;
-};
-
-const reportReason = (
-  reason: Cause.Reason<unknown>,
-  foreignMessagePrefix: string,
-): readonly PrintableError[] => {
-  if (Cause.isInterruptReason(reason)) {
-    return [];
-  }
-  const [failureValue] = failureValuesOfReason(reason);
+const reportFailureValue = (
+  failed: { readonly cause?: unknown },
+  fallbackTag: string,
+): Arrays.NonEmptyReadonlyArray<PrintableError> => {
+  const failureValue = failed.cause;
   const stackLocation = Option.flatMap(
     Schema.decodeUnknownOption(ErrorStack)(failureValue),
     (withStack) => Option.fromUndefinedOr(findUserLocationInStack(withStack.stack)),
@@ -157,56 +147,134 @@ const reportReason = (
     onSome: (location) => ({ location }),
     onNone: () => ({}),
   });
-  return Option.match(Schema.decodeUnknownOption(TaskRaisedContainer)(failureValue), {
-    onSome: (container) => container.reportedErrors,
+  const standardInputNotRead = Option.flatMap(
+    Schema.decodeUnknownOption(PlatformErrorValue)(failureValue),
+    ({ reason }) => Schema.decodeUnknownOption(StandardInputNotReadValue)(reason.cause),
+  );
+  const container = Option.orElse(standardInputNotRead, () =>
+    Schema.decodeUnknownOption(TaskRaisedContainer)(failureValue),
+  );
+  return Option.match(container, {
+    onSome: (decoded) => decoded.reportedErrors,
     onNone: () =>
       Option.match(Schema.decodeUnknownOption(ErrorCausedByCommandRefusal)(failureValue), {
-        onSome: (causedByRefusal) => [reportError(causedByRefusal.cause)],
+        onSome: (causedByRefusal) => Arrays.of(reportError(causedByRefusal.cause)),
         onNone: () =>
           Option.match(Schema.decodeUnknownOption(TaskRaisedError)(failureValue), {
-            onSome: (taskRaised) => [reportError(taskRaised)],
-            onNone: () =>
-              Option.match(
+            onSome: (taskRaised) => Arrays.of(reportError(taskRaised)),
+            onNone: () => {
+              const userError = Schema.decodeUnknownOption(UserError)(failureValue);
+              const tag = Option.getOrElse(
                 Option.filter(
-                  Schema.decodeUnknownOption(UserError)(failureValue),
-                  (userError) =>
-                    Option.isSome(userTagOf(failureValue)) ||
-                    !UNTAGGED_ERROR_NAMES.has(userError.name),
+                  Option.map(userError, (decoded) =>
+                    Option.getOrElse(userTagOf(failureValue), () => decoded.name),
+                  ),
+                  (userTag) => userTag !== "",
                 ),
-                {
-                  onSome: (userError) => {
-                    const tag = Option.getOrElse(userTagOf(failureValue), () => userError.name);
-                    const message = Cause.isDieReason(reason)
-                      ? withoutEngineSourceExcerpt(userError.name, userError.message)
-                      : userError.message;
-                    return [
-                      {
-                        tag,
-                        message: withCauseChain(
-                          failureValue,
-                          `${foreignMessagePrefix}${message === "" ? describeOwnFields(failureValue, tag) : message}`,
-                          [failureValue],
-                        ),
-                        ...userLocation,
-                      },
-                    ];
-                  },
-                  onNone: () => [
-                    reportError(
-                      new UntaggedFailure({
-                        failureMessage: withCauseChain(
-                          failureValue,
-                          `${foreignMessagePrefix}${describeCauseMessage(failureValue)}`,
-                          [failureValue],
-                        ),
-                        ...userLocation,
-                      }),
-                    ),
-                  ],
-                },
-              ),
+                () => fallbackTag,
+              );
+              const describedByItsOwnFields = Option.filter(
+                userError,
+                (decoded) =>
+                  Option.isSome(userTagOf(failureValue)) || !UNTAGGED_ERROR_NAMES.has(decoded.name),
+              );
+              const message = Option.match(describedByItsOwnFields, {
+                onSome: (decoded) =>
+                  decoded.message === "" ? describeOwnFields(failureValue, tag) : decoded.message,
+                onNone: () => describeCauseMessage(failureValue),
+              });
+              return Arrays.of({
+                tag,
+                message: withCauseChain(failureValue, message, [failureValue]),
+                ...userLocation,
+              });
+            },
           }),
       }),
+  });
+};
+
+const reportReason = (reason: Cause.Reason<unknown>): readonly PrintableError[] => {
+  if (Cause.isInterruptReason(reason)) {
+    return [];
+  }
+  const [failureValue] = failureValuesOfReason(reason);
+  return reportFailureValue({ cause: failureValue }, UNTAGGED_FAILURE_TAG);
+};
+
+const reportUnderlyingErrorsOnce = (
+  wrapped: { readonly cause?: unknown },
+  fallbackTag: string,
+  followedCauses: readonly unknown[],
+): Arrays.NonEmptyReadonlyArray<PrintableError> =>
+  Option.match(
+    Option.filter(Schema.decodeUnknownOption(PlatformErrorValue)(wrapped.cause), ({ reason }) => {
+      const isUnfollowed = !followedCauses.includes(reason.cause);
+      const pointsAtItsCause =
+        reason.cause !== undefined &&
+        (reason.description === undefined || restatesItsCause(reason));
+      return isUnfollowed && pointsAtItsCause;
+    }),
+    {
+      onNone: () => reportFailureValue(wrapped, fallbackTag),
+      onSome: (platformError) =>
+        reportUnderlyingErrorsOnce(platformError.reason, fallbackTag, [
+          ...followedCauses,
+          platformError,
+        ]),
+    },
+  );
+
+export const reportUnderlyingErrors = (
+  wrapped: { readonly cause?: unknown },
+  fallbackTag: string,
+): Arrays.NonEmptyReadonlyArray<PrintableError> =>
+  reportUnderlyingErrorsOnce(wrapped, fallbackTag, []);
+
+export const addContext = (printable: PrintableError, addedContext: string): PrintableError => {
+  const { context = [], ...described } = printable;
+  return { ...described, context: [...context, addedContext] };
+};
+
+export const reportWrappedCause = (
+  wrapper: {
+    readonly _tag: string;
+    readonly cause: unknown;
+    readonly location?: string | undefined;
+    readonly filePath?: string | undefined;
+    readonly taskName?: string | null | undefined;
+  },
+  context: string,
+): Arrays.NonEmptyReadonlyArray<PrintableError> => {
+  const wrapperLocation = "location" in wrapper ? wrapper.location : wrapper.filePath;
+  const placed = (printable: PrintableError): PrintableError => {
+    const { location: causeLocation, taskName: causeTaskName, ...described } = printable;
+    const location = causeLocation ?? wrapperLocation;
+    const taskName = location === undefined ? (wrapper.taskName ?? causeTaskName) : undefined;
+    return {
+      ...described,
+      ...(location === undefined ? {} : { location }),
+      ...(taskName === undefined ? {} : { taskName }),
+    };
+  };
+  return Arrays.map(reportUnderlyingErrors(wrapper, UNTAGGED_FAILURE_TAG), (printable) =>
+    addContext(placed(printable), context),
+  );
+};
+
+export const reportTaskText = (
+  wrapper: Omit<Parameters<typeof reportWrappedCause>[0], "cause">,
+  text: string,
+  context: string,
+): Arrays.NonEmptyReadonlyArray<PrintableError> => {
+  const location = wrapper.location ?? wrapper.filePath;
+  const taskName = location === undefined ? (wrapper.taskName ?? undefined) : undefined;
+  return Arrays.of({
+    tag: wrapper._tag,
+    message: text,
+    context: [context],
+    ...(location === undefined ? {} : { location }),
+    ...(taskName === undefined ? {} : { taskName }),
   });
 };
 
@@ -215,8 +283,6 @@ const isRangeError = Schema.is(Schema.instanceOf(RangeError));
 const MOST_NESTED_PRINTED_CAUSES = 100;
 
 const FailureWithCause = Schema.Struct({ cause: Schema.Unknown });
-
-const EFFECT_INTERNAL_STACK_LINE = /Generator\.next|~effect\/(?:Effect|Utils)/u;
 
 const withoutCause = <Link>(link: Link) =>
   Option.match(Schema.decodeUnknownOption(ErrorFields)(link), {
@@ -269,16 +335,98 @@ const withFlatDeepCauseChains = <Failure>(cause: Cause.Cause<Failure>) =>
       }));
       return Cause.annotate(
         Cause.die({
-          ...flatChain,
-          stack: chainLines
-            .join("\n[cause]: ")
-            .split("\n")
-            .filter((line) => !EFFECT_INTERNAL_STACK_LINE.test(line))
-            .join("\n"),
+          name: flatChain.name,
+          message: `${flatChain.message}, through a chain of ${chain.length} causes:\n${chainLines.join("\n[cause]: ")}`,
         }),
         Cause.reasonAnnotations(reason),
       ).reasons;
     }),
+  );
+
+const NamedError = Schema.Struct({
+  name: Schema.String,
+  message: Schema.String,
+  stack: Schema.optional(Schema.String),
+});
+
+const PrintedMessage = Schema.Struct({
+  ...NamedError.fields,
+  raisedBy: Schema.Literal(TASK_PACKAGE.name),
+  printedMessage: Schema.String,
+});
+
+const copyOfError = (
+  original: typeof NamedError.Type,
+  message: string,
+  cause: Option.Option<unknown>,
+) =>
+  Object.assign(
+    new Error(
+      message,
+      Option.match(cause, { onNone: () => ({}), onSome: (causeValue) => ({ cause: causeValue }) }),
+    ),
+    {
+      name: original.name,
+      ...(original.stack === undefined ? {} : { stack: original.stack }),
+    },
+  );
+
+const copyWithPrintedMessages = (
+  failureValue: unknown,
+  followedValues: readonly unknown[],
+): Option.Option<Error | typeof ErrorFields.Type> => {
+  const unfollowedCause = Option.filter(
+    Option.map(
+      Schema.decodeUnknownOption(ErrorWithCause)(failureValue),
+      (withCause) => withCause.cause,
+    ),
+    (causeValue) => !followedValues.includes(causeValue),
+  );
+  const printedCause = Option.flatMap(unfollowedCause, (causeValue) =>
+    copyWithPrintedMessages(causeValue, [...followedValues, causeValue]),
+  );
+  return Option.match(Schema.decodeUnknownOption(NamedError)(failureValue), {
+    onSome: (named) => {
+      const printedMessage = Option.match(
+        Schema.decodeUnknownOption(PrintedMessage)(failureValue),
+        { onNone: () => named.message, onSome: (printed) => printed.printedMessage },
+      );
+      const isUnchanged = printedMessage === named.message && Option.isNone(printedCause);
+      return isUnchanged
+        ? Option.none()
+        : Option.some(
+            copyOfError(
+              named,
+              printedMessage,
+              Option.orElse(printedCause, () => unfollowedCause),
+            ),
+          );
+    },
+    onNone: () =>
+      Option.flatMap(printedCause, (printed) =>
+        Option.map(Schema.decodeUnknownOption(ErrorFields)(failureValue), (fields) => ({
+          ...fields,
+          cause: printed,
+        })),
+      ),
+  });
+};
+
+const withPrintedMessages = <Failure>(cause: Cause.Cause<Failure>) =>
+  Cause.fromReasons(
+    cause.reasons.flatMap(
+      (reason): readonly Cause.Reason<Error | Failure | typeof ErrorFields.Type>[] => {
+        const [failureValue] = failureValuesOfReason(reason);
+        return Option.match(copyWithPrintedMessages(failureValue, [failureValue]), {
+          onNone: () => [reason],
+          onSome: (printedValue) =>
+            Cause.annotate(
+              Cause.isFailReason(reason) ? Cause.fail(printedValue) : Cause.die(printedValue),
+              Cause.reasonAnnotations(reason),
+            ).reasons,
+        });
+      },
+    ),
   );
 
 export const causeWithPrintableErrors = <Failure>(failedCause: Cause.Cause<Failure>) =>
@@ -300,11 +448,9 @@ export const causeWithPrintableErrors = <Failure>(failedCause: Cause.Cause<Failu
     },
   );
 
-export const reportCause = <Failure>(cause: Cause.Cause<Failure>, foreignMessagePrefix = "") => {
-  const details = Cause.pretty(causeWithPrintableErrors(cause));
-  const reportedErrors = cause.reasons.flatMap((reason) =>
-    reportReason(reason, foreignMessagePrefix),
-  );
+export const reportCause = <Failure>(cause: Cause.Cause<Failure>) => {
+  const details = Cause.pretty(withPrintedMessages(causeWithPrintableErrors(cause)));
+  const reportedErrors = cause.reasons.flatMap((reason) => reportReason(reason));
   return {
     failures: Arrays.isArrayNonEmpty(reportedErrors)
       ? reportedErrors
@@ -312,3 +458,20 @@ export const reportCause = <Failure>(cause: Cause.Cause<Failure>, foreignMessage
     details,
   };
 };
+
+export const describeTraceFailure = <Failure>(cause: Cause.Cause<Failure>) => {
+  const [firstPrintable] = reportCause(cause).failures;
+  return { errorType: firstPrintable.tag, message: joinMessages([firstPrintable]) };
+};
+
+export const describeTraceExceptions = <Failure>(cause: Cause.Cause<Failure>) =>
+  cause.reasons
+    .filter((reason) => !Cause.isInterruptReason(reason))
+    .map((reason) => {
+      const reasonCause = Cause.fromReasons([reason]);
+      const [prettyError] = Cause.prettyErrors(withPrintedMessages(reasonCause), {
+        includeCauseInStack: true,
+      });
+      const { errorType, message } = describeTraceFailure(reasonCause);
+      return { errorType, message, stacktrace: prettyError?.stack ?? "No stack trace available" };
+    });

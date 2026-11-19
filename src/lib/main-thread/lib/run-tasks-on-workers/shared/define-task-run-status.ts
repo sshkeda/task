@@ -7,7 +7,7 @@ export const TaskRunStatus = Schema.TaggedUnion({
   Assigned: OnWorker,
   Loading: OnWorker,
   Running: OnWorker,
-  Serving: OnWorker,
+  Serving: { ...OnWorker, failed: Schema.Boolean },
   Failing: OnWorker,
   Finished: OnWorker,
   Closed: OnWorker,
@@ -36,6 +36,7 @@ export const TaskRunOutcomeEvent = Schema.TaggedUnion({
   FailOnExit: { causedByAwaitedTasks: Schema.Boolean },
   Pass: {},
   Serve: {},
+  StopServed: {},
 });
 
 export const isOnWorker = TaskRunStatus.isAnyOf([
@@ -65,7 +66,8 @@ const moveOnEnd = (status: typeof TaskRunStatus.Type) =>
       [TaskRunStatus.cases.Finished.make({ workerId }), "settleOutcome"] as const,
     Running: ({ workerId }) =>
       [TaskRunStatus.cases.Finished.make({ workerId }), "settleOutcome"] as const,
-    Serving: ({ workerId }) => [TaskRunStatus.cases.Closed.make({ workerId }), "close"] as const,
+    Serving: ({ workerId, failed }) =>
+      [TaskRunStatus.cases.Closed.make({ workerId }), failed ? "closeFailed" : "close"] as const,
     Failing: ({ workerId }) =>
       [TaskRunStatus.cases.Finished.make({ workerId }), "reportFailure"] as const,
     Finished: () => ignore(status),
@@ -79,12 +81,17 @@ export const moveTaskRunStatus = (
   TaskRunEvent.match(event, {
     Assign: ({ workerId }) =>
       TaskRunStatus.guards.Preparing(status)
-        ? ([TaskRunStatus.cases.Assigned.make({ workerId }), "none"] as const)
+        ? ([TaskRunStatus.cases.Assigned.make({ workerId }), "recordWorkerAssignment"] as const)
         : ignore(status),
     End: () => moveOnEnd(status),
     FailBeforeCleanup: () => {
       if (TaskRunStatus.guards.Serving(status)) {
-        return [status, "none"] as const;
+        return status.failed
+          ? ignore(status)
+          : ([
+              TaskRunStatus.cases.Serving.make({ workerId: status.workerId, failed: true }),
+              "reportServedFailure",
+            ] as const);
       }
       return TaskRunStatus.guards.Running(status)
         ? ([
@@ -95,12 +102,15 @@ export const moveTaskRunStatus = (
     },
     Load: () =>
       TaskRunStatus.guards.Assigned(status)
-        ? ([TaskRunStatus.cases.Loading.make({ workerId: status.workerId }), "none"] as const)
+        ? ([
+            TaskRunStatus.cases.Loading.make({ workerId: status.workerId }),
+            "recordModuleLoading",
+          ] as const)
         : ignore(status),
     Serve: () =>
       TaskRunStatus.guards.Running(status)
         ? ([
-            TaskRunStatus.cases.Serving.make({ workerId: status.workerId }),
+            TaskRunStatus.cases.Serving.make({ workerId: status.workerId, failed: false }),
             "settleOutcome",
           ] as const)
         : ignore(status),
@@ -130,4 +140,8 @@ export const moveTaskRunOutcome = (
       settlePending(outcome, TaskRunOutcome.cases.Failed.make({ causedByAwaitedTasks })),
     Pass: () => settlePending(outcome, TaskRunOutcome.cases.Passed.make({})),
     Serve: () => settlePending(outcome, TaskRunOutcome.cases.Served.make({})),
+    StopServed: () =>
+      TaskRunOutcome.guards.Served(outcome)
+        ? ([TaskRunOutcome.cases.Cancelled.make({}), "none"] as const)
+        : ignoreOutcome(outcome),
   });

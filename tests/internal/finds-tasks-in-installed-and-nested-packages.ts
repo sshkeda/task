@@ -7,6 +7,7 @@ import { encodeJson } from "../shared/encode-json.ts";
 import { REPOSITORY_DIRECTORY } from "../shared/find-repository-directory.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
+import { readTracedFailures } from "../shared/read-trace-files.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
 export const installed = makeTest(
@@ -83,9 +84,11 @@ export default Task.make({ name: "main", run: Effect.andThen(runAll([lint]), che
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain("[lint] linting");
       expect(ran.standardError).toContain("[test] testing");
-      expect(ran.standardError).toContain(
-        "[main] error SettledTasksFailed: 1 of 2 tasks failed: broken\n",
-      );
+      expect(ran.standardError).not.toContain("SettledTasksFailed");
+      expect(yield* readTracedFailures(project, ran)).toContainEqual({
+        taskName: "main",
+        failure: "error SettledTasksFailed: 1 of 2 tasks failed: [broken]",
+      });
     }),
   ),
 );
@@ -193,7 +196,6 @@ export default Task.make({ name: "main", run: Effect.gen(function* () { yield* E
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(0);
-      expect(ran.standardError).toContain("[tool] started");
       expect(ran.standardError).toContain("[main] tool 1");
     }),
   ),
@@ -253,9 +255,12 @@ export const projectThatIsNodeModulesDirectory = makeTest(
   runsProjectAt("nested/node_modules"),
 );
 
-const expectLocationsInsideAndOutsideNodeModules = (
+const expectLinesInsideAndOutsideNodeModules = (
   mainFile: string,
-  expectedLines: readonly string[],
+  expectedLines: {
+    readonly insideNodeModules: readonly string[];
+    readonly outside: readonly string[];
+  },
 ) =>
   Effect.scoped(
     Effect.gen(function* () {
@@ -266,7 +271,10 @@ const expectLocationsInsideAndOutsideNodeModules = (
         "outside/package.json": '{ "name": "outside", "type": "module" }',
         "outside/main.ts": mainFile,
       });
-      for (const directory of [projectPath, "outside"]) {
+      for (const [directory, expectedDirectoryLines] of [
+        [projectPath, expectedLines.insideNodeModules],
+        ["outside", expectedLines.outside],
+      ] as const) {
         const ran = yield* runTaskProcess(
           project,
           `${directory}/main.ts`,
@@ -274,36 +282,41 @@ const expectLocationsInsideAndOutsideNodeModules = (
           `${project.directory}/${directory}`,
         );
         expect(ran.exitCode, directory).toBe(1);
-        for (const expectedLine of expectedLines) {
-          expect(ran.standardError, directory).toContain(expectedLine);
+        for (const expectedLine of expectedDirectoryLines) {
+          expect(ran.standardError.split("\n"), directory).toContain(expectedLine);
         }
       }
     }),
   );
 
-export const projectInsideNodeModulesPrintsLocations = makeTest(
-  "a project inside a directory named node_modules prints the user location of the error a task body fails with",
-  expectLocationsInsideAndOutsideNodeModules(
+export const projectInsideNodeModulesPrintsNoLocations = makeTest(
+  "a project inside a directory named node_modules prints no location for the error a task body fails with, while the same project outside node_modules prints it",
+  expectLinesInsideAndOutsideNodeModules(
     `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 import { TaskError } from "@sshkeda/task/errors";
 export default Task.make({ name: "main", run: Effect.gen(function* () {
   return yield* new TaskError({ message: "broke" });
 }) });`,
-    ["[main] main.ts:5:21: error TaskError: broke\n"],
+    {
+      insideNodeModules: ["error: [main] TaskError: broke"],
+      outside: ["error: [main] main.ts:5:17: TaskError: broke"],
+    },
   ),
 );
 
+const MADE_MORE_THAN_ONCE_LINES = [
+  "error: main.ts:3:21: TaskMadeMoreThanOnce: makes the task [same], which 2 Task.make() calls make",
+  "error: main.ts:4:27: TaskMadeMoreThanOnce: makes the task [same], which 2 Task.make() calls make",
+] as const;
+
 export const projectInsideNodeModulesNamesBothMakeCalls = makeTest(
   "a project inside a directory named node_modules names both Task.make() calls when two of them make one task name",
-  expectLocationsInsideAndOutsideNodeModules(
+  expectLinesInsideAndOutsideNodeModules(
     `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 export default Task.make({ name: "same", run: Effect.void });
 export const again = Task.make({ name: "same", run: Effect.void });`,
-    [
-      'main.ts:3:21: error TaskMadeMoreThanOnce: makes the task "same", which 2 Task.make() calls make\n',
-      'main.ts:4:27: error TaskMadeMoreThanOnce: makes the task "same", which 2 Task.make() calls make\n',
-    ],
+    { insideNodeModules: MADE_MORE_THAN_ONCE_LINES, outside: MADE_MORE_THAN_ONCE_LINES },
   ),
 );

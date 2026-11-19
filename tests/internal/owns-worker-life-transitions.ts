@@ -70,7 +70,7 @@ const events = [
   WorkerStageEvent.cases.Exit.make({ exitCode: CRASH_EXIT_CODE, uncaughtError: null }),
   WorkerStageEvent.cases.Exit.make({
     exitCode: CLEAN_EXIT_CODE,
-    uncaughtError: { message: "escaped", location: null },
+    uncaughtError: { tag: "Error", message: "escaped" },
   }),
   WorkerStageEvent.cases.RequestExit.make({}),
   WorkerStageEvent.cases.Terminate.make({ terminatingTaskName: TERMINATING_TASK_NAME }),

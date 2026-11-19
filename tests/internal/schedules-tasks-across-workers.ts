@@ -4,7 +4,7 @@ import { Effect, FileSystem } from "effect";
 
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
-import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
+import { readAttribute, readProjectRunsDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
 const MISSING_TIMESTAMP = 0n;
@@ -22,7 +22,7 @@ const readBodies = (trace: Effect.Success<ReturnType<typeof readTraces>>[number]
     const worker = readAttribute(span.attributes, "sshkeda_task.worker");
     const name = readAttribute(span.attributes, "sshkeda_task.task");
     const isTaskBodyOnAWorker =
-      span.thread === "worker" && typeof worker === "number" && typeof name === "string";
+      span.role === "body" && typeof worker === "number" && typeof name === "string";
     return isTaskBodyOnAWorker
       ? [
           {
@@ -66,7 +66,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () { yield* E
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       expect(ran.exitCode).toBe(0);
       expect(ran.standardError).toContain("[main] got 1");
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       expect(
         readBodies(trace)
           .map((body) => `${body.name} on ${body.worker}`)
@@ -78,11 +78,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () { yield* E
 
 const readStartedWorkers = (
   trace: Effect.Success<ReturnType<typeof readTraces>>[number] | undefined,
-) =>
-  readAttribute(
-    trace?.findOnlySpan("runRootTaskFiber")?.attributes ?? [],
-    "sshkeda_task.workers.started",
-  );
+) => readAttribute(trace?.findRunSpan()?.attributes ?? [], "sshkeda_task.workers.started");
 
 export const fibers = makeTest(
   "with one worker, tasks run as fibers side by side on it, and a task waiting on another lets that task run on the same worker",
@@ -109,7 +105,7 @@ export default Task.make({ name: "main", run: Task.all([waiting, other]) });`,
       expect(ran.exitCode).toBe(0);
       expect(ran.standardError).toContain("[waiting] got slow done");
       expect(ran.standardError).toMatch(/^passed: 4 tasks, [\d.]+s$/mu);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       expect(readStartedWorkers(trace)).toBe(1);
       const bodies = readBodies(trace);
       expect(bodies.map((body) => `${body.name} on ${body.worker}`).toSorted()).toEqual([
@@ -140,7 +136,7 @@ import { Task } from "@sshkeda/task";
 export default Task.make({ name: "main", run: Effect.void });`,
       });
       const alone = yield* runTaskProcess(single, "main.ts");
-      const [aloneTrace] = yield* readTraces(yield* readTraceDirectory(single, alone));
+      const [aloneTrace] = yield* readTraces(yield* readProjectRunsDirectory(single, alone));
       expect(readStartedWorkers(aloneTrace)).toBe(1);
       expect(readBodies(aloneTrace).map((body) => body.worker)).toEqual([0]);
 
@@ -162,14 +158,14 @@ export default Task.make({ name: "main", run: Effect.void });`,
         SSHKEDA_TASK_WORKERS: String(WORKER_CAP),
       });
       expect(cappedRun.exitCode).toBe(0);
-      const [cappedTrace] = yield* readTraces(yield* readTraceDirectory(capped, cappedRun));
+      const [cappedTrace] = yield* readTraces(yield* readProjectRunsDirectory(capped, cappedRun));
       expect(readStartedWorkers(cappedTrace)).toBe(WORKER_CAP);
       expect(readBodies(cappedTrace).filter((body) => body.worker >= WORKER_CAP)).toEqual([]);
 
       const roomy = yield* makeProject(files);
       const roomyRun = yield* runTaskProcess(roomy, "main.ts", { SSHKEDA_TASK_WORKERS: "50" });
       expect(roomyRun.exitCode).toBe(0);
-      const [roomyTrace] = yield* readTraces(yield* readTraceDirectory(roomy, roomyRun));
+      const [roomyTrace] = yield* readTraces(yield* readProjectRunsDirectory(roomy, roomyRun));
       expect(readStartedWorkers(roomyTrace)).toBe(names.length);
     }),
   ),
@@ -220,7 +216,7 @@ export default Task.make({ name: "main", run: Effect.void });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "4" });
       expect(ran.exitCode).toBe(0);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       expect(readStartedWorkers(trace)).toBe(1);
       expect(readBodies(trace).map((body) => body.name)).toEqual(["main"]);
     }),
@@ -276,9 +272,9 @@ export const oneWorker = makeTest(
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "1" });
       expect(ran.exitCode).toBe(0);
-      expect(yield* fileSystem.readDirectory(`${project.home}/.sshkeda-task`)).toEqual(["traces"]);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
-      expect(trace?.file.startsWith(`${project.home}/.sshkeda-task/traces/project/`)).toBe(true);
+      expect(yield* fileSystem.readDirectory(`${project.home}/.sshkeda-task`)).toEqual(["runs"]);
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
+      expect(trace?.file.startsWith(`${project.home}/.sshkeda-task/runs/project/`)).toBe(true);
       const bodies = readBodies(trace);
       expect(bodies.map((body) => body.name).toSorted()).toEqual([...names, "main"]);
       expect(bodies.filter((body) => body.worker !== 0)).toEqual([]);
@@ -326,7 +322,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "4" });
       expect(ran.exitCode).toBe(0);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       expect(readStartedWorkers(trace)).toBe(IDLE_WORKER_RUN_STARTED_WORKER_COUNT);
       const workersByTaskName = new Map(readBodies(trace).map((body) => [body.name, body.worker]));
       expect(
@@ -345,7 +341,7 @@ const SETUP_LIMIT_LONGER_THAN_A_WORKER_START = "5 seconds";
 const BUSY_MILLISECONDS_LONGER_THAN_THE_SETUP_LIMIT = 7000;
 
 export const waitingForBusyWorkerCountsTowardNoLimit = makeTest(
-  "a task queued on a worker that other tasks occupy says so after 2s, naming the first task and a count of the rest, and that wait counts toward neither its timeout nor the setup limit",
+  "a task queued on a worker that other tasks occupy prints no waiting line, and that wait counts toward neither its timeout nor the setup limit",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -363,9 +359,7 @@ export default Task.make({ name: "main", run: Task.all([blocker, quick, queued])
         SSHKEDA_TASK_WORKERS: "1",
         SSHKEDA_TASK_SETUP_LIMIT: SETUP_LIMIT_LONGER_THAN_A_WORKER_START,
       });
-      expect(ran.standardError).toContain(
-        '[quick] waiting for worker 0, which is running "blocker" and 1 other task',
-      );
+      expect(ran.standardError).not.toContain("[quick] waiting for worker");
       expect(ran.standardError).not.toContain("TimedOut");
       expect(ran.exitCode).toBe(0);
       expect(ran.standardError).toContain("[quick] quick ran");
@@ -415,12 +409,13 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       });
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).not.toContain("[hang] waiting for worker");
-      expect(ran.standardError).toContain(
-        `[hang] error TaskSetupTimedOut: setup timed out after 2s while loading ${project.directory}/main.ts`,
+      expect(ran.standardError.split("\n")).toContain(
+        `error: [hang] hang.ts:11:26: TaskSetupTimedOut: setup timed out after 2s while loading ${project.directory}/main.ts`,
       );
       const { seconds } =
-        /^failed: hang \(1 of 5 tasks\), 4 stopped, (?<seconds>[\d.]+)s$/mu.exec(ran.standardError)
-          ?.groups ?? {};
+        /^failed: \[hang\] \(1 of 5 tasks\), 4 stopped, (?<seconds>[\d.]+)s$/mu.exec(
+          ran.standardError,
+        )?.groups ?? {};
       expect(Number(seconds)).toBeLessThan(MAXIMUM_SECONDS_BEFORE_THE_COMMANDS_END);
     }),
   ),
@@ -456,7 +451,7 @@ export default Task.make({ name: "main", run: Task.all([first, second, third, lo
         SSHKEDA_TASK_SETUP_LIMIT: SETUP_LIMIT_SHORTER_THAN_THE_COMMANDS,
       });
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain("error TaskSetupTimedOut: setup timed out after 2s");
+      expect(ran.standardError).toContain(": TaskSetupTimedOut: setup timed out after 2s");
       const { seconds } =
         /^failed: .+, (?<seconds>[\d.]+)s$/mu.exec(ran.standardError)?.groups ?? {};
       expect(Number(seconds)).toBeLessThan(MAXIMUM_SECONDS_BEFORE_THE_COMMANDS_END);
@@ -465,7 +460,7 @@ export default Task.make({ name: "main", run: Task.all([first, second, third, lo
 );
 
 export const blockedWhileLoadingLeavesSetupLimit = makeTest(
-  "a task whose module awaits while loading on a worker that another task's body then blocks says so, and that block counts toward neither its setup limit nor its notice",
+  "a task whose module awaits while loading on a worker that another task's body then blocks prints no waiting line, and that block does not count toward its setup limit",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -500,9 +495,8 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
         SSHKEDA_TASK_WORKERS: "2",
         SSHKEDA_TASK_SETUP_LIMIT: SETUP_LIMIT_LONGER_THAN_A_WORKER_START,
       });
-      expect(ran.standardError).toContain(
-        '[awaits] waiting for worker 1, which is running "heavy"',
-      );
+      expect(ran.standardError).not.toContain("[awaits] waiting for worker");
+      expect(ran.standardError).not.toContain("[awaits] loading");
       expect(ran.standardError).not.toContain("TimedOut");
       expect(ran.standardError).toContain("[awaits] awaits ran");
       expect(ran.exitCode).toBe(0);
@@ -549,7 +543,7 @@ export default Task.make({ name: "main", run: Effect.asVoid(second) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "4" });
       expect(ran.exitCode).toBe(0);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       expect(readStartedWorkers(trace)).toBe(1);
       expect(
         readBodies(trace)
@@ -576,7 +570,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       });
       const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_WORKERS: "4" });
       expect(ran.exitCode).toBe(0);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       expect(
         readBodies(trace)
           .map((body) => `${body.name} on ${body.worker}`)

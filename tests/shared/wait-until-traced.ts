@@ -17,6 +17,8 @@ const NOTE_WRITE = 0x2;
 const NOTE_EXTEND = 0x4;
 const O_EVTONLY = 0x80_00;
 
+const TRACE_FILE_NAME = "trace.jsonl";
+
 const watchWithKqueue = Effect.sync(() => {
   const library = dlopen("/usr/lib/libSystem.B.dylib", {
     open: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
@@ -84,23 +86,28 @@ const waitUntilTraced = Effect.fn("waitUntilTraced")(function* ({
     : watchWithFileSystem;
   const watched = new Set<string>();
 
-  yield* watch(directory);
-  const tracesIncludeTextOrWaitForChange = Effect.gen(function* () {
-    const traces = (yield* fileSystem.readDirectory(directory))
-      .filter((file) => file.endsWith(".jsonl"))
-      .map((file) => `${directory}/${file}`);
-    yield* Effect.forEach(
-      traces.filter((trace) => !watched.has(trace)),
-      (trace) =>
-        watch(trace).pipe(
+  const watchOnce = (path: string) =>
+    watched.has(path)
+      ? Effect.void
+      : watch(path).pipe(
           Effect.tap(() =>
             Effect.sync(() => {
-              watched.add(trace);
+              watched.add(path);
             }),
           ),
-        ),
-      { discard: true },
+        );
+
+  yield* watchOnce(directory);
+  const tracesIncludeTextOrWaitForChange = Effect.gen(function* () {
+    const runDirectories = (yield* fileSystem.readDirectory(directory)).map(
+      (runDirectoryName) => `${directory}/${runDirectoryName}`,
     );
+    yield* Effect.forEach(runDirectories, watchOnce, { discard: true });
+    const traces = yield* Effect.filter(
+      runDirectories.map((runDirectory) => `${runDirectory}/${TRACE_FILE_NAME}`),
+      (trace) => fileSystem.exists(trace),
+    );
+    yield* Effect.forEach(traces, watchOnce, { discard: true });
     const texts = yield* Effect.forEach(traces, (trace) => fileSystem.readFileString(trace));
     if (texts.some((traced) => traced.includes(text))) {
       return true;

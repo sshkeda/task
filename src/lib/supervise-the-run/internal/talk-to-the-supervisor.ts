@@ -4,22 +4,18 @@ import { Rpc, RpcClient, RpcGroup, RpcSerialization } from "effect/rpc";
 import type { RpcClientError } from "effect/rpc";
 import { Socket } from "effect/socket";
 
+import { ProcessIdentity } from "../../../shared/claim-processes-to-report.ts";
 import {
   TerminalCommand,
   TerminalCommandEnded,
   TerminalCommandId,
 } from "../../../shared/run-in-terminal.ts";
 import { STOP_SIGNALS } from "../../../shared/stop-signals.ts";
+import { TrackedProcessGroup } from "../../kill-leftover-processes/index.ts";
 
 export const ProcessGroupShared = Schema.Struct({
   processGroupId: Schema.Int,
-  startedGroup: Schema.NullOr(
-    Schema.Struct({
-      taskName: Schema.String,
-      leaderStartTime: Schema.NullOr(Schema.String),
-      latestMemberStartTimeAtLeaderExit: Schema.NullOr(Schema.String),
-    }),
-  ),
+  startedGroup: Schema.NullOr(TrackedProcessGroup),
 });
 
 export const SupervisorRpcs = RpcGroup.make(
@@ -28,6 +24,11 @@ export const SupervisorRpcs = RpcGroup.make(
   Rpc.make("ShareProcessGroup", { payload: ProcessGroupShared }),
   Rpc.make("RunInTerminal", { payload: TerminalCommand, success: TerminalCommandEnded }),
   Rpc.make("AwaitTerminalCommandExit", { payload: TerminalCommandId }),
+  Rpc.make("ClaimUnknownOwnership", {
+    payload: { processes: Schema.Array(ProcessIdentity) },
+    success: Schema.Array(ProcessIdentity),
+  }),
+  Rpc.make("SweepBeforeExit", { success: Schema.Array(Schema.String) }),
 );
 
 export const provideSupervisorRpcSerialization = Effect.provideService(
@@ -52,6 +53,8 @@ export const connectToTheSupervisor = (
 export const supervisorConnectionDeferred =
   Deferred.makeUnsafe<Effect.Success<ReturnType<typeof connectToTheSupervisor>>>();
 
+export const supervisorDisconnected = Deferred.makeUnsafe<void>();
+
 export const callTheSupervisor = (
   call: (
     supervisor: Effect.Success<ReturnType<typeof connectToTheSupervisor>>,
@@ -70,3 +73,16 @@ export const runInTheSupervisorTerminal = (command: typeof TerminalCommand.Type)
 
 export const awaitTheSupervisorTerminalCommandExit = (command: typeof TerminalCommandId.Type) =>
   callTheSupervisor((supervisor) => supervisor.AwaitTerminalCommandExit(command));
+
+export const sweepBeforeExit = Effect.suspend(() => {
+  const isConnected =
+    Deferred.isDoneUnsafe(supervisorConnectionDeferred) &&
+    !Deferred.isDoneUnsafe(supervisorDisconnected);
+  return isConnected
+    ? Deferred.await(supervisorConnectionDeferred).pipe(
+        Effect.flatMap((supervisor) => supervisor.SweepBeforeExit()),
+        Effect.catchTag("RpcClientError", () => Effect.succeed([])),
+        Effect.raceFirst(Deferred.await(supervisorDisconnected).pipe(Effect.as([]))),
+      )
+    : Effect.succeed([]);
+});

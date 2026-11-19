@@ -1,13 +1,21 @@
-import { Formatter, Option, PlatformError, Predicate, Schema, SchemaTransformation } from "effect";
+import {
+  Formatter,
+  Option,
+  PlatformError,
+  Predicate,
+  Schema,
+  SchemaTransformation,
+  Struct,
+} from "effect";
 
 import type { PrintableError } from "../lib/errors/index.ts";
 import { cutToGraphemes } from "./cut-to-graphemes.ts";
 import { TASK_ERROR_FIELDS } from "./error-fields.ts";
 import { TASK_PACKAGE } from "./task-package.ts";
 
-export const withLocationOrElse = (printable: PrintableError, fallbackLocation: string) => {
-  const { location, ...printableWithoutLocation } = printable;
-  return { ...printableWithoutLocation, location: location ?? fallbackLocation };
+export const attributeUnplacedToTask = (printable: PrintableError, taskName: string) => {
+  const isUnplaced = printable.location === undefined && printable.taskName === undefined;
+  return isUnplaced ? { ...Struct.omit(printable, ["taskName"]), taskName } : printable;
 };
 
 export const ErrorStack = Schema.Struct({ stack: Schema.String });
@@ -16,29 +24,39 @@ export const TaskRaisedError = Schema.Struct({
   raisedBy: Schema.Literal(TASK_PACKAGE.name),
   name: Schema.String,
   message: Schema.String,
-  messageBeforeOutput: Schema.optional(Schema.String),
+  printedMessage: Schema.optional(Schema.String),
   location: Schema.optional(Schema.String),
   filePath: Schema.optional(Schema.String),
   taskName: Schema.optional(Schema.NullOr(Schema.String)),
+  recapOutputLines: Schema.optional(Schema.Array(Schema.NullOr(Schema.String))),
 });
 
+const printedMessageOf = (error: typeof TaskRaisedError.Type) => {
+  const message = error.printedMessage ?? error.message;
+  return message === "" ? error.name : message;
+};
+
 export const reportError = (error: typeof TaskRaisedError.Type): PrintableError => {
-  const location = error.location ?? error.filePath ?? error.taskName ?? undefined;
+  const location = error.location ?? error.filePath;
+  const taskName = location === undefined ? (error.taskName ?? undefined) : undefined;
+  const outputLines = error.recapOutputLines ?? [];
   return {
     tag: error.name,
+    raisedBy: error.raisedBy,
     ...(location === undefined ? {} : { location }),
-    message: error.message === "" ? error.name : error.message,
-    ...(error.messageBeforeOutput === undefined
-      ? {}
-      : { messageBeforeOutput: error.messageBeforeOutput }),
+    ...(taskName === undefined ? {} : { taskName }),
+    message: printedMessageOf(error),
+    ...(outputLines.length === 0 ? {} : { outputLines }),
   };
 };
 
 const ErrnoCode = Schema.Struct({
-  code: Schema.String.check(Schema.isPattern(/^E[A-Z]+$/u)),
+  code: Schema.String,
+  errno: Schema.Int,
+  syscall: Schema.String,
 });
 
-const SystemErrorMessage = Schema.Struct({ ...ErrnoCode.fields, message: Schema.String });
+const CauseWithMessage = Schema.Struct({ message: Schema.String });
 
 const LocatedCauseMessage = Schema.Struct({ filePath: Schema.String, message: Schema.String });
 
@@ -66,54 +84,62 @@ const isLocatedCauseMessage = Schema.is(LocatedCauseMessage);
 
 export const THROWN_VALUE_WITHOUT_MESSAGE = "a thrown value that has no message";
 
-const describeDecodedCause = (decoded: typeof CauseMessage.Type) => {
+const withMissingErrorCode = (
+  errnoCode: Option.Option<typeof ErrnoCode.Type>,
+  description: string,
+) =>
+  Option.match(errnoCode, {
+    onNone: () => description,
+    onSome: (systemError) => `${description} (${systemError.code})`,
+  });
+
+const describeDecodedCause = (
+  decoded: typeof CauseMessage.Type,
+  errnoCode: Option.Option<typeof ErrnoCode.Type>,
+) => {
   const message = Predicate.isString(decoded) ? decoded : decoded.message;
-  const description = message === "" ? THROWN_VALUE_WITHOUT_MESSAGE : message;
+  const description = withMissingErrorCode(
+    errnoCode,
+    message === "" ? THROWN_VALUE_WITHOUT_MESSAGE : message,
+  );
   const hasLocation = !Predicate.isString(decoded) && isLocatedCauseMessage(decoded);
   return hasLocation ? `${decoded.filePath} ${description}` : description;
 };
 
-const restatesItsCause = (reason: PlatformError.PlatformError["reason"]) =>
+export const restatesItsCause = (reason: PlatformError.PlatformError["reason"]) =>
   reason.description === String(reason.cause) ||
   Option.exists(
-    Schema.decodeUnknownOption(Schema.Struct({ message: Schema.String }))(reason.cause),
+    Schema.decodeUnknownOption(CauseWithMessage)(reason.cause),
     (cause) => cause.message === reason.description,
   );
+
+export const PlatformErrorValue = Schema.instanceOf(PlatformError.PlatformError);
 
 const describePlatformError = (platformError: PlatformError.PlatformError) =>
   Option.getOrElse(
     Option.map(
       Option.filter(
-        Schema.decodeUnknownOption(SystemErrorMessage)(platformError.reason.cause),
+        Schema.decodeUnknownOption(CauseWithMessage)(platformError.reason.cause),
         () =>
           platformError.reason.description === undefined || restatesItsCause(platformError.reason),
       ),
-      (systemError) => systemError.message,
+      (restatedCause) => restatedCause.message,
     ),
     () => platformError.reason.description ?? platformError.message,
   );
 
 export const describeCauseMessage = (cause: unknown) =>
-  Option.match(Schema.decodeUnknownOption(Schema.instanceOf(PlatformError.PlatformError))(cause), {
+  Option.match(Schema.decodeUnknownOption(PlatformErrorValue)(cause), {
     onSome: describePlatformError,
     onNone: () =>
       Option.match(Schema.decodeUnknownOption(CauseMessage)(cause), {
-        onSome: describeDecodedCause,
+        onSome: (decoded) =>
+          describeDecodedCause(decoded, Schema.decodeUnknownOption(ErrnoCode)(cause)),
         onNone: () => "a failure value that cannot be formatted",
       }),
   });
 
 export const UNTAGGED_FAILURE_TAG = "UntaggedFailure";
-
-export class UntaggedFailure extends Schema.TaggedError<UntaggedFailure>()(UNTAGGED_FAILURE_TAG, {
-  ...TASK_ERROR_FIELDS,
-  failureMessage: Schema.String,
-  location: Schema.optional(Schema.String),
-}) {
-  public override get message() {
-    return this.failureMessage;
-  }
-}
 
 export class CauseWithoutFailure extends Schema.TaggedError<CauseWithoutFailure>()(
   "CauseWithoutFailure",

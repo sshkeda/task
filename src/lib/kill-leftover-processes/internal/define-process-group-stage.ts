@@ -1,5 +1,7 @@
 import { Schema } from "effect";
 
+import { ProcessIdentity } from "../../../shared/claim-processes-to-report.ts";
+
 export const SignalResult = Schema.Literals(["EPERM", "ESRCH", "sent"]);
 
 export const ListedIdentity = Schema.Struct({
@@ -10,7 +12,7 @@ export const ListedIdentity = Schema.Struct({
 
 export const ProcessGroupStage = Schema.TaggedUnion({
   Started: {},
-  LeaderExited: { latestMemberStartTime: Schema.String },
+  LeaderExited: { membersAtLeaderExit: Schema.Array(ProcessIdentity) },
   ProbedAlive: {},
   WitnessFound: { witness: ListedIdentity },
   StillTheSame: {},
@@ -22,7 +24,7 @@ export const ProcessGroupStage = Schema.TaggedUnion({
 
 export const ProcessGroupEvent = Schema.TaggedUnion({
   CheckMembers: { hasOnlyEndedMembers: Schema.Boolean },
-  ExitLeader: { latestMemberStartTime: Schema.NullOr(Schema.String) },
+  ExitLeader: { membersAtLeaderExit: Schema.Array(ProcessIdentity) },
   FindWitness: { witness: Schema.NullOr(ListedIdentity) },
   KillGroup: { result: SignalResult },
   Probe: { result: SignalResult },
@@ -30,12 +32,12 @@ export const ProcessGroupEvent = Schema.TaggedUnion({
 });
 
 export const lifeStageOf = (startedGroup: {
-  readonly latestMemberStartTimeAtLeaderExit: string | null;
+  readonly membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[] | null;
 }) =>
-  startedGroup.latestMemberStartTimeAtLeaderExit === null
+  startedGroup.membersAtLeaderExit === null
     ? ProcessGroupStage.cases.Started.make({})
     : ProcessGroupStage.cases.LeaderExited.make({
-        latestMemberStartTime: startedGroup.latestMemberStartTimeAtLeaderExit,
+        membersAtLeaderExit: startedGroup.membersAtLeaderExit,
       });
 
 const isLife = ProcessGroupStage.isAnyOf(["LeaderExited", "Started"]);
@@ -57,16 +59,13 @@ export const moveProcessGroupStage = (
         ? end
         : ([ProcessGroupStage.cases.NotSignalable.make({}), "keep"] as const);
     },
-    ExitLeader: ({ latestMemberStartTime }) => {
+    ExitLeader: ({ membersAtLeaderExit }) => {
       if (!isLife(stage)) {
         return stay(stage);
       }
-      return latestMemberStartTime === null
+      return membersAtLeaderExit.length === 0
         ? end
-        : ([
-            ProcessGroupStage.cases.LeaderExited.make({ latestMemberStartTime }),
-            "record",
-          ] as const);
+        : ([ProcessGroupStage.cases.LeaderExited.make({ membersAtLeaderExit }), "record"] as const);
     },
     Probe: ({ result }) => {
       if (!isLife(stage)) {

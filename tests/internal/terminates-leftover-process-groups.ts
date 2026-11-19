@@ -1,27 +1,43 @@
 import { expect } from "bun:test";
 
 import { Task } from "@sshkeda/task";
-import { Effect, FileSystem, Schedule, Schema } from "effect";
+import { Deferred, Effect, FileSystem, Schedule, Schema, Stream } from "effect";
 import { ChildProcess } from "effect/process";
+import { RpcTest } from "effect/rpc";
 
 import {
+  forgetEndedProcessGroups,
   killTaskProcessGroups,
+  recordLeaderExit,
   signalRunProcesses,
   startedProcessGroup,
 } from "../../src/lib/kill-leftover-processes/index.ts";
+import type { TrackedProcessGroup } from "../../src/lib/kill-leftover-processes/index.ts";
 import { listProcesses } from "../../src/lib/kill-leftover-processes/internal/list-processes.ts";
+import { createRunMarker } from "../../src/lib/kill-leftover-processes/internal/mark-run-processes.ts";
+import { makeProcessGroupsListingWith } from "../../src/lib/main-thread/shared/provide-process-groups.ts";
+import { processGroupsSharedWithTheSupervisor } from "../../src/lib/supervise-the-run/index.ts";
+import {
+  SupervisorRpcs,
+  supervisorConnectionDeferred,
+} from "../../src/lib/supervise-the-run/internal/talk-to-the-supervisor.ts";
 import { makeProcessReportClaimer } from "../../src/shared/claim-processes-to-report.ts";
 import { TASK_STATE_DIRECTORY_NAME } from "../../src/shared/names-from-package-json.ts";
-import { read, write } from "../shared/access-files.ts";
+import { RUN_MARKERS_VARIABLE_NAME } from "../../src/shared/read-environment-config.ts";
+import { markCommandOfTask } from "../../src/shared/run-marker.ts";
+import { exists, read, write } from "../shared/access-files.ts";
 import { failTestCleanup } from "../shared/fail-test-cleanup.ts";
 import { findKilledProcesses } from "../shared/find-killed-processes.ts";
-import { isProcessAlive } from "../shared/is-process-alive.ts";
+import { isProcessAlive, waitUntilProcessEnds } from "../shared/is-process-alive.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
-import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
+import { readShellExecutableName } from "../shared/read-shell-executable-name.ts";
+import { readAttribute, readProjectRunsDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 
 const SHELL_AND_SLEEP_PROCESS_COUNT = 2;
+
+const REGISTRATION = 1;
 
 export const hung = makeTest(
   "a task that starts a command and hangs is stopped by its timeout, which runs its finalizers and stops the command's whole tree",
@@ -40,7 +56,9 @@ export default hang;`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.standardError).toContain("[hang] cleaned up");
-      expect(ran.standardError).toContain("[hang] error TaskTimedOut: timed out after 5s");
+      expect(ran.standardError).toMatch(
+        /^run: \S+\/\nerror: \[hang\] main\.ts:4:26: TaskTimedOut: timed out after 5s\n\[hang\] cleaned up\nerror: \[hang\] its output is in \S+\/1\.output\nended: \[hang\], [\d.]+s, failed\nrecap: \[hang\] 1\.output \| main\.ts:4:26: TaskTimedOut: timed out after 5s\nfailed: \[hang\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+      );
       expect(findKilledProcesses(ran.standardError)).toEqual([]);
       const processIds = (yield* read(`${project.directory}/pids`)).trim().split(" ");
       expect(processIds).toHaveLength(SHELL_AND_SLEEP_PROCESS_COUNT);
@@ -91,7 +109,7 @@ export const leaked = makeTest(
       const processId = Number(/\[main\] spawned (?<processId>\d+)/u.exec(ran.standardError)?.[1]);
       const killed = findKilledProcesses(ran.standardError);
       expect(killed.map((each) => `${each.command} by ${each.by}`)).toEqual([
-        "sh by no known task",
+        `${yield* readShellExecutableName} by no known task`,
         "sleep by no known task",
       ]);
       expect(killed[0]?.processId).toBe(processId);
@@ -123,7 +141,7 @@ export const withoutPgrep = makeTest(
       const processId = Number(/\[main\] spawned (?<processId>\d+)/u.exec(ran.standardError)?.[1]);
       const killed = findKilledProcesses(ran.standardError);
       expect(killed.map((each) => `${each.command} by ${each.by}`)).toEqual([
-        "sh by no known task",
+        `${yield* readShellExecutableName} by no known task`,
         "sleep by no known task",
       ]);
       expect(killed[0]?.processId).toBe(processId);
@@ -151,7 +169,7 @@ export default Task.make({ name: "main", run: Effect.sync(() => Bun.spawn(["sh",
       const processId = Number(/\[main\] spawned (?<processId>\d+)/u.exec(ran.standardError)?.[1]);
       expect(findKilledProcesses(ran.standardError)).toContainEqual({
         processId,
-        command: "sh",
+        command: yield* readShellExecutableName,
         by: "no known task",
       });
       expect(yield* isProcessAlive(processId)).toBe(false);
@@ -175,7 +193,7 @@ export default Task.make({ name: "main", run: Effect.andThen(server, ${orphanCom
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       const expected = yield* Effect.forEach(["server", "main"], (name) =>
         Effect.gen(function* () {
           const [shell, shellGroup, sleep, sleepGroup] = yield* Schema.decodeUnknownEffect(
@@ -194,7 +212,7 @@ export default Task.make({ name: "main", run: Effect.andThen(server, ${orphanCom
               readAttribute(log.attributes, "process.pid") === sleep,
           );
           expect(readAttribute(logged?.attributes ?? [], "sshkeda_task.task")).toBe(name);
-          return { processId: sleep, command: "sleep", by: `"${name}"` };
+          return { processId: sleep, command: "sleep", by: `[${name}]` };
         }),
       );
       expect(
@@ -204,6 +222,36 @@ export default Task.make({ name: "main", run: Effect.andThen(server, ${orphanCom
       ).toEqual(expected.toSorted((left, right) => left.by.localeCompare(right.by)));
     }),
   ),
+);
+
+export const killedAfterLeaderExit = makeTest(
+  "a process that ignores SIGTERM and holds a command's output after the command exits is killed by the worker, reported once and traced with its task, and its kill is never printed as a task log line",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.asVoid(Task.exec("sh", ["-c", "trap '' TERM; sleep 600 & echo $! > pid; printf finished"])) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      const sleep = yield* Schema.decodeEffect(Schema.FiniteFromString)(
+        (yield* read(`${project.directory}/pid`)).trim(),
+      );
+      expect(findKilledProcesses(ran.standardError)).toEqual([
+        { processId: sleep, command: "sleep", by: "[main]" },
+      ]);
+      expect(ran.standardError).not.toContain("process killed");
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
+      const logged = trace?.logs.find(
+        (log) =>
+          log.body.stringValue === "process killed" &&
+          readAttribute(log.attributes, "process.pid") === sleep,
+      );
+      expect(readAttribute(logged?.attributes ?? [], "sshkeda_task.task")).toBe("main");
+    }),
+  ),
+  "30 seconds",
 );
 
 const FAKE_SECRET = "FAKE-SECRET-123";
@@ -222,7 +270,7 @@ export default Task.make({ name: "main", run: ChildProcess.make("sh", ["-c", "tr
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
       const perl = Number((yield* read(`${project.directory}/leftover-pid`)).trim());
-      expect(ran.standardError).toContain(`killed ${perl} (perl), started by "main"`);
+      expect(ran.standardError).toContain(`killed: [main] ${perl} (perl)`);
       expect(yield* isProcessAlive(perl)).toBe(false);
       const stateDirectory = `${project.home}/${TASK_STATE_DIRECTORY_NAME}`;
       const stateFiles = yield* Effect.filter(
@@ -232,7 +280,7 @@ export default Task.make({ name: "main", run: ChildProcess.make("sh", ["-c", "tr
         (filePath) =>
           Effect.map(fileSystem.stat(filePath), (information) => information.type === "File"),
       );
-      expect(stateFiles.some((filePath) => filePath.endsWith(".jsonl"))).toBe(true);
+      expect(stateFiles.some((filePath) => filePath.endsWith("/trace.jsonl"))).toBe(true);
       const filesHoldingSecret = yield* Effect.filter(stateFiles, (filePath) =>
         Effect.map(fileSystem.readFile(filePath), (bytes) =>
           Buffer.from(bytes).includes(FAKE_SECRET),
@@ -262,9 +310,9 @@ export default Task.make({ name: "main", run: Effect.andThen(leaver, Effect.log(
       expect(ran.exitCode).toBe(0);
       const sleep = Number((yield* read(`${project.directory}/leaver-pid`)).trim());
       expect(findKilledProcesses(ran.standardError)).toEqual([
-        { processId: sleep, command: "sleep", by: '"leaver"' },
+        { processId: sleep, command: "sleep", by: "[leaver]" },
       ]);
-      expect(ran.standardError.indexOf(`killed ${sleep} `)).toBeLessThan(
+      expect(ran.standardError.indexOf(`killed: [leaver] ${sleep} `)).toBeLessThan(
         ran.standardError.indexOf("[main] after leaver"),
       );
       expect(yield* isProcessAlive(sleep)).toBe(false);
@@ -290,7 +338,7 @@ export default Task.make({ name: "main", run: Task.exec("bash", ["-c", "set -m; 
       );
       expect(ran.exitCode, ran.standardError).toBe(0);
       expect(findKilledProcesses(ran.standardError), ran.standardError).toEqual([
-        { processId: Number(job), command: "bun", by: '"main"' },
+        { processId: Number(job), command: "bun", by: "[main]" },
       ]);
       expect(yield* isProcessAlive(Number(job))).toBe(false);
     }),
@@ -344,7 +392,7 @@ export default Task.make({ name: "main", run: Effect.asVoid(server) });`,
       expect(ran.exitCode).toBe(0);
       expect(findKilledProcesses(ran.standardError)).toEqual([]);
       expect(ran.standardError).not.toContain("could not kill");
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       expect(
         trace?.logs.filter((log) => String(log.body.stringValue).startsWith("process ")),
       ).toEqual([]);
@@ -370,6 +418,34 @@ export default Task.make({ name: "main", run: Effect.sync(() => Bun.spawn(["slee
       ]);
       expect(yield* isProcessAlive(leftover)).toBe(false);
       expect(yield* isProcessAlive(other.pid)).toBe(true);
+    }),
+  ),
+);
+
+export const markerInArguments = makeTest(
+  "a process task did not start, which names the run's marker in its arguments but not in its environment, is never killed",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo \\"$${RUN_MARKERS_VARIABLE_NAME}\\" > marker.part; mv marker.part marker; until [ -e foreign-started ]; do sleep 0.05; done"]) });`,
+      });
+      const command = yield* startTaskProcess(project, "main.ts");
+      yield* exists(`${project.directory}/marker`).pipe(
+        Effect.repeat({ until: (written) => written, schedule: Schedule.spaced("50 millis") }),
+        Effect.timeout("10 seconds"),
+      );
+      const marker = (yield* read(`${project.directory}/marker`)).trim();
+      const namingTheMarker = yield* ChildProcess.make(
+        "perl",
+        ["-e", "sleep 1000", `${RUN_MARKERS_VARIABLE_NAME}=${marker}`],
+        { stdout: "ignore", stderr: "ignore" },
+      );
+      yield* write(`${project.directory}/foreign-started`, "");
+      const ran = yield* command.waitForExit;
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(findKilledProcesses(ran.standardError)).toEqual([]);
+      expect(yield* isProcessAlive(namingTheMarker.pid)).toBe(true);
     }),
   ),
 );
@@ -498,19 +574,153 @@ export const reusedProcessGroupId = makeTest(
       const unrelated = yield* startGroupWhoseLeaderExited;
       const earlierStartTime = yield* readStartTimeOfThisProcess;
       const { claimProcessesToReport } = makeProcessReportClaimer();
-      for (const latestMemberStartTimeAtLeaderExit of [null, earlierStartTime]) {
+      for (const membersAtLeaderExit of [
+        null,
+        [{ processId: process.pid, startTime: earlierStartTime }],
+      ]) {
         yield* killTaskProcessGroups(
           new Map([
             [
               unrelated.processGroupId,
-              startedProcessGroup("leaver", earlierStartTime, latestMemberStartTimeAtLeaderExit),
+              startedProcessGroup(REGISTRATION, "leaver", earlierStartTime, membersAtLeaderExit),
             ],
           ]),
           "leaver",
           claimProcessesToReport,
+          null,
         );
         expect(yield* isProcessAlive(unrelated.member)).toBe(true);
       }
+    }),
+  ),
+);
+
+export const reusedProcessGroupIdAfterRecordedMembersEnded = makeTest(
+  "a recorded process group ID that an unrelated group now holds is never signaled after the members task saw at its leader's exit have ended, even when the unrelated group's member started between the leader and those members",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const leaderStartTime = yield* readStartTimeOfThisProcess;
+      const unrelated = yield* startGroupWhoseLeaderExited;
+      const endedMember = yield* ChildProcess.make("sleep", ["1000"]);
+      const listedEndedMember = yield* Effect.fromNullishOr(
+        (yield* listProcesses(null)).get(endedMember.pid),
+      );
+      yield* endedMember.kill({ killSignal: "SIGKILL" });
+      yield* waitUntilProcessEnds(endedMember.pid);
+      yield* killTaskProcessGroups(
+        new Map([
+          [
+            unrelated.processGroupId,
+            startedProcessGroup(REGISTRATION, "leaver", leaderStartTime, [
+              { processId: endedMember.pid, startTime: listedEndedMember.startTime },
+            ]),
+          ],
+        ]),
+        "leaver",
+        makeProcessReportClaimer().claimProcessesToReport,
+        null,
+      );
+      expect(yield* isProcessAlive(unrelated.member)).toBe(true);
+    }),
+  ),
+);
+
+export const leaderExitRecordedDuringKill = makeTest(
+  "a process group whose leader exit is recorded while a kill of its task looks at the group stays tracked, so the next kill stops the members its leader left",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const group = yield* startGroupWhoseLeaderExited;
+      const leaderStartTime = yield* readStartTimeOfThisProcess;
+      const listedMember = yield* Effect.fromNullishOr(
+        (yield* listProcesses(null)).get(group.member),
+      );
+      const startedProcessGroups = new Map([
+        [group.processGroupId, startedProcessGroup(REGISTRATION, "leaver", leaderStartTime, null)],
+      ]);
+      const killAndForget = (listProcessesNow: typeof listProcesses) =>
+        killTaskProcessGroups(
+          startedProcessGroups,
+          "leaver",
+          makeProcessReportClaimer().claimProcessesToReport,
+          null,
+          listProcessesNow,
+        ).pipe(Effect.flatMap(forgetEndedProcessGroups(startedProcessGroups)));
+      yield* killAndForget((taskName) =>
+        Effect.sync(() =>
+          recordLeaderExit(startedProcessGroups, group.processGroupId, "leaver", [
+            { processId: group.member, startTime: listedMember.startTime },
+          ]),
+        ).pipe(Effect.andThen(listProcesses(taskName))),
+      );
+      expect(startedProcessGroups.get(group.processGroupId)).toEqual(
+        startedProcessGroup(REGISTRATION, "leaver", leaderStartTime, [
+          { processId: group.member, startTime: listedMember.startTime },
+        ]),
+      );
+      yield* killAndForget(listProcesses);
+      yield* waitUntilProcessEnds(group.member);
+      expect(startedProcessGroups.has(group.processGroupId)).toBe(false);
+    }),
+  ),
+);
+
+const supervisorMirror = new Map<number, typeof TrackedProcessGroup.Type>();
+
+const actAsTheSupervisor = Effect.gen(function* () {
+  const handlers = yield* SupervisorRpcs.toHandlers({
+    ReportReady: () => Effect.void,
+    AcknowledgeStop: () => Effect.void,
+    ShareProcessGroup: ({ processGroupId, startedGroup }) =>
+      Effect.sync(() => {
+        if (startedGroup === null) {
+          supervisorMirror.delete(processGroupId);
+        } else {
+          supervisorMirror.set(processGroupId, startedGroup);
+        }
+      }),
+    RunInTerminal: () => Effect.die("the test supervisor runs no terminal commands"),
+    AwaitTerminalCommandExit: () => Effect.void,
+    ClaimUnknownOwnership: ({ processes }) => Effect.succeed(processes),
+    SweepBeforeExit: () => Effect.succeed([]),
+  });
+  const supervisor = yield* RpcTest.makeClient(SupervisorRpcs).pipe(
+    Effect.provideContext(handlers),
+  );
+  yield* Deferred.succeed(supervisorConnectionDeferred, supervisor);
+});
+
+export const supervisorKeepsLeaderExitRecordedDuringKill = makeTest(
+  "the supervisor keeps the leader exit the run records while a kill of the task looks at the group, and drops the group once a later kill ends it",
+  Effect.scoped(
+    Effect.gen(function* () {
+      yield* actAsTheSupervisor;
+      const group = yield* startGroupWhoseLeaderExited;
+      const leaderStartTime = yield* readStartTimeOfThisProcess;
+      const listedMember = yield* Effect.fromNullishOr(
+        (yield* listProcesses(null)).get(group.member),
+      );
+      const runConfig = { ownsSession: true, runMarker: null, runProcessId: process.pid };
+      const processGroups = makeProcessGroupsListingWith(runConfig, listProcesses);
+      const processGroupsRacingALeaderExit = makeProcessGroupsListingWith(runConfig, (taskName) =>
+        processGroups
+          .recordLeaderExit(group.processGroupId, "leaver", [
+            { processId: group.member, startTime: listedMember.startTime },
+          ])
+          .pipe(Effect.andThen(listProcesses(taskName))),
+      );
+      yield* processGroups.record(group.processGroupId, "leaver", leaderStartTime);
+      yield* processGroupsRacingALeaderExit.killForTask("leaver");
+      const tracked = yield* Effect.fromNullishOr(
+        processGroupsSharedWithTheSupervisor.get(group.processGroupId),
+      );
+      expect(tracked.membersAtLeaderExit).toEqual([
+        { processId: group.member, startTime: listedMember.startTime },
+      ]);
+      expect(supervisorMirror.get(group.processGroupId)).toEqual(tracked);
+      yield* processGroups.killForTask("leaver");
+      yield* waitUntilProcessEnds(group.member);
+      expect(processGroupsSharedWithTheSupervisor.has(group.processGroupId)).toBe(false);
+      expect(supervisorMirror.has(group.processGroupId)).toBe(false);
     }),
   ),
 );
@@ -524,9 +734,10 @@ export const reusedProcessId = makeTest(
       const earlierStartTime = yield* readStartTimeOfThisProcess;
       const { claimProcessesToReport } = makeProcessReportClaimer();
       yield* killTaskProcessGroups(
-        new Map([[sleep.pid, startedProcessGroup("leaver", earlierStartTime, null)]]),
+        new Map([[sleep.pid, startedProcessGroup(REGISTRATION, "leaver", earlierStartTime, null)]]),
         "leaver",
         claimProcessesToReport,
+        null,
         listedAsAnEarlierProcess(sleep.pid, earlierStartTime),
       );
       expect(yield* isProcessAlive(sleep.pid)).toBe(true);
@@ -548,14 +759,94 @@ export const reusedRunProcessId = makeTest(
           sessionId: listedSleep.sessionId,
           descendantsOfProcessId: null,
           startedProcessGroups: new Map([
-            [sleep.pid, startedProcessGroup("leaver", earlierStartTime, null)],
+            [sleep.pid, startedProcessGroup(REGISTRATION, "leaver", earlierStartTime, null)],
           ]),
           runMarker: null,
+          sparedProcessId: null,
         },
         "SIGKILL",
         listedAsAnEarlierProcess(sleep.pid, earlierStartTime),
       );
       expect(yield* isProcessAlive(sleep.pid)).toBe(true);
+    }),
+  ),
+);
+
+export const markedChildAfterRecordedMembersEnded = makeTest(
+  "a process a task's command group gains after its leader exits is killed and reported when that task ends, even after every member task saw at the leader's exit has ended",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { Effect, Schedule } from "effect";
+import { ChildProcess } from "effect/process";
+import { Task } from "@sshkeda/task";
+const hasEnded = (processId: number) => Effect.try(() => process.kill(processId, 0)).pipe(Effect.match({ onFailure: () => true, onSuccess: () => false }));
+export const leaver = Task.make({ name: "leaver", run: Effect.gen(function* () {
+  const leader = yield* ChildProcess.make("sh", ["-c", "(trap '' TERM; until [ -e go ]; do sleep 0.05; done; ${process.execPath} -e 'setInterval(() => {}, 1000)' > /dev/null 2>&1 & echo $! > child-pid.part; mv child-pid.part child-pid) > /dev/null 2>&1 & echo $! > member-pid"]);
+  yield* leader.exitCode;
+  const member = Number(readFileSync("member-pid", "utf8").trim());
+  writeFileSync("go", "");
+  yield* Effect.suspend(() => (existsSync("child-pid") ? hasEnded(member) : Effect.succeed(false))).pipe(Effect.repeat({ until: (done) => done, schedule: Schedule.spaced("50 millis") }));
+}) });
+export default Task.make({ name: "main", run: Effect.andThen(leaver, Effect.log("after leaver")) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      const child = Number((yield* read(`${project.directory}/child-pid`)).trim());
+      yield* killTestProcessWhenDone(child);
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(findKilledProcesses(ran.standardError)).toEqual([
+        { processId: child, command: "bun", by: "[leaver]" },
+      ]);
+      expect(ran.standardError.indexOf(`killed: [leaver] ${child} `)).toBeLessThan(
+        ran.standardError.indexOf("[main] after leaver"),
+      );
+      expect(yield* isProcessAlive(child)).toBe(false);
+    }),
+  ),
+);
+
+const SPAWN_UNMARKED_MEMBER = `const member = Bun.spawn([process.execPath, "-e", "setInterval(() => {}, 1000)"], { env: {}, stdio: ["ignore", "ignore", "ignore"] });
+console.log(member.pid);
+setInterval(() => {}, 1000);`;
+
+export const markerOfAnEarlierProcess = makeTest(
+  "the supervisor never signals a process group whose only marked member is listed with the identity of an earlier process at its PID, so the group's other members stay running",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const runMarker = yield* Effect.fromNullishOr(yield* createRunMarker([]));
+      const leader = yield* ChildProcess.make(
+        "env",
+        [
+          `${RUN_MARKERS_VARIABLE_NAME}=${markCommandOfTask(runMarker, "leaver")}`,
+          process.execPath,
+          "-e",
+          SPAWN_UNMARKED_MEMBER,
+        ],
+        { stdout: "pipe", stderr: "ignore" },
+      );
+      yield* killTestProcessWhenDone(leader.pid);
+      const member = Number(
+        yield* Effect.fromOption(
+          yield* leader.stdout.pipe(Stream.decodeText, Stream.splitLines, Stream.runHead),
+        ),
+      );
+      yield* killTestProcessWhenDone(member);
+      const earlierStartTime = yield* readStartTimeOfThisProcess;
+      yield* signalRunProcesses(
+        {
+          sessionId: -1,
+          descendantsOfProcessId: null,
+          startedProcessGroups: new Map([
+            [leader.pid, startedProcessGroup(REGISTRATION, "leaver", earlierStartTime, [])],
+          ]),
+          runMarker,
+          sparedProcessId: null,
+        },
+        "SIGKILL",
+        listedAsAnEarlierProcess(leader.pid, earlierStartTime),
+      );
+      expect(yield* isProcessAlive(member)).toBe(true);
     }),
   ),
 );

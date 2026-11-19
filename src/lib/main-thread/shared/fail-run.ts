@@ -3,18 +3,21 @@ import { Cause, Effect } from "effect";
 import { StopState } from "./provide-stop-state.ts";
 import { reportTaskFailure } from "./report-task-failure.ts";
 
-export const failTask = Effect.fn("failTask")(function* (
+export const failTask = Effect.fn(function* (
   failure: Effect.Success<StopState["Service"]["awaitFailure"]>,
-  markFailed: (taskName: string) => Effect.Effect<void>,
+  markFailed: (
+    taskName: string,
+    failure: { readonly _tag: string; readonly message: string },
+  ) => Effect.Effect<void>,
 ) {
   if (failure.taskName === null) {
     return;
   }
-  yield* markFailed(failure.taskName);
+  yield* markFailed(failure.taskName, failure);
   yield* reportTaskFailure(failure.taskName, Cause.fail(failure));
 }, Effect.uninterruptible);
 
-export const failRun = Effect.fn("failRun")(function* (
+export const failRun = Effect.fn(function* (
   failure: Parameters<typeof failTask>[0],
   markFailed: Parameters<typeof failTask>[1],
 ) {

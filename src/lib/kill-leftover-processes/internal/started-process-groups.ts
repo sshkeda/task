@@ -1,118 +1,180 @@
 import { Effect } from "effect";
 
-import {
-  lifeStageOf,
-  moveProcessGroupStage,
-  ProcessGroupEvent,
-  ProcessGroupStage,
-} from "./define-process-group-stage.ts";
+import { processIdentityKey } from "../../../shared/claim-processes-to-report.ts";
+import type { ProcessIdentity } from "../../../shared/claim-processes-to-report.ts";
+import type { RunMarker } from "../../../shared/run-marker.ts";
+import { lifeStageOf, ProcessGroupStage } from "./define-process-group-stage.ts";
 import type { ListedIdentity } from "./define-process-group-stage.ts";
+import {
+  moveTrackedProcessGroupStage,
+  trackedGroupOf,
+  TrackedProcessGroupEvent,
+  trackedStageOf,
+  UNREGISTERED_GENERATION,
+} from "./define-tracked-process-group-stage.ts";
 import { listProcesses } from "./list-processes.ts";
+import { findMarkedProcesses } from "./mark-run-processes.ts";
 import { sendSignal } from "./send-signal.ts";
 
 export const startedProcessGroup = (
+  generation: number,
   taskName: string,
   leaderStartTime: string | null,
-  latestMemberStartTimeAtLeaderExit: string | null,
-) => ({ taskName, leaderStartTime, latestMemberStartTimeAtLeaderExit });
+  membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[] | null,
+) => ({ generation, taskName, leaderStartTime, membersAtLeaderExit });
+
+const registrations = { latestGeneration: UNREGISTERED_GENERATION };
+
+const registerNextGeneration = () => {
+  registrations.latestGeneration += 1;
+  return registrations.latestGeneration;
+};
+
+export const moveTrackedProcessGroup = (
+  startedProcessGroups: Map<number, ReturnType<typeof startedProcessGroup>>,
+  processGroupId: number,
+  event: typeof TrackedProcessGroupEvent.Type,
+) => {
+  const [next, action] = moveTrackedProcessGroupStage(
+    trackedStageOf(startedProcessGroups.get(processGroupId)),
+    event,
+  );
+  if (action === "none") {
+    return action;
+  }
+  const nextGroup = trackedGroupOf(next);
+  if (nextGroup === null) {
+    startedProcessGroups.delete(processGroupId);
+  } else {
+    startedProcessGroups.set(processGroupId, nextGroup);
+  }
+  return action;
+};
+
+export const recordStartedProcessGroup = (
+  startedProcessGroups: Map<number, ReturnType<typeof startedProcessGroup>>,
+  processId: number,
+  taskName: string,
+  leaderStartTime: string | null,
+) =>
+  moveTrackedProcessGroup(
+    startedProcessGroups,
+    processId,
+    TrackedProcessGroupEvent.cases.Start.make({
+      generation: registerNextGeneration(),
+      taskName,
+      leaderStartTime,
+    }),
+  );
 
 export const recordLeaderExit = (
   startedProcessGroups: Map<number, ReturnType<typeof startedProcessGroup>>,
   processId: number,
-  latestMemberStartTime: string | null,
-) => {
-  const startedGroup = startedProcessGroups.get(processId);
-  if (startedGroup === undefined) {
-    return;
-  }
-  const [next] = moveProcessGroupStage(
-    lifeStageOf(startedGroup),
-    ProcessGroupEvent.cases.ExitLeader.make({ latestMemberStartTime }),
+  taskName: string,
+  membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[],
+) =>
+  moveTrackedProcessGroup(
+    startedProcessGroups,
+    processId,
+    TrackedProcessGroupEvent.cases.ExitLeader.make({ taskName, membersAtLeaderExit }),
   );
-  if (ProcessGroupStage.guards.LeaderExited(next)) {
-    startedProcessGroups.set(
-      processId,
-      startedProcessGroup(
-        startedGroup.taskName,
-        startedGroup.leaderStartTime,
-        next.latestMemberStartTime,
-      ),
-    );
-  } else {
-    startedProcessGroups.delete(processId);
-  }
-};
 
-const MICROSECONDS_PER_SECOND = 1_000_000n;
-
-const orderOfStartTime = (startTime: string) => {
-  const [seconds = "0", microseconds] = startTime.split(".");
-  return microseconds === undefined
-    ? BigInt(seconds)
-    : BigInt(seconds) * MICROSECONDS_PER_SECOND + BigInt(microseconds);
-};
-
-const findLatestMemberStartTime = (
+const findLiveMembers = (
   listedProcesses: Effect.Success<ReturnType<typeof listProcesses>>,
   processGroupId: number,
 ) =>
-  [...listedProcesses.values()]
-    .filter(
-      (listedProcess) => listedProcess.processGroupId === processGroupId && !listedProcess.hasEnded,
-    )
-    .map((listedProcess) => listedProcess.startTime)
-    .toSorted((left, right) => Number(orderOfStartTime(left) - orderOfStartTime(right)))
-    .at(-1) ?? null;
+  [...listedProcesses].flatMap(([processId, listedProcess]) => {
+    const isLiveMember = listedProcess.processGroupId === processGroupId && !listedProcess.hasEnded;
+    return isLiveMember ? [{ processId, startTime: listedProcess.startTime }] : [];
+  });
 
 export const findStartedGroupWitness = (
   listedProcesses: Effect.Success<ReturnType<typeof listProcesses>>,
   processGroupId: number,
-  startedGroup: Omit<ReturnType<typeof startedProcessGroup>, "taskName">,
+  startedGroup: Pick<
+    ReturnType<typeof startedProcessGroup>,
+    "leaderStartTime" | "membersAtLeaderExit" | "taskName"
+  >,
+  markedIdentities: ReadonlyMap<string, string | null>,
 ): typeof ListedIdentity.Type | null => {
-  const { leaderStartTime } = startedGroup;
   const lifeStage = lifeStageOf(startedGroup);
   if (!ProcessGroupStage.guards.LeaderExited(lifeStage)) {
     const leader = listedProcesses.get(processGroupId);
     const isTheLeaderTaskStarted =
-      leader?.processGroupId === processGroupId && leader.startTime === leaderStartTime;
+      leader?.processGroupId === processGroupId &&
+      leader.startTime === startedGroup.leaderStartTime;
     return isTheLeaderTaskStarted
       ? { processId: processGroupId, processGroupId, startTime: leader.startTime }
       : null;
   }
-  const witness = [...listedProcesses].find(
-    ([, listedProcess]) =>
-      listedProcess.processGroupId === processGroupId &&
-      !listedProcess.hasEnded &&
-      orderOfStartTime(listedProcess.startTime) <=
-        orderOfStartTime(lifeStage.latestMemberStartTime) &&
-      (leaderStartTime === null ||
-        orderOfStartTime(listedProcess.startTime) >= orderOfStartTime(leaderStartTime)),
+  const recordedMemberKeys = new Set(
+    lifeStage.membersAtLeaderExit.map((member) => processIdentityKey(member)),
   );
-  return witness === undefined
-    ? null
-    : { processId: witness[0], processGroupId, startTime: witness[1].startTime };
+  const witness = findLiveMembers(listedProcesses, processGroupId).find((member) => {
+    const memberKey = processIdentityKey(member);
+    return (
+      recordedMemberKeys.has(memberKey) || markedIdentities.get(memberKey) === startedGroup.taskName
+    );
+  });
+  return witness === undefined ? null : { ...witness, processGroupId };
 };
 
 export const findStartedGroupWitnessNow = (
   taskName: string | null,
   processGroupId: number,
-  startedGroup: Omit<ReturnType<typeof startedProcessGroup>, "taskName">,
+  startedGroup: Pick<
+    ReturnType<typeof startedProcessGroup>,
+    "leaderStartTime" | "membersAtLeaderExit" | "taskName"
+  >,
+  runMarker: typeof RunMarker.Type | null,
 ) =>
-  listProcesses(taskName).pipe(
-    Effect.map((listedProcesses) =>
-      findStartedGroupWitness(listedProcesses, processGroupId, startedGroup),
-    ),
-  );
+  Effect.gen(function* () {
+    const listedProcesses = yield* listProcesses(taskName);
+    const { markedIdentities } = yield* findMarkedProcesses(
+      runMarker,
+      new Map(
+        [...listedProcesses].filter(
+          ([, listedProcess]) => listedProcess.processGroupId === processGroupId,
+        ),
+      ),
+    );
+    return findStartedGroupWitness(listedProcesses, processGroupId, startedGroup, markedIdentities);
+  });
 
-export const readLatestMemberStartTime = (taskName: string | null, processGroupId: number) =>
+export const listMembersLeftByLeader = (
+  taskName: string | null,
+  processGroupId: number,
+  membersAtLeaderExit: readonly (typeof ProcessIdentity.Type)[],
+) => {
+  const recordedMemberKeys = new Set(
+    membersAtLeaderExit.map((member) => processIdentityKey(member)),
+  );
+  return listProcesses(taskName).pipe(
+    Effect.flatMap((listedProcesses) =>
+      Effect.forEach(
+        findLiveMembers(listedProcesses, processGroupId).filter((member) =>
+          recordedMemberKeys.has(processIdentityKey(member)),
+        ),
+        (member) =>
+          Effect.gen(function* () {
+            const listedProcess = listedProcesses.get(member.processId);
+            const command =
+              listedProcess === undefined ? null : yield* listedProcess.readCommandLineUnlessGone;
+            return command === null ? [] : [{ processId: member.processId, command }];
+          }),
+      ),
+    ),
+    Effect.map((members) => members.flat()),
+  );
+};
+
+export const readMembersAtLeaderExit = (taskName: string | null, processGroupId: number) =>
   sendSignal(taskName, -processGroupId, 0).pipe(
     Effect.flatMap((result) =>
       result === "ESRCH"
-        ? Effect.succeed(null)
+        ? Effect.succeed([])
         : listProcesses(taskName).pipe(
-            Effect.map((listedProcesses) =>
-              findLatestMemberStartTime(listedProcesses, processGroupId),
-            ),
+            Effect.map((listedProcesses) => findLiveMembers(listedProcesses, processGroupId)),
           ),
     ),
   );

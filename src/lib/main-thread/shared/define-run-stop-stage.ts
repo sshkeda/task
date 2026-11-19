@@ -29,13 +29,16 @@ import {
 } from "../../errors/index.ts";
 import {
   BrokenTasksFound,
+  RootTaskWorkingDirectoryUnavailable,
   ServingTaskRequestsItself,
   StopRequested,
   TaskCleanupCutOff,
   TaskCleanupFrozeWorker,
   TaskCleanupNotStarted,
   TaskCleanupTimedOut,
+  WorkerOutputNotRead,
   WorkerTerminatedForAnotherTask,
+  WorkerTerminationFailed,
 } from "./main-thread-errors.ts";
 
 export const RunFailure = Schema.Union([
@@ -49,6 +52,7 @@ export const RunFailure = Schema.Union([
   ProcRunMarkerUnreadable,
   ProcStatMalformed,
   ProcStatUnreadable,
+  RootTaskWorkingDirectoryUnavailable,
   ServedTaskFailed,
   ServingTaskRequestsItself,
   SettledTasksFailed,
@@ -66,7 +70,9 @@ export const RunFailure = Schema.Union([
   TaskTimedOut,
   TaskWaitsOnItself,
   WorkerExited,
+  WorkerOutputNotRead,
   WorkerTerminatedForAnotherTask,
+  WorkerTerminationFailed,
 ]);
 
 export const RunStopStage = Schema.TaggedUnion({

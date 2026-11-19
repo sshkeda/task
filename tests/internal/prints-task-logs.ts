@@ -1,17 +1,28 @@
 import { expect } from "bun:test";
 
 import { Task } from "@sshkeda/task";
-import { Effect, FileSystem } from "effect";
+import { Effect, FileSystem, Option } from "effect";
 
+import { joinOutput, OutputToJoin } from "../../src/shared/label-output.ts";
+import {
+  reserveTaskOutputBytes,
+  liftTaskOutputBudget,
+  makeTaskOutputBudget,
+  takeTaskOutputBytes,
+  tryToTakeTaskOutputBytes,
+  waitForTaskOutputBudgetChange,
+} from "../../src/shared/task-output-budget.ts";
 import { read } from "../shared/access-files.ts";
+import { countOccurrences } from "../shared/count-occurrences.ts";
 import { EXIT_CODE_AFTER_SIGINT } from "../shared/exit-codes-after-stop-signals.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
+import { findRunDirectoryPath, withSecondsNamed } from "../shared/name-output-files.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
+import { separateEndedLines } from "../shared/separate-ended-lines.ts";
+import { withoutTheFirstRunLine } from "../shared/split-run-lines.ts";
 
 const LOOP_LINE_COUNT = 20_000;
-
-const LINES_AFTER_THE_LOOP = 2;
 
 const LOGGED_BEFORE_EXIT_COUNT = 2000;
 
@@ -51,7 +62,7 @@ export default Task.make({ name: "main", run: Effect.forEach(Array.from({ length
       const lines = ran.standardError.split("\n");
       const exitLine = lines.findIndex((line) =>
         line.startsWith(
-          `[main] error WorkerExited: its worker exited on its own with code ${WORKER_EXIT_CODE}`,
+          `error: [main] main.ts:3:21: WorkerExited: its worker exited on its own with code ${WORKER_EXIT_CODE}`,
         ),
       );
       expect(lines.filter((line) => line.startsWith("[main] line "))).toEqual(
@@ -79,14 +90,10 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
+      expect(ran.standardError).toMatch(/^\[main\] retrying\n\[main\] \S+: warn Error: timeout$/mu);
+      expect(ran.standardError).toMatch(/^\[main\] caught\n\[main\] \S+: info Error: not found$/mu);
       expect(ran.standardError).toMatch(
-        /^\[main\] retrying\n\[main\] \S+: warn UntaggedFailure: timeout$/mu,
-      );
-      expect(ran.standardError).toMatch(
-        /^\[main\] caught\n\[main\] \S+: info UntaggedFailure: not found$/mu,
-      );
-      expect(ran.standardError).toMatch(
-        /^\[main\] gave up\n\[main\] \S+: error UntaggedFailure: still down$/mu,
+        /^\[main\] gave up\n\[main\] \S+: error Error: still down$/mu,
       );
     }),
   ),
@@ -123,7 +130,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
 );
 
 export const consoleOutputBeforeExit = makeTest(
-  "console output a task writes just before the run ends reaches stdout in full, whether the task passes or fails",
+  "console output a task writes just before the run ends reaches standard error in full, whether the task passes or fails",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -139,9 +146,12 @@ export default Task.make({ name: "chatty", run: Effect.gen(function* () {
       for (const fail of ["0", "1"]) {
         const ran = yield* runTaskProcess(project, "main.ts", { FAIL: fail });
         expect(ran.exitCode).toBe(Number(fail));
-        const lines = ran.standardOutput.split("\n");
-        expect(lines.length).toBe(LOOP_LINE_COUNT + LINES_AFTER_THE_LOOP);
-        expect(lines.at(-LINES_AFTER_THE_LOOP)).toBe("last line");
+        expect(ran.standardOutput).toBe("");
+        const outputLines = ran.standardError
+          .split("\n")
+          .filter((line) => line.startsWith("[chatty] "));
+        expect(outputLines.length).toBe(LOOP_LINE_COUNT + 1);
+        expect(outputLines.at(-1)).toBe("[chatty] last line");
       }
     }),
   ),
@@ -149,8 +159,10 @@ export default Task.make({ name: "chatty", run: Effect.gen(function* () {
 
 const CONSOLE_OUTPUT_LENGTH = 1_000_000;
 
+const CHATTY_LINE_COUNT = 3;
+
 export const consoleOutputToASlowReader = makeTest(
-  "console output a task writes just before the run ends reaches a reader that waits before it reads, as in | (sleep 3; cat), even when the pipe is non-blocking",
+  "console output a task writes just before the run ends reaches a reader of standard error that waits before it reads, as in 2>&1 | (sleep 3; cat), even when the pipe is non-blocking",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -159,41 +171,196 @@ import { Task } from "@sshkeda/task";
 export default Task.make({ name: "chatty", run: Effect.sync(() => {
   process.stdout.write("x".repeat(${CONSOLE_OUTPUT_LENGTH}) + "\\nlast line\\n");
 }) });`,
-        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`{ perl -MFcntl -e 'fcntl(STDOUT, F_SETFL, fcntl(STDOUT, F_GETFL, 0) | O_NONBLOCK) or die; exec @ARGV' \${process.execPath} main.ts; echo $? > exit-code; } | (sleep 3; cat > output)\`], { stdio: ["ignore", "inherit", "inherit"] });
+        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`{ perl -MFcntl -e 'fcntl(STDERR, F_SETFL, fcntl(STDERR, F_GETFL, 0) | O_NONBLOCK) or die; exec @ARGV' \${process.execPath} main.ts 2>&1; echo $? > exit-code; } | (sleep 3; cat > output)\`], { stdio: ["ignore", "inherit", "inherit"] });
 process.exitCode = await shell.exited;`,
       });
       yield* runTaskProcess(project, "piped.ts");
-      const output = yield* read(`${project.directory}/output`);
-      expect(output.length).toBe(CONSOLE_OUTPUT_LENGTH + "\nlast line\n".length);
-      expect(output.endsWith("\nlast line\n")).toBe(true);
+      const { endedLines, otherLines } = separateEndedLines(
+        withSecondsNamed(withoutTheFirstRunLine(yield* read(`${project.directory}/output`))).split(
+          "\n",
+        ),
+      );
+      expect(otherLines.slice(0, CHATTY_LINE_COUNT)).toEqual([
+        `output: ${"x".repeat(CONSOLE_OUTPUT_LENGTH)}`,
+        "output: last line",
+        "passed: 1 task, <seconds>",
+      ]);
+      expect(endedLines).toEqual([]);
       expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("0");
     }),
   ),
 );
 
-export const consoleOutputToAReaderThatLeaves = makeTest(
-  "console output to a reader that leaves early, as in | head -n 1, does not crash the run",
+const UNREAD_OUTPUT_LINE_COUNT = 64;
+
+const UNREAD_OUTPUT_LINE_BYTES = 1_048_576;
+
+const CHECKS_WITHOUT_PROGRESS = 10;
+
+export const unreadStandardErrorSlowsConsoleOutput = makeTest(
+  "while nobody reads standard error, a task writing 64 lines of 1 MiB to standard output is held back after about 16 MiB, and every line arrives once the reader reads",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { writeFileSync } from "node:fs";
+import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const line = "x".repeat(${UNREAD_OUTPUT_LINE_BYTES}) + "\\n";
+export default Task.make({ name: "chatty", run: Effect.promise(async () => {
+  for (let written = 1; written <= ${UNREAD_OUTPUT_LINE_COUNT}; written++) {
+    await new Promise<void>((resolve) => process.stdout.write(line, () => resolve()));
+    writeFileSync("written", String(written));
+  }
+}) });`,
+        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`{ \${process.execPath} main.ts 2>&1; echo $? > exit-code; } | (until [ -s written ]; do sleep 0.05; done; seen=$(cat written); same=0; while [ $same -lt ${CHECKS_WITHOUT_PROGRESS} ]; do sleep 0.2; now=$(cat written); if [ "$now" = "$seen" ]; then same=$((same + 1)); else seen=$now; same=0; fi; done; echo $seen > written-while-unread; cat > output)\`], { stdio: ["ignore", "inherit", "inherit"] });
+process.exitCode = await shell.exited;`,
+      });
+      const ran = yield* runTaskProcess(project, "piped.ts");
+      const writtenWhileUnread = Number(yield* read(`${project.directory}/written-while-unread`));
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(writtenWhileUnread).toBeGreaterThan(0);
+      expect(writtenWhileUnread).toBeLessThan(UNREAD_OUTPUT_LINE_COUNT);
+      const outputLines = (yield* read(`${project.directory}/output`))
+        .split("\n")
+        .filter((line) => line === `output: ${"x".repeat(UNREAD_OUTPUT_LINE_BYTES)}`);
+      expect(outputLines.length).toBe(UNREAD_OUTPUT_LINE_COUNT);
+      expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("0");
+    }),
+  ),
+);
+
+const FLOOD_SCRIPT = `i=0; while [ $i -lt ${UNREAD_OUTPUT_LINE_COUNT} ]; do head -c ${UNREAD_OUTPUT_LINE_BYTES} /dev/zero | tr '\\0' x; echo; i=$((i+1)); echo $i > written; done`;
+
+export const unreadStandardErrorSlowsCommandOutput = makeTest(
+  "while nobody reads standard error, a command writing 64 lines of 1 MiB is held back after about 16 MiB, and every line arrives once the reader reads",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "flood.sh": FLOOD_SCRIPT,
+        "main.ts": `import { Task } from "@sshkeda/task";
+export default Task.make({ name: "chatty", run: Task.exec("sh", ["flood.sh"], { print: true }) });`,
+        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`{ \${process.execPath} main.ts 2>&1; echo $? > exit-code; } | (until [ -s written ]; do sleep 0.05; done; seen=$(cat written); same=0; while [ $same -lt ${CHECKS_WITHOUT_PROGRESS} ]; do sleep 0.2; now=$(cat written); if [ "$now" = "$seen" ]; then same=$((same + 1)); else seen=$now; same=0; fi; done; echo $seen > written-while-unread; cat > output)\`], { stdio: ["ignore", "inherit", "inherit"] });
+process.exitCode = await shell.exited;`,
+      });
+      const ran = yield* runTaskProcess(project, "piped.ts");
+      const writtenWhileUnread = Number(yield* read(`${project.directory}/written-while-unread`));
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(writtenWhileUnread).toBeGreaterThan(0);
+      expect(writtenWhileUnread).toBeLessThan(UNREAD_OUTPUT_LINE_COUNT);
+      const outputLines = (yield* read(`${project.directory}/output`))
+        .split("\n")
+        .filter((line) => line === `[chatty] ${"x".repeat(UNREAD_OUTPUT_LINE_BYTES)}`);
+      expect(outputLines.length).toBe(UNREAD_OUTPUT_LINE_COUNT);
+      expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("0");
+    }),
+  ),
+);
+
+const BLANK_LINES_PER_CHUNK = 20_000;
+
+const BLANK_LINE_CHUNK_COUNT = 60;
+
+const LONG_NAME_REPEATS = 40;
+
+const LONG_TASK_NAME = `quiet${"-blank".repeat(LONG_NAME_REPEATS)}`;
+
+export const unreadStandardErrorHoldsBlankLines = makeTest(
+  `while nobody reads standard error, a command writing ${String(BLANK_LINE_CHUNK_COUNT * BLANK_LINES_PER_CHUNK)} blank lines is held back, since each blank line costs the bytes of its name and line end, and every line arrives once the reader reads`,
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "blank.sh": `i=0; while [ $i -lt ${BLANK_LINE_CHUNK_COUNT} ]; do head -c ${BLANK_LINES_PER_CHUNK} /dev/zero | tr '\\0' '\\n'; i=$((i+1)); echo $i > written; done`,
+        "main.ts": `import { Task } from "@sshkeda/task";
+export default Task.make({ name: "${LONG_TASK_NAME}", run: Task.exec("sh", ["blank.sh"], { print: true }) });`,
+        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`{ \${process.execPath} main.ts 2>&1; echo $? > exit-code; } | (until [ -s written ]; do sleep 0.05; done; seen=$(cat written); same=0; while [ $same -lt ${CHECKS_WITHOUT_PROGRESS} ]; do sleep 0.2; now=$(cat written); if [ "$now" = "$seen" ]; then same=$((same + 1)); else seen=$now; same=0; fi; done; echo $seen > written-while-unread; cat > output)\`], { stdio: ["ignore", "inherit", "inherit"] });
+process.exitCode = await shell.exited;`,
+      });
+      const ran = yield* runTaskProcess(project, "piped.ts");
+      const writtenWhileUnread = Number(yield* read(`${project.directory}/written-while-unread`));
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(writtenWhileUnread).toBeGreaterThan(0);
+      expect(writtenWhileUnread).toBeLessThan(BLANK_LINE_CHUNK_COUNT);
+      const outputLines = (yield* read(`${project.directory}/output`))
+        .split("\n")
+        .filter((line) => line === `[${LONG_TASK_NAME}] `);
+      expect(outputLines.length).toBe(BLANK_LINE_CHUNK_COUNT * BLANK_LINES_PER_CHUNK);
+      expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("0");
+    }),
+  ),
+);
+
+const FLOODING_CLEANUP_TASK = `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "chatty", cleanup: "1 minute", run: Effect.gen(function* () {
+  yield* Effect.addFinalizer(() => Task.exec("sh", ["flood.sh"], { print: true }).pipe(Effect.ignore, Effect.andThen(Effect.promise(() => Bun.write("cleanup-done", "")))));
+  yield* Effect.promise(() => Bun.write("started", ""));
+  return yield* Effect.forever(Effect.log("still going").pipe(Effect.andThen(Effect.sleep("10 millis"))));
+}) });`;
+
+export const commandOutputAfterAStopSignal = makeTest(
+  "once Ctrl-C stops the run while nobody reads standard error, a command a stopping task runs is no longer held back, so a cleanup that writes 64 MiB still finishes",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "flood.sh": FLOOD_SCRIPT,
+        "main.ts": FLOODING_CLEANUP_TASK,
+        "unread.pl": `use strict;
+pipe(my $reader, my $writer) or die;
+my $pid = fork();
+if ($pid == 0) { close $reader; open(STDERR, ">&", $writer) or die; exec($ARGV[0], "main.ts") or die; }
+close $writer;
+select(undef, undef, undef, 0.05) until -e "started";
+kill "INT", $pid;
+local $SIG{ALRM} = sub { kill "KILL", $pid; };
+alarm 40;
+waitpid($pid, 0);
+print $? & 127 ? "killed\\n" : ($? >> 8) . "\\n";`,
+        "unread.ts": `const perl = Bun.spawn(["perl", "unread.pl", process.execPath], { stdio: ["ignore", "inherit", "inherit"] });
+process.exitCode = await perl.exited;`,
+      });
+      const unread = yield* runTaskProcess(project, "unread.ts");
+      expect(unread.standardOutput).not.toBe("killed\n");
+      expect((yield* read(`${project.directory}/written`)).trim()).toBe(
+        String(UNREAD_OUTPUT_LINE_COUNT),
+      );
+      expect(
+        yield* (yield* FileSystem.FileSystem).exists(`${project.directory}/cleanup-done`),
+      ).toBe(true);
+    }),
+  ),
+  "50 seconds",
+);
+
+export const consoleOutputWhenStandardOutputRefusesWrites = makeTest(
+  "console output reaches standard error as output: lines and the run passes even when standard output refuses every write, since Task writes nothing there",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 export default Task.make({ name: "chatty", run: Effect.sync(() => {
-  for (let line = 0; line < 20; line++) process.stdout.write("x".repeat(${CONSOLE_OUTPUT_LENGTH}) + "\\n");
+  process.stdout.write("hello from the task\\n");
 }) });`,
-        "piped.ts": `const shell = Bun.spawn(["sh", "-c", \`{ \${process.execPath} main.ts 2> errors; echo $? > exit-code; } | head -n 1 > output\`], { stdio: ["ignore", "inherit", "inherit"] });
+        "read-only.ts": `const shell = Bun.spawn(["sh", "-c", \`\${process.execPath} main.ts 1</dev/null\`], { stdio: ["ignore", "inherit", "inherit"] });
 process.exitCode = await shell.exited;`,
       });
-      yield* runTaskProcess(project, "piped.ts");
-      expect((yield* read(`${project.directory}/output`)).length).toBe(CONSOLE_OUTPUT_LENGTH + 1);
-      expect(yield* read(`${project.directory}/errors`)).toContain("\npassed: 1 task, ");
-      expect((yield* read(`${project.directory}/exit-code`)).trim()).toBe("0");
+      const ran = yield* runTaskProcess(project, "read-only.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      const { endedLines, otherLines } = separateEndedLines(
+        withSecondsNamed(withoutTheFirstRunLine(ran.standardError)).split("\n"),
+      );
+      expect(otherLines.slice(0, -1)).toEqual([
+        "output: hello from the task",
+        "passed: 1 task, <seconds>",
+      ]);
+      expect(otherLines.at(-1)).toMatch(/^run: \S+\/$/u);
+      expect(endedLines).toEqual([]);
     }),
   ),
 );
 
 export const interruptWithConsoleOutputUnread = makeTest(
-  "Ctrl-C while standard output is a full pipe that nobody reads still ends the run with exit 130",
+  "Ctrl-C while standard output is a pipe that nobody reads ends the run with exit 130 and every line on standard error, since Task writes nothing to standard output",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -220,6 +387,12 @@ process.exitCode = await perl.exited;`,
       });
       const unread = yield* runTaskProcess(project, "unread.ts");
       expect(unread.standardOutput).toBe(`${EXIT_CODE_AFTER_SIGINT}\n`);
+      expect(withSecondsNamed(withoutTheFirstRunLine(unread.standardError))).toStartWith(
+        `output: ${"x".repeat(CONSOLE_OUTPUT_LENGTH)}\n`,
+      );
+      expect(unread.standardError).toMatch(
+        /^stopped: \[chatty\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/mu,
+      );
     }),
   ),
 );
@@ -231,7 +404,7 @@ export const liveCommandOutput = makeTest(
       const fileSystem = yield* FileSystem.FileSystem;
       const project = yield* makeProject({
         "main.ts": `import { Task } from "@sshkeda/task";
-export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo first; read line < gate; echo second"]) });`,
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo first; read line < gate; echo second"], { print: true }) });`,
       });
       yield* Task.exec("mkfifo", [`${project.directory}/gate`]);
 
@@ -242,7 +415,96 @@ export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo first
 
       const exited = yield* command.waitForExit;
       expect(exited.exitCode).toBe(0);
-      expect(exited.standardError).toContain("[main] first\n[main] second\n[main] passed in ");
+      expect(exited.standardError).toMatch(/\[main\] first\n\[main\] second\npassed: 1 task, /u);
+    }),
+  ),
+  "30 seconds",
+);
+
+export const liveCommandOutputFromBothStreams = makeTest(
+  "a command's standard output and standard error lines both print under the task's name while the command is still running",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const project = yield* makeProject({
+        "main.ts": `import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo to standard output; echo to standard error >&2; read line < gate; echo done"], { print: true }) });`,
+      });
+      yield* Task.exec("mkfifo", [`${project.directory}/gate`]);
+
+      const command = yield* startTaskProcess(project, "main.ts");
+      const gate = yield* fileSystem.open(`${project.directory}/gate`, { flag: "r+" });
+      yield* command.waitForLine("[main] to standard output");
+      yield* command.waitForLine("[main] to standard error");
+      yield* gate.write(new TextEncoder().encode("\n"));
+
+      const exited = yield* command.waitForExit;
+      expect(exited.exitCode, exited.standardError).toBe(0);
+      expect(exited.standardError).toMatch(/^\[main\] done\npassed: 1 task, /mu);
+    }),
+  ),
+  "30 seconds",
+);
+
+export const commandPromptWithoutANewline = makeTest(
+  "text a command writes without a newline, such as a prompt, prints under the task's name before the command reads its answer, and the rest of the line joins it",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const project = yield* makeProject({
+        "main.ts": `import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "printf 'Password: '; read answer < gate; echo accepted $answer"], { print: true }) });`,
+      });
+      yield* Task.exec("mkfifo", [`${project.directory}/gate`]);
+
+      const command = yield* startTaskProcess(project, "main.ts");
+      const gate = yield* fileSystem.open(`${project.directory}/gate`, { flag: "r+" });
+      yield* command.waitForStandardError("\n[main] Password: ");
+      yield* gate.write(new TextEncoder().encode("hunter2\n"));
+
+      const exited = yield* command.waitForExit;
+      expect(exited.exitCode, exited.standardError).toBe(0);
+      expect(exited.standardError).toMatch(/\n\[main\] Password: accepted hunter2\n/u);
+      expect(
+        withSecondsNamed(yield* read(`${findRunDirectoryPath(exited.standardError)}/1.output`)),
+      ).toBe(
+        "started: [main], <seconds>, 1.output\n[main] Password: accepted hunter2\nended: [main], <seconds>, passed\n",
+      );
+    }),
+  ),
+  "30 seconds",
+);
+
+export const promptEndedByAnotherLine = makeTest(
+  "a line from elsewhere ends a command's open prompt line first, and the rest of the prompt's line then prints as a new line under the task's name",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  yield* Effect.all([
+    Task.exec("sh", ["-c", "printf 'Continue? '; read answer < gate; echo $answer"], { print: true }),
+    Task.exec("sh", ["-c", "read line < log-gate"]).pipe(Effect.andThen(Effect.log("in between"))),
+  ], { concurrency: "unbounded" });
+}) });`,
+      });
+      yield* Task.exec("mkfifo", [`${project.directory}/gate`, `${project.directory}/log-gate`]);
+
+      const command = yield* startTaskProcess(project, "main.ts");
+      const gate = yield* fileSystem.open(`${project.directory}/gate`, { flag: "r+" });
+      const logGate = yield* fileSystem.open(`${project.directory}/log-gate`, { flag: "r+" });
+      yield* command.waitForStandardError("\n[main] Continue? ");
+      yield* logGate.write(new TextEncoder().encode("\n"));
+      yield* command.waitForLine("[main] in between");
+      yield* gate.write(new TextEncoder().encode("yes\n"));
+
+      const exited = yield* command.waitForExit;
+      expect(exited.exitCode, exited.standardError).toBe(0);
+      expect(exited.standardError).toMatch(
+        /\n\[main\] Continue\? \n\[main\] in between\n\[main\] yes\npassed: 1 task, /u,
+      );
     }),
   ),
   "30 seconds",
@@ -260,7 +522,7 @@ const heapMegabytes = Effect.sleep("500 millis").pipe(Effect.andThen(Effect.sync
   Bun.gc(true);
   return Math.round(heapStats().heapSize / 1_000_000);
 })));
-const printLines = Task.exec("sh", ["-c", "yes $(printf '%04000d' 0) | head -n 5000"]);
+const printLines = Task.exec("sh", ["-c", "yes $(printf '%04000d' 0) | head -n 5000"], { print: true });
 export default Task.make({ name: "main", run: Effect.gen(function* () {
   yield* printLines;
   const before = yield* heapMegabytes;
@@ -286,12 +548,12 @@ export const interleavedCommandOutput = makeTest(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Task } from "@sshkeda/task";
-export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo out one; sleep 0.3; echo err one >&2; sleep 0.3; echo out two; sleep 0.3; printf 'err two without a newline' >&2"]) });`,
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo out one; sleep 0.3; echo err one >&2; sleep 0.3; echo out two; sleep 0.3; printf 'err two without a newline' >&2"], { print: true }) });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(0);
-      expect(ran.standardError).toContain(
-        "[main] out one\n[main] err one\n[main] out two\n[main] err two without a newline\n[main] passed in ",
+      expect(ran.standardError).toMatch(
+        /\[main\] out one\n\[main\] err one\n\[main\] out two\n\[main\] err two without a newline\npassed: 1 task, /u,
       );
     }),
   ),
@@ -299,8 +561,10 @@ export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo out o
 
 const FAILED_COMMAND_EXIT_CODE = 3;
 
+const PRINTED_LIVE_AND_IN_THE_RECAP = 2;
+
 export const failedCommandOutput = makeTest(
-  "a failed command's output prints once, as the command writes it, and not again under its CommandFailed error, while the last line of the run still carries it",
+  "a failed command's output prints once, when the command fails, and not again under its CommandFailed error, only in its recap",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -310,11 +574,12 @@ export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo check
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(FAILED_COMMAND_EXIT_CODE);
       expect(ran.standardError).toContain(
-        `[main] checked\n[main] broken\n[main] error CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}\nfailed: main (1 of 1 task), `,
+        `[main] checked\n[main] broken\nerror: [main] main.ts:2:52: CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}\nerror: [main] its output is in ${findRunDirectoryPath(ran.standardError)}/1.output\nended: [main], `,
       );
-      expect(ran.standardError).toEndWith(
-        `\nCommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE} | checked | broken`,
+      expect(ran.standardError).toContain(
+        `\nrecap: [main] 1.output | main.ts:2:52: CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}\nrecap: [main] checked\nrecap: [main] broken\nfailed: `,
       );
+      expect(countOccurrences(ran.standardError, "broken")).toBe(PRINTED_LIVE_AND_IN_THE_RECAP);
     }),
   ),
 );
@@ -346,7 +611,7 @@ export const stoppedCommandLastLine = makeTest(
         Effect.gen(function* () {
           const project = yield* makeProject({
             "main.ts": `import { Task } from "@sshkeda/task";
-export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo 'full line'; printf '${WAITING_FOR_LOCK}' >&2; echo ready; sleep 30"]), ${options} });`,
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "echo 'full line'; printf '${WAITING_FOR_LOCK}' >&2; echo ready; sleep 30"], { print: true }), ${options} });`,
           });
           const command = yield* startTaskProcess(project, "main.ts");
           yield* stop(command);
@@ -369,7 +634,7 @@ export const stoppedCommandOutputWhileStopping = makeTest(
         Effect.gen(function* () {
           const project = yield* makeProject({
             "main.ts": `import { Task } from "@sshkeda/task";
-export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "trap 'echo released the lock; printf \\"removed the partial build\\" >&2; exit 1' TERM; echo ready; sleep 30 & wait"]), ${options} });`,
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "trap 'echo released the lock; printf \\"removed the partial build\\" >&2; exit 1' TERM; echo ready; sleep 30 & wait"], { print: true }), ${options} });`,
           });
           const command = yield* startTaskProcess(project, "main.ts");
           yield* stop(command);
@@ -389,12 +654,12 @@ export const stoppedCommandWithLingeringChild = makeTest(
     Effect.gen(function* () {
       const project = yield* makeProject({
         "main.ts": `import { Task } from "@sshkeda/task";
-export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "printf '${WAITING_FOR_LOCK}' >&2; (trap '' TERM; sleep 30) & wait"]), timeout: "1 second", cleanup: "1 minute" });`,
+export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "printf '${WAITING_FOR_LOCK}' >&2; (trap '' TERM; sleep 30) & wait"], { print: true }), timeout: "1 second", cleanup: "1 minute" });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain(`[main] ${WAITING_FOR_LOCK}\n`);
-      expect(ran.standardError).toMatch(/^failed: main \(1 of 1 task\), [0-9]\.\ds$/mu);
+      expect(ran.standardError).toMatch(/^failed: \[main\] \(1 of 1 task\), [0-9]\.\ds$/mu);
     }),
   ),
 );
@@ -405,26 +670,47 @@ const LONG_LINES_PER_TASK = 400;
 
 const LONG_LINE_TASK_NAMES = ["a", "b", "c"] as const;
 
+const printLongLines = (letter: string) =>
+  `Task.exec("awk", ["BEGIN { line = sprintf(\\"%${LONG_LINE_LENGTH}s\\", \\"\\"); gsub(/ /, \\"${letter}\\", line); for (i = 0; i < ${LONG_LINES_PER_TASK}; i++) print line }"], { print: true })`;
+
 export const parallelCommandOutput = makeTest(
-  "long output lines from commands in parallel tasks print whole, never cut by another task's lines",
+  "long output lines from commands in parallel tasks print every character under their own task's name, and each task's file, named on its started line at SSHKEDA_TASK_LOG=debug, holds them whole",
   Effect.scoped(
     Effect.gen(function* () {
-      const printLongLines = (letter: string) =>
-        `Task.exec("awk", ["BEGIN { line = sprintf(\\"%${LONG_LINE_LENGTH}s\\", \\"\\"); gsub(/ /, \\"${letter}\\", line); for (i = 0; i < ${LONG_LINES_PER_TASK}; i++) print line }"])`;
       const project = yield* makeProject({
         "main.ts": `import { Task } from "@sshkeda/task";
 ${LONG_LINE_TASK_NAMES.map((letter) => `export const ${letter} = Task.make({ name: "${letter}", run: ${printLongLines(letter)} });`).join("\n")}
 export default Task.make({ name: "main", run: Task.all([${LONG_LINE_TASK_NAMES.join(", ")}]) });`,
       });
-      const ran = yield* runTaskProcess(project, "main.ts");
+      const ran = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_LOG: "debug" });
       expect(ran.exitCode).toBe(0);
-      const outputLines = ran.standardError
+      const commandLines = ran.standardError
         .split("\n")
-        .filter((line) => line.length > LONG_LINE_LENGTH);
-      expect(outputLines).toHaveLength(LONG_LINES_PER_TASK * LONG_LINE_TASK_NAMES.length);
+        .filter((line) => /^\[[abc]\] /u.test(line));
       expect(
-        outputLines.filter((line) => !/^\[(?<letter>[abc])\] \k<letter>+$/u.test(line)),
+        commandLines.filter((line) => !/^\[(?<letter>[abc])\] \k<letter>+$/u.test(line)),
       ).toEqual([]);
+      const runDirectoryPath = findRunDirectoryPath(ran.standardError);
+      for (const letter of LONG_LINE_TASK_NAMES) {
+        const fileName = new RegExp(
+          `^started: \\[${letter}\\], [\\d.]+s, (?<fileName>\\d+\\.output)$`,
+          "mu",
+        ).exec(ran.standardError)?.groups?.["fileName"];
+        const printed = commandLines
+          .filter((line) => line.startsWith(`[${letter}] `))
+          .map((line) => line.slice(`[${letter}] `.length))
+          .join("");
+        expect(printed.length, letter).toBe(LONG_LINE_LENGTH * LONG_LINES_PER_TASK);
+        const fileLines = (yield* read(`${runDirectoryPath}/${fileName}`))
+          .split("\n")
+          .filter((line) => line.startsWith(`[${letter}] `));
+        expect(fileLines, letter).toEqual(
+          Array.from(
+            { length: LONG_LINES_PER_TASK },
+            () => `[${letter}] ${letter.repeat(LONG_LINE_LENGTH)}`,
+          ),
+        );
+      }
     }),
   ),
 );
@@ -562,7 +848,7 @@ export default Task.make({ name: "main", run: ${list}([${MANY_TASK_NAMES.join(",
   });
 
 export const manyWorkersLogging = makeTest(
-  "a run where dozens of tasks log at once on their own workers prints every line on standard output and standard error and no listener leak warning",
+  "a run where dozens of tasks log and print at once on their own workers prints every line on standard error and no listener leak warning",
   Effect.scoped(
     Effect.gen(function* () {
       const ran = yield* runManyTasksOnTheirOwnWorkers(
@@ -577,8 +863,11 @@ export const manyWorkersLogging = makeTest(
         ),
       ).toEqual([]);
       expect(
-        MANY_TASK_NAMES.filter((name) => !ran.standardOutput.includes(`printed by ${name}\n`)),
+        MANY_TASK_NAMES.filter(
+          (name) => !ran.standardError.includes(`[${name}] printed by ${name}\n`),
+        ),
       ).toEqual([]);
+      expect(ran.standardOutput).toBe("");
     }),
   ),
 );
@@ -598,4 +887,72 @@ export const manyWorkersFailing = makeTest(
       ).toEqual([]);
     }),
   ),
+);
+
+const FULL_BUDGET_BYTES = 16_777_216;
+
+export const liftBetweenReadAndWait = Task.make({
+  name: "a command held by a full output budget goes on when the budget is lifted after it read the budget and before it started to wait",
+  timeout: "10 seconds",
+  cleanup: "5 seconds",
+  run: Effect.gen(function* () {
+    const budget = makeTaskOutputBudget();
+    expect(tryToTakeTaskOutputBytes(budget, FULL_BUDGET_BYTES)).toEqual({
+      taken: FULL_BUDGET_BYTES,
+    });
+    const attempt = tryToTakeTaskOutputBytes(budget, 1);
+    expect(attempt).toEqual({ waitWhile: FULL_BUDGET_BYTES });
+    liftTaskOutputBudget(budget);
+    expect(yield* waitForTaskOutputBudgetChange(budget, FULL_BUDGET_BYTES)).toBe("not-equal");
+    expect(yield* takeTaskOutputBytes(budget, 1)).toBe(0);
+    const waitingBudget = makeTaskOutputBudget();
+    tryToTakeTaskOutputBytes(waitingBudget, FULL_BUDGET_BYTES);
+    const [woken] = yield* Effect.all(
+      [
+        waitForTaskOutputBudgetChange(waitingBudget, FULL_BUDGET_BYTES),
+        Effect.yieldNow.pipe(
+          Effect.andThen(
+            Effect.sync(() => {
+              liftTaskOutputBudget(waitingBudget);
+            }),
+          ),
+        ),
+      ],
+      { concurrency: "unbounded" },
+    );
+    expect(woken).toBe("ok");
+  }),
+});
+
+const ALTERNATING_PIECE_COUNT = 70_000;
+
+const PROBE_TASK_NAME_LENGTH = 245;
+
+export const alternatingPartialLinesAreReserved = makeTest(
+  "command output that alternates partial lines between standard output and standard error never prints more bytes than it reserved from the output budget, even under a long task name",
+  Effect.sync(() => {
+    const taskName = "n".repeat(PROBE_TASK_NAME_LENGTH);
+    const sources = [`[${taskName}] 0`, `[${taskName}] 1`];
+    const totals = {
+      openSource: Option.none<string>().pipe(Option.getOrNull),
+      joinedBytes: 0,
+      reservedBytes: 0,
+    };
+    for (const index of Array.from({ length: ALTERNATING_PIECE_COUNT }).keys()) {
+      const piece = { text: "x", continuesLine: index >= sources.length, endsLine: false };
+      const [openSource, texts] = joinOutput(
+        totals.openSource,
+        OutputToJoin.cases.Piece.make({
+          source: sources[index % sources.length] ?? "",
+          taskName,
+          piece,
+        }),
+      );
+      totals.openSource = openSource;
+      totals.joinedBytes += Buffer.byteLength(texts.join(""));
+      totals.reservedBytes += reserveTaskOutputBytes(taskName, [piece]);
+    }
+    const closingLineBreakBytes = totals.openSource === null ? 0 : 1;
+    expect(totals.joinedBytes + closingLineBreakBytes).toBeLessThanOrEqual(totals.reservedBytes);
+  }),
 );

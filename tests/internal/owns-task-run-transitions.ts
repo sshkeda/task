@@ -26,7 +26,7 @@ const describeStatus = (status: typeof TaskRunStatus.Type) =>
       Assigned: ({ workerId }) => [workerId],
       Loading: ({ workerId }) => [workerId],
       Running: ({ workerId }) => [workerId],
-      Serving: ({ workerId }) => [workerId],
+      Serving: ({ workerId, failed }) => [workerId, ...(failed ? ["failed"] : [])],
       Failing: ({ workerId }) => [workerId],
       Finished: ({ workerId }) => [workerId],
       Closed: ({ workerId }) => [workerId],
@@ -47,7 +47,8 @@ const statuses = [
   TaskRunStatus.cases.Assigned.make(onWorker),
   TaskRunStatus.cases.Loading.make(onWorker),
   TaskRunStatus.cases.Running.make(onWorker),
-  TaskRunStatus.cases.Serving.make(onWorker),
+  TaskRunStatus.cases.Serving.make({ ...onWorker, failed: false }),
+  TaskRunStatus.cases.Serving.make({ ...onWorker, failed: true }),
   TaskRunStatus.cases.Failing.make(onWorker),
   TaskRunStatus.cases.Finished.make(onWorker),
   TaskRunStatus.cases.Closed.make(onWorker),
@@ -63,7 +64,7 @@ const events = [
 ];
 
 const EXPECTED_MOVES = `
-Preparing | Assign 2 -> Assigned 2 | none
+Preparing | Assign 2 -> Assigned 2 | recordWorkerAssignment
 Preparing | End -> Preparing | ignored
 Preparing | FailBeforeCleanup -> Preparing | ignored
 Preparing | Load -> Preparing | ignored
@@ -72,7 +73,7 @@ Preparing | StartBody -> Preparing | ignored
 Assigned 1 | Assign 2 -> Assigned 1 | ignored
 Assigned 1 | End -> Finished 1 | settleOutcome
 Assigned 1 | FailBeforeCleanup -> Assigned 1 | ignored
-Assigned 1 | Load -> Loading 1 | none
+Assigned 1 | Load -> Loading 1 | recordModuleLoading
 Assigned 1 | Serve -> Assigned 1 | ignored
 Assigned 1 | StartBody -> Running 1 | recordBodyStart
 Loading 1 | Assign 2 -> Loading 1 | ignored
@@ -89,10 +90,16 @@ Running 1 | Serve -> Serving 1 | settleOutcome
 Running 1 | StartBody -> Running 1 | ignored
 Serving 1 | Assign 2 -> Serving 1 | ignored
 Serving 1 | End -> Closed 1 | close
-Serving 1 | FailBeforeCleanup -> Serving 1 | none
+Serving 1 | FailBeforeCleanup -> Serving 1 failed | reportServedFailure
 Serving 1 | Load -> Serving 1 | ignored
 Serving 1 | Serve -> Serving 1 | ignored
 Serving 1 | StartBody -> Serving 1 | ignored
+Serving 1 failed | Assign 2 -> Serving 1 failed | ignored
+Serving 1 failed | End -> Closed 1 | closeFailed
+Serving 1 failed | FailBeforeCleanup -> Serving 1 failed | ignored
+Serving 1 failed | Load -> Serving 1 failed | ignored
+Serving 1 failed | Serve -> Serving 1 failed | ignored
+Serving 1 failed | StartBody -> Serving 1 failed | ignored
 Failing 1 | Assign 2 -> Failing 1 | ignored
 Failing 1 | End -> Finished 1 | reportFailure
 Failing 1 | FailBeforeCleanup -> Failing 1 | ignored
@@ -139,6 +146,7 @@ const describeOutcomeEvent = TaskRunOutcomeEvent.match({
     causedByAwaitedTasks ? "FailOnExit by awaited tasks" : "FailOnExit",
   Pass: () => "Pass",
   Serve: () => "Serve",
+  StopServed: () => "StopServed",
 });
 
 const outcomes = [
@@ -156,6 +164,7 @@ const outcomeEvents = [
   TaskRunOutcomeEvent.cases.FailOnExit.make({ causedByAwaitedTasks: true }),
   TaskRunOutcomeEvent.cases.Pass.make({}),
   TaskRunOutcomeEvent.cases.Serve.make({}),
+  TaskRunOutcomeEvent.cases.StopServed.make({}),
 ];
 
 const EXPECTED_OUTCOME_MOVES = `
@@ -164,31 +173,37 @@ Pending | Fail -> Failed | none
 Pending | FailOnExit by awaited tasks -> Failed by awaited tasks | none
 Pending | Pass -> Passed | none
 Pending | Serve -> Served | none
+Pending | StopServed -> Pending | ignored
 Served | Cancel -> Served | ignored
 Served | Fail -> Failed | none
 Served | FailOnExit by awaited tasks -> Served | ignored
 Served | Pass -> Served | ignored
 Served | Serve -> Served | ignored
+Served | StopServed -> Cancelled | none
 Passed | Cancel -> Passed | ignored
 Passed | Fail -> Failed | none
 Passed | FailOnExit by awaited tasks -> Passed | ignored
 Passed | Pass -> Passed | ignored
 Passed | Serve -> Passed | ignored
+Passed | StopServed -> Passed | ignored
 Failed | Cancel -> Failed | ignored
 Failed | Fail -> Failed | none
 Failed | FailOnExit by awaited tasks -> Failed | ignored
 Failed | Pass -> Failed | ignored
 Failed | Serve -> Failed | ignored
+Failed | StopServed -> Failed | ignored
 Failed by awaited tasks | Cancel -> Failed by awaited tasks | ignored
 Failed by awaited tasks | Fail -> Failed | none
 Failed by awaited tasks | FailOnExit by awaited tasks -> Failed by awaited tasks | ignored
 Failed by awaited tasks | Pass -> Failed by awaited tasks | ignored
 Failed by awaited tasks | Serve -> Failed by awaited tasks | ignored
+Failed by awaited tasks | StopServed -> Failed by awaited tasks | ignored
 Cancelled | Cancel -> Cancelled | ignored
 Cancelled | Fail -> Failed | none
 Cancelled | FailOnExit by awaited tasks -> Cancelled | ignored
 Cancelled | Pass -> Cancelled | ignored
 Cancelled | Serve -> Cancelled | ignored
+Cancelled | StopServed -> Cancelled | ignored
 `;
 
 export const everyOutcomeMove = Task.make({

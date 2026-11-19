@@ -8,14 +8,18 @@ import {
   TaskNotMadeWhileLoading,
   TaskWaitsOnItself,
 } from "../lib/errors/index.ts";
-import { attributeFailures, joinMessages } from "./attribute-reported-failures.ts";
+import { attributeFailures } from "./attribute-reported-failures.ts";
 import { TASK_ERROR_FIELDS, UNATTRIBUTED_FAILURE_FIELDS } from "./error-fields.ts";
 import {
   findConstructingLocation,
   findLocationInFile,
+  findProjectLocation,
   findUserLocationInStack,
 } from "./find-user-locations-in-stack-traces.ts";
-import { ErrorStack, describeCauseMessage } from "./report-errors.ts";
+import { joinMessages } from "./join-messages.ts";
+import { nameTask } from "./label-lines.ts";
+import { reportWrappedCause } from "./report-cause.ts";
+import { ErrorStack } from "./report-errors.ts";
 import { TASK_PACKAGE } from "./task-package.ts";
 
 export class TaskModuleImportFailed extends Schema.TaggedError<TaskModuleImportFailed>()(
@@ -25,14 +29,17 @@ export class TaskModuleImportFailed extends Schema.TaggedError<TaskModuleImportF
   public get location() {
     return Option.match(Schema.decodeUnknownOption(ErrorStack)(this.cause), {
       onSome: (withStack) =>
-        findLocationInFile(withStack.stack, this.filePath) ??
+        findProjectLocation(findLocationInFile(withStack.stack, this.filePath)) ??
         findUserLocationInStack(withStack.stack) ??
-        this.filePath,
-      onNone: () => this.filePath,
+        findProjectLocation(this.filePath),
+      onNone: () => findProjectLocation(this.filePath),
     });
   }
+  public get reportedErrors() {
+    return reportWrappedCause(this, "could not import task module");
+  }
   public override get message() {
-    return `could not import task module because ${describeCauseMessage(this.cause)}`;
+    return joinMessages(this.reportedErrors);
   }
 }
 
@@ -65,7 +72,7 @@ export class StandardInputReadOutsideRootTask extends Schema.TaggedError<Standar
   { ...TASK_ERROR_FIELDS, taskName: Schema.String, rootTaskName: Schema.String },
 ) {
   public override get message() {
-    return `read standard input, which only the root task "${this.rootTaskName}" can read`;
+    return `read standard input, which only the root task ${nameTask(this.rootTaskName)} can read`;
   }
 }
 
@@ -83,9 +90,10 @@ export class TaskBodyFailed extends Schema.TaggedError<TaskBodyFailed>()("TaskBo
   ...REPORTED_FAILURE_FIELDS,
   ...TASK_ERROR_FIELDS,
   failedCommandExitCode: Schema.optional(Schema.Int),
+  awaitedTaskNames: Schema.optional(Schema.Array(Schema.String)),
 }) {
   public get reportedErrors() {
-    return attributeFailures(this, (failureMessage) => `its body failed with ${failureMessage}`);
+    return attributeFailures(this, null);
   }
   public override get message() {
     return joinMessages(this.reportedErrors);
@@ -97,10 +105,7 @@ export class ServedTaskFailed extends Schema.TaggedError<ServedTaskFailed>()("Se
   ...TASK_ERROR_FIELDS,
 }) {
   public get reportedErrors() {
-    return attributeFailures(
-      this,
-      (failureMessage) => `its body failed after serving with ${failureMessage}`,
-    );
+    return attributeFailures(this, "its body failed after serving");
   }
   public override get message() {
     return joinMessages(this.reportedErrors);
@@ -163,7 +168,7 @@ export class StartTaskNotMade extends Schema.TaggedError<StartTaskNotMade>()("St
 
 export class TaskNameNotString extends Schema.TaggedError<TaskNameNotString>()(
   "TaskNameNotString",
-  { ...TASK_ERROR_FIELDS, location: Schema.String, nameText: Schema.String },
+  { ...TASK_ERROR_FIELDS, location: Schema.UndefinedOr(Schema.String), nameText: Schema.String },
 ) {
   public override get message() {
     return `calls Task.make() with the name ${this.nameText}, which is not a string`;
@@ -172,7 +177,7 @@ export class TaskNameNotString extends Schema.TaggedError<TaskNameNotString>()(
 
 export class TaskDefinitionNotGiven extends Schema.TaggedError<TaskDefinitionNotGiven>()(
   "TaskDefinitionNotGiven",
-  { ...TASK_ERROR_FIELDS, given: Schema.String, location: Schema.String },
+  { ...TASK_ERROR_FIELDS, given: Schema.String, location: Schema.UndefinedOr(Schema.String) },
 ) {
   public override get message() {
     return `calls Task.make() with ${this.given}, which is not a task definition`;
@@ -205,7 +210,7 @@ export class TaskCleanupFailed extends Schema.TaggedError<TaskCleanupFailed>()(
   { ...REPORTED_FAILURE_FIELDS, ...TASK_ERROR_FIELDS },
 ) {
   public get reportedErrors() {
-    return attributeFailures(this, (failureMessage) => `its cleanup failed with ${failureMessage}`);
+    return attributeFailures(this, "its cleanup failed");
   }
   public override get message() {
     return joinMessages(this.reportedErrors);
@@ -218,12 +223,25 @@ export const AwaitedTasksFailure = Schema.Union([AwaitedTaskFailed, SettledTasks
 
 export const isAwaitedTasksFailure = Schema.is(AwaitedTasksFailure);
 
+export const AWAITED_TASKS_FAILURE_TAGS: ReadonlySet<string> = new Set(
+  AwaitedTasksFailure.members.map((member) => member.identifier),
+);
+
+export const isAwaitedTasksFailurePrintable = (printable: {
+  readonly tag: string;
+  readonly raisedBy?: typeof TASK_PACKAGE.name | undefined;
+  readonly location?: string | undefined;
+}) =>
+  AWAITED_TASKS_FAILURE_TAGS.has(printable.tag) &&
+  printable.raisedBy === TASK_PACKAGE.name &&
+  printable.location === undefined;
+
 export class RunCalledInStandaloneExecutable extends Schema.TaggedError<RunCalledInStandaloneExecutable>()(
   "RunCalledInStandaloneExecutable",
   { ...TASK_ERROR_FIELDS, ...UNATTRIBUTED_FAILURE_FIELDS, rootTaskName: Schema.String },
 ) {
   public override get message() {
-    return `${TASK_PACKAGE.name} can't run "${this.rootTaskName}" inside a bun build --compile binary, which holds only its bundle, not the task source files it imports again to run tasks`;
+    return `${TASK_PACKAGE.name} can't run ${nameTask(this.rootTaskName)} inside a bun build --compile binary, which holds only its bundle, not the task source files it imports again to run tasks`;
   }
 }
 

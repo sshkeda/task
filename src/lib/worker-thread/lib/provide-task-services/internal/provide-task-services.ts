@@ -3,6 +3,12 @@ import type { Schema } from "effect";
 import { SecureRandom } from "effect/crypto";
 import { ChildProcessSpawner } from "effect/process";
 
+import {
+  CommandRecapFiles,
+  makeCommandRecapPath,
+  readCommandRecap,
+} from "../../../../../shared/command-recap-file.ts";
+import { TaskLines } from "../../../../../shared/mark-task-worker-thread-contexts.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../../../shared/names-from-package-json.ts";
 import { RUN_MARKERS_VARIABLE_NAME } from "../../../../../shared/read-environment-config.ts";
 import {
@@ -19,14 +25,17 @@ import { TaskMadeByAnotherCopy } from "../../../../errors/index.ts";
 import type { makeTaskBodyRecord } from "../../../shared/define-task-body-record.ts";
 import { encodeTaskOutput } from "../../../shared/encode-task-output.ts";
 import { reportToMainThread, WorkerState } from "../../../shared/provide-worker-state.ts";
-import { makeTaskLogger } from "./make-task-logger.ts";
+import { makeTaskLines, makeTaskLogger } from "./make-task-logger.ts";
 import {
   provideTaskStdio,
   refuseStandardInputOutsideRootTask,
 } from "./read-standard-input-from-main-thread.ts";
-import { resolvePathsFromPackageDirectory } from "./resolve-paths-from-package-directory.ts";
-import { runCommandsInPackageDirectory } from "./run-commands-in-package-directory.ts";
-import { blameMissingWorkingDirectory } from "./spawn-commands-with-bun.ts";
+import { resolvePathsFromRunDirectory } from "./resolve-paths-from-run-directory.ts";
+import { runCommandsInRunDirectory } from "./run-commands-in-run-directory.ts";
+import {
+  checkWorkingDirectoryBeforeSpawn,
+  recheckWorkingDirectoryAfterSpawnFailure,
+} from "./spawn-commands-with-bun.ts";
 import { spawnReportedProcess } from "./spawn-reported-process.ts";
 
 const serve = (startMessage: typeof StartTaskFiber.Type, served: Schema.Json | undefined) =>
@@ -45,15 +54,26 @@ export const provideTaskServices =
   ) =>
   <Success, Failure, Services>(effect: Effect.Effect<Success, Failure, Services>) =>
     Effect.gen(function* () {
-      const { fileSystem, path } = resolvePathsFromPackageDirectory(
+      const { fileSystem, path } = resolvePathsFromRunDirectory(
         yield* Path.Path,
         yield* FileSystem.FileSystem,
-        startMessage.taskPackageDirectoryPath,
+        startMessage.runDirectoryPath,
       );
       return yield* effect.pipe(
         provideTaskStdio(startMessage, workerState),
         Effect.provideService(Path.Path, path),
         Effect.provideService(FileSystem.FileSystem, fileSystem),
+        Effect.provideService(
+          CommandRecapFiles,
+          CommandRecapFiles.of({
+            makeCommandRecapPath: makeCommandRecapPath(
+              fileSystem,
+              path,
+              startMessage.commandRecapDirectoryPath,
+            ),
+            readCommandRecap: (recapPath) => readCommandRecap(fileSystem, recapPath),
+          }),
+        ),
         Effect.provideService(
           Tasks,
           Tasks.of({
@@ -78,36 +98,46 @@ export const provideTaskServices =
           if (refusal !== null) {
             return Effect.die(refusal);
           }
-          const workingDirectory = path.resolve(startMessage.taskPackageDirectoryPath, command.cwd);
+          const workingDirectory = path.resolve(startMessage.runDirectoryPath, command.cwd);
           const { runMarker } = workerState;
-          return workerState
-            .runInTerminal({
-              ...command,
-              env:
-                runMarker === null
-                  ? command.env
-                  : {
-                      ...command.env,
-                      [RUN_MARKERS_VARIABLE_NAME]: markCommandOfTask(
-                        runMarker,
-                        startMessage.taskName,
-                      ),
-                    },
-              id: SecureRandom.uuidV4Unsafe(),
-              cwd: workingDirectory,
-              cleanup: startMessage.cleanup,
-            })
-            .pipe(
-              Effect.flatMap(failUnlessStarted(command.command)),
-              Effect.catchTag("PlatformError", (failure) =>
-                blameMissingWorkingDirectory(
-                  command.command.slice(command.command.lastIndexOf("/") + 1),
-                  startMessage.taskPackageDirectoryPath,
-                  workingDirectory,
-                  failure,
-                ).pipe(workerState.provideRuntimeServices),
-              ),
-            );
+          const programName = command.command.slice(command.command.lastIndexOf("/") + 1);
+          return checkWorkingDirectoryBeforeSpawn(
+            programName,
+            startMessage.runDirectoryPath,
+            workingDirectory,
+          ).pipe(
+            workerState.provideRuntimeServices,
+            Effect.andThen(
+              workerState
+                .runInTerminal({
+                  ...command,
+                  env:
+                    runMarker === null
+                      ? command.env
+                      : {
+                          ...command.env,
+                          [RUN_MARKERS_VARIABLE_NAME]: markCommandOfTask(
+                            runMarker,
+                            startMessage.taskName,
+                          ),
+                        },
+                  id: SecureRandom.uuidV4Unsafe(),
+                  cwd: workingDirectory,
+                  cleanup: startMessage.cleanup,
+                })
+                .pipe(
+                  Effect.flatMap(failUnlessStarted(command.command)),
+                  Effect.catchTag("PlatformError", (spawnFailure) =>
+                    recheckWorkingDirectoryAfterSpawnFailure(
+                      programName,
+                      startMessage.runDirectoryPath,
+                      workingDirectory,
+                      spawnFailure,
+                    ).pipe(workerState.provideRuntimeServices),
+                  ),
+                ),
+            ),
+          );
         }),
         Effect.provideService(
           Serving,
@@ -122,7 +152,7 @@ export const provideTaskServices =
         ),
         Effect.provideService(
           ChildProcessSpawner.ChildProcessSpawner,
-          runCommandsInPackageDirectory(path, startMessage.taskPackageDirectoryPath, (command) =>
+          runCommandsInRunDirectory(path, startMessage.runDirectoryPath, (command) =>
             spawnReportedProcess(startMessage, body, command).pipe(
               Effect.provideService(WorkerState, workerState),
             ),
@@ -137,6 +167,16 @@ export const provideTaskServices =
               workerState.reportToMainThreadNow,
             ),
           ]),
+        ),
+        Effect.provideService(
+          TaskLines,
+          makeTaskLines(
+            startMessage,
+            workerState.taskLogHold,
+            workerState.taskOutputBudget,
+            workerState.reportToMainThreadNow,
+            workerState.postStreamOutputNow,
+          ),
         ),
         Effect.annotateLogs(`${TASK_TRACE_LABEL_PREFIX}.task`, startMessage.taskName),
         workerState.provideRuntimeServices,

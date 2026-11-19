@@ -17,6 +17,10 @@ const SHELL_EXIT_CODE_BASE_FOR_SIGNALS = 128;
 export const exitCodeAfterStopSignal = (signal: (typeof STOP_REASONS)[number]) =>
   SHELL_EXIT_CODE_BASE_FOR_SIGNALS + STOP_REASON_NUMBERS[signal];
 
+const receivedSignalCounts = new Map<string, number>();
+
+export const countSignalsReceived = (signal: string) => receivedSignalCounts.get(signal) ?? 0;
+
 export const listenToSignals = <Signal extends NodeJS.Signals>(signals: readonly Signal[]) =>
   Effect.gen(function* () {
     const received = yield* Queue.unbounded<Signal>();
@@ -24,6 +28,7 @@ export const listenToSignals = <Signal extends NodeJS.Signals>(signals: readonly
       Effect.sync(() =>
         signals.map((signal) => {
           const offer = () => {
+            receivedSignalCounts.set(signal, countSignalsReceived(signal) + 1);
             Queue.offerUnsafe(received, signal);
           };
           process.on(signal, offer);

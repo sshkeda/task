@@ -25,7 +25,7 @@ export default Task.make({ name: "main", run: Effect.promise(() => Bun.write("ma
         [flag],
       );
       expect(ran.standardError).toBe(
-        `error RunCalledInBunWatchMode: @sshkeda/task doesn't run under bun ${flag}`,
+        `error: RunCalledInBunWatchMode: @sshkeda/task doesn't run under bun ${flag}`,
       );
       expect(ran.standardOutput).toBe("");
       expect(ran.exitCode).toBe(1);
@@ -63,7 +63,7 @@ const expectRefusedUnderBunEvaluation = (flag: string, printedFlag: string) =>
         flag.endsWith("=") ? [`${flag}${evaluatedCode}`] : [flag, evaluatedCode],
       );
       expect(ran.standardError).toBe(
-        `error RunCalledInBunEvaluation: @sshkeda/task doesn't run under bun ${printedFlag}`,
+        `error: RunCalledInBunEvaluation: @sshkeda/task doesn't run under bun ${printedFlag}`,
       );
       expect(ran.standardOutput).toBe("");
       expect(ran.exitCode).toBe(1);

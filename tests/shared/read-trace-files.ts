@@ -8,6 +8,10 @@ const PERMISSION_BITS = 0o777;
 
 const TASK_TRACE_LABEL_PREFIX = "sshkeda_task";
 
+const TASK_SCOPE_NAME = "@sshkeda/task";
+
+const TASK_SPAN_ROLE_ATTRIBUTE = `${TASK_TRACE_LABEL_PREFIX}.span.role`;
+
 const Scalar = Schema.Struct({
   stringValue: Schema.optionalKey(Schema.String),
   intValue: Schema.optionalKey(Schema.Union([Schema.Finite, Schema.String])),
@@ -27,11 +31,22 @@ const Span = Schema.Struct({
   spanId: Schema.String,
   parentSpanId: Schema.optionalKey(Schema.String),
   name: Schema.String,
+  kind: Schema.Finite,
   startTimeUnixNano: Schema.String,
   endTimeUnixNano: Schema.String,
   attributes: Attributes,
+  events: Schema.optionalKey(
+    Schema.Array(
+      Schema.Struct({ name: Schema.String, timeUnixNano: Schema.String, attributes: Attributes }),
+    ),
+  ),
   status: Schema.Struct({ code: Schema.Finite, message: Schema.optionalKey(Schema.String) }),
+  links: Schema.Array(
+    Schema.Struct({ traceId: Schema.String, spanId: Schema.String, attributes: Attributes }),
+  ),
 });
+
+const Scope = Schema.Struct({ name: Schema.String, version: Schema.optionalKey(Schema.String) });
 
 const LogRecord = Schema.Struct({
   timeUnixNano: Schema.String,
@@ -48,7 +63,7 @@ const Line = Schema.Union([
     resourceSpans: Schema.Array(
       Schema.Struct({
         resource: Resource,
-        scopeSpans: Schema.Array(Schema.Struct({ spans: Schema.Array(Span) })),
+        scopeSpans: Schema.Array(Schema.Struct({ scope: Scope, spans: Schema.Array(Span) })),
       }),
     ),
   }),
@@ -56,7 +71,9 @@ const Line = Schema.Union([
     resourceLogs: Schema.Array(
       Schema.Struct({
         resource: Resource,
-        scopeLogs: Schema.Array(Schema.Struct({ logRecords: Schema.Array(LogRecord) })),
+        scopeLogs: Schema.Array(
+          Schema.Struct({ scope: Scope, logRecords: Schema.Array(LogRecord) }),
+        ),
       }),
     ),
   }),
@@ -76,16 +93,16 @@ export const readAttribute = (attributes: typeof Attributes.Type, key: string) =
   return value === undefined ? undefined : readScalar(value);
 };
 
-export const readTraceDirectory = (
+export const readProjectRunsDirectory = (
   project: Effect.Success<ReturnType<typeof makeProjectUsingTaskFrom>>,
   ran: { readonly standardError: string; readonly exitCode: number },
 ) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const stateDirectory = `${project.home}/${TASK_STATE_DIRECTORY_NAME}`;
-    const directory = `${stateDirectory}/traces/project`;
+    const directory = `${stateDirectory}/runs/project`;
     const directoryModes = yield* Effect.forEach(
-      [stateDirectory, `${stateDirectory}/traces`, directory],
+      [stateDirectory, `${stateDirectory}/runs`, directory],
       (path) =>
         Effect.map(
           fileSystem.stat(path),
@@ -119,9 +136,21 @@ export const readTraceDirectory = (
     };
   });
 
-export const readTraces = (traceDirectory: Effect.Success<ReturnType<typeof readTraceDirectory>>) =>
+const TRACE_FILE_NAME = "trace.jsonl";
+
+const findOnly = <Found>(found: readonly Found[]) => {
+  const [only, ...others] = found;
+  return others.length === 0 ? only : undefined;
+};
+
+export const readTraces = (
+  projectRunsDirectory: Effect.Success<ReturnType<typeof readProjectRunsDirectory>>,
+) =>
   Effect.forEach(
-    traceDirectory.files.filter((file) => file.path.endsWith(".jsonl")),
+    projectRunsDirectory.files.filter((file) => {
+      const [runDirectoryName, fileName, ...deeper] = file.path.split("/");
+      return runDirectoryName !== undefined && fileName === TRACE_FILE_NAME && deeper.length === 0;
+    }),
     (file) =>
       Effect.gen(function* () {
         const lines = yield* Effect.forEach(file.text.trimEnd().split("\n"), (line) =>
@@ -133,10 +162,12 @@ export const readTraces = (traceDirectory: Effect.Success<ReturnType<typeof read
                 resource.scopeSpans.flatMap((scope) =>
                   scope.spans.map((span) => ({
                     ...span,
-                    label:
-                      span.name === "executeTaskFiber"
-                        ? `executeTaskFiber ${String(readAttribute(span.attributes, `${TASK_TRACE_LABEL_PREFIX}.task`))}`
-                        : span.name,
+                    scope: scope.scope,
+                    role:
+                      scope.scope.name === TASK_SCOPE_NAME
+                        ? readAttribute(span.attributes, TASK_SPAN_ROLE_ATTRIBUTE)
+                        : undefined,
+                    resource: resource.resource.attributes,
                     thread: readAttribute(
                       resource.resource.attributes,
                       `${TASK_TRACE_LABEL_PREFIX}.thread`,
@@ -154,23 +185,64 @@ export const readTraces = (traceDirectory: Effect.Success<ReturnType<typeof read
               )
             : [],
         );
-        const named = (label: string) => spans.filter((span) => span.label === label);
-        const findOnlySpan = (label: string) => {
-          const [only, ...others] = named(label);
-          return others.length === 0 ? only : undefined;
-        };
-        const findParentSpanNames = (span: (typeof spans)[number] | undefined): string[] => {
+        const userSpans = spans.filter((span) => span.role === undefined);
+        const named = (name: string) => userSpans.filter((span) => span.name === name);
+        const findOnlySpan = (name: string) => findOnly(named(name));
+        const withRole = (role: string) => spans.filter((span) => span.role === role);
+        const withTaskRole = (role: string, taskName: string) =>
+          withRole(role).filter(
+            (span) =>
+              readAttribute(span.attributes, `${TASK_TRACE_LABEL_PREFIX}.task`) === taskName,
+          );
+        const findRunSpan = () => findOnly(withRole("run"));
+        const findTaskSpan = (role: string, taskName: string) =>
+          findOnly(withTaskRole(role, taskName));
+        const findTaskEventNames = (role: string, taskName: string) =>
+          withTaskRole(role, taskName).flatMap((span) =>
+            (span.events ?? []).map((event) => event.name),
+          );
+        const findParentSpans = (span: (typeof spans)[number] | undefined): typeof spans => {
           const parent = spans.find((candidate) => candidate.spanId === span?.parentSpanId);
-          return parent === undefined ? [] : [parent.label, ...findParentSpanNames(parent)];
+          return parent === undefined ? [] : [parent, ...findParentSpans(parent)];
         };
+        const findChildSpans = (span: (typeof spans)[number] | undefined) =>
+          spans.filter((candidate) => candidate.parentSpanId === span?.spanId);
         return {
           ...file,
-          file: `${traceDirectory.home}/${TASK_STATE_DIRECTORY_NAME}/traces/project/${file.path}`,
+          file: `${projectRunsDirectory.home}/${TASK_STATE_DIRECTORY_NAME}/runs/project/${file.path}`,
           spans,
           logs,
           named,
           findOnlySpan,
-          findParentSpanNames,
+          withRole,
+          findRunSpan,
+          findTaskSpan,
+          findTaskEventNames,
+          findParentSpans,
+          findChildSpans,
         };
       }),
   );
+
+const TRACED_FAILURE_PREFIX = "failed: ";
+
+export const readTracedFailures = (
+  project: Parameters<typeof readProjectRunsDirectory>[0],
+  ran: Parameters<typeof readProjectRunsDirectory>[1],
+) =>
+  Effect.gen(function* () {
+    const traces = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
+    return traces.flatMap((trace) =>
+      trace.logs.flatMap((log) => {
+        const body = log.body.stringValue ?? "";
+        return body.startsWith(TRACED_FAILURE_PREFIX)
+          ? [
+              {
+                taskName: readAttribute(log.attributes, `${TASK_TRACE_LABEL_PREFIX}.task`),
+                failure: body.slice(TRACED_FAILURE_PREFIX.length),
+              },
+            ]
+          : [];
+      }),
+    );
+  });

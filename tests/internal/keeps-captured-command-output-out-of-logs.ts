@@ -8,6 +8,7 @@ import { failureAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import type { makeProjectUsingTaskFrom } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
+import { withRunDirectoryNamed, withSecondsNamed } from "../shared/name-output-files.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
@@ -20,7 +21,7 @@ const PRINT_FAKE_SECRETS = "printf '%s%s' fake-token- 7f3a9c; printf '%s%s' fake
 const FAILING_EXIT_CODE = 3;
 
 const CAPTURED_FAILURE_LINE =
-  "[main] error CapturedCommandFailed: sh exited with code 3, and its captured output is not shown";
+  "error: [main] main.ts:2:52: CapturedCommandFailed: sh exited with code 3, and its captured output is not shown";
 
 const readStateDirectoryFiles = (
   project: Effect.Success<ReturnType<typeof makeProjectUsingTaskFrom>>,
@@ -50,7 +51,7 @@ const expectNoFakeSecrets = (
   ran: { readonly standardOutput: string; readonly standardError: string },
   stateFiles: readonly { readonly path: string; readonly text: string }[],
 ) => {
-  expect(stateFiles.some((file) => file.path.startsWith("traces/"))).toBe(true);
+  expect(stateFiles.some((file) => file.path.startsWith("runs/"))).toBe(true);
   for (const secret of [FAKE_SECRET_OUTPUT, FAKE_SECRET_ERROR]) {
     expect(ran.standardOutput).not.toContain(secret);
     expect(ran.standardError).not.toContain(secret);
@@ -61,7 +62,7 @@ const expectNoFakeSecrets = (
 };
 
 export const capturedOutputStaysOutOfLogs = makeTest(
-  "Task.exec with secret: true logs no line of the command, so its output is in neither the run's output nor any file in the state directory",
+  "Task.exec with secret: true prints no line of the command, so its output is in neither the run's output nor any file in the state directory",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -82,7 +83,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       expect(
         stateFiles.some(
           (file) =>
-            file.path.startsWith("traces/") &&
+            file.path.startsWith("runs/") &&
             file.text.includes(`captured ${FAKE_SECRET_OUTPUT.length} characters`),
         ),
       ).toBe(true);
@@ -127,8 +128,9 @@ export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "${PRINT_FA
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(FAILING_EXIT_CODE);
       expect(
-        ran.standardError.split("\n").filter((line) => line.startsWith("[main] error ")),
+        ran.standardError.split("\n").filter((line) => line.startsWith("error: [main] main.ts:")),
       ).toEqual([CAPTURED_FAILURE_LINE]);
+      expect(ran.standardError).toMatch(/\nerror: \[main\] its output is in \S+\/1\.output\n/u);
       expectNoFakeSecrets(ran, yield* readStateDirectoryFiles(project));
     }),
   ),
@@ -141,8 +143,9 @@ import { Task } from "@sshkeda/task";
 export default Task.make({ name: "main", run: Effect.gen(function* () {
   const byDefault: string = yield* Task.exec("sh", ["-c", "echo default line"]);
   const notSecret: string = yield* Task.exec("sh", ["-c", "echo not secret line"], { secret: false });
+  const printed: string = yield* Task.exec("sh", ["-c", "echo printed line"], { print: true });
   const captured: Redacted.Redacted<string> = yield* Task.exec("sh", ["-c", "echo captured line"], { secret: true });
-  yield* Effect.log(\`returned \${JSON.stringify([byDefault, notSecret, Redacted.value(captured)])}\`);
+  yield* Effect.log(\`returned \${JSON.stringify([byDefault, notSecret, printed, Redacted.value(captured)])}\`);
   yield* Task.exec("sh", ["-c", "echo checked; echo broken >&2; exit 3"], { secret: false }).pipe(
     Effect.catchTag("CommandFailed", (failure) => Effect.log(\`caught \${failure.standardOutput.trim()} \${failure.standardError.trim()}\`)),
   );
@@ -151,15 +154,30 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
 `;
 
 export const defaultOutputLogs = makeTest(
-  "Task.exec logs each line and returns a string by default and with secret: false",
+  "Task.exec returns a string by default, with secret: false and with print: true, and prints a command's lines under its task's name as it writes them only with print: true, and otherwise all at once when its task fails",
   Effect.scoped(
     Effect.gen(function* () {
       yield* typeCheckSource(CONSUMER_SECRET_OPTION_SOURCE);
       const project = yield* makeProject({ "main.ts": CONSUMER_SECRET_OPTION_SOURCE });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(ROOT_TASK_COMMAND_EXIT_CODE);
-      expect(ran.standardError).toContain(
-        `[main] default line\n[main] not secret line\n[main] returned ["default line\\n","not secret line\\n","captured line\\n"]\n[main] checked\n[main] broken\n[main] caught checked broken\n[main] failed\n[main] error CommandFailed: sh exited with code ${ROOT_TASK_COMMAND_EXIT_CODE}\nfailed: main (1 of 1 task), `,
+      expect(withSecondsNamed(withRunDirectoryNamed(ran.standardError, project))).toBe(
+        [
+          "run: <run folder>/",
+          "[main] printed line",
+          String.raw`[main] returned ["default line\n","not secret line\n","printed line\n","captured line\n"]`,
+          "[main] caught checked broken",
+          "[main] checked",
+          "[main] broken",
+          "[main] failed",
+          `error: [main] main.ts:12:15: CommandFailed: sh exited with code ${ROOT_TASK_COMMAND_EXIT_CODE}`,
+          "error: [main] its output is in <run folder>/1.output",
+          "ended: [main], <seconds>, failed",
+          `recap: [main] 1.output | main.ts:12:15: CommandFailed: sh exited with code ${ROOT_TASK_COMMAND_EXIT_CODE}`,
+          "recap: [main] failed",
+          "failed: [main] (1 of 1 task), <seconds>",
+          "run: <run folder>/",
+        ].join("\n"),
       );
     }),
   ),

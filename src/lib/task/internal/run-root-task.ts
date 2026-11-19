@@ -4,15 +4,15 @@ import * as BunCrypto from "@effect/platform-bun/BunCrypto";
 import * as BunServices from "@effect/platform-bun/BunServices";
 import {
   Array as Arrays,
+  Cause,
+  Clock,
   Deferred,
   Duration,
   Effect,
   Exit,
   Fiber,
   FileSystem,
-  flow,
-  LogLevel,
-  Option,
+  Logger,
   Path,
   Queue,
   Runtime,
@@ -20,19 +20,27 @@ import {
   Stdio,
   Stream,
 } from "effect";
-import type { Cause } from "effect";
 import { constVoid } from "effect/Function";
 import type { PlatformError } from "effect/PlatformError";
 
-import { setProjectDirectoryPath } from "../../../shared/find-user-locations-in-stack-traces.ts";
-import { formatCauseLines, formatFailureLines } from "../../../shared/format-error-lines.ts";
+import {
+  filePathOfLocation,
+  setProjectDirectoryPath,
+} from "../../../shared/find-user-locations-in-stack-traces.ts";
+import { joinOutput, OutputToJoin } from "../../../shared/label-output.ts";
 import { isInsideTaskWorkerThread } from "../../../shared/mark-task-worker-thread-contexts.ts";
 import {
+  LINE_ORIGINS,
+  printCauseNow,
+  printFailureNow,
+  recordStandardErrorWrite,
   StandardErrorWriteFailed,
   standardErrorClosedDeferred,
   standardErrorLinesDeferred,
   standardErrorWriteFailedDeferred,
+  standardErrorWriterStoppedDeferred,
 } from "../../../shared/print-to-standard-error.ts";
+import type { makeStandardErrorLine } from "../../../shared/print-to-standard-error.ts";
 import {
   bunEvaluationFlag,
   bunWatchModeFlag,
@@ -44,12 +52,10 @@ import {
 import type { LOG_LEVEL_NAMES } from "../../../shared/read-environment-config.ts";
 import {
   findDefinitionNotGiven,
-  filePathOfLocation,
   isListMadeByThisCopy,
   listTasksMade,
 } from "../../../shared/record-tasks-made.ts";
 import type { RootTaskGroup } from "../../../shared/root-task-group.ts";
-import type { StandardErrorLine } from "../../../shared/rpc.ts";
 import { saveStandardStreamFlags } from "../../../shared/save-standard-stream-flags.ts";
 import {
   exitCodeAfterStopSignal,
@@ -57,12 +63,41 @@ import {
   listenToSignals,
   STOP_SIGNALS,
 } from "../../../shared/stop-signals.ts";
-import { Exited } from "../../../shared/task-errors.ts";
+import { Exited, RunArgumentsNotAccepted, StartTaskNotMade } from "../../../shared/task-errors.ts";
+import { ENVIRONMENT_USAGE_ERRORS, USAGE_ERROR_EXIT_CODE } from "../../../shared/usage-errors.ts";
+import {
+  FlagGivenTwice,
+  FlagInvalid,
+  FlagMissing,
+  FlagNotRead,
+  FlagsInvalid,
+  FlagValueMissing,
+} from "./flag-errors.ts";
 import { checkDeclaredFlags, decodeTaskFlags, readCommandLine } from "./read-command-line-flags.ts";
+import { findErrnoCode, readerHasGone } from "./standard-stream-reader-gone.ts";
 
 const STANDARD_ERROR_FILE_DESCRIPTOR = 2;
 
 const READER_WAIT_AFTER_A_STOP_SIGNAL = Duration.seconds(1);
+
+const FAILURE_EXIT_CODE = 1;
+
+const isUsageError = Schema.is(
+  Schema.Union([
+    ...ENVIRONMENT_USAGE_ERRORS,
+    FlagGivenTwice,
+    FlagInvalid,
+    FlagMissing,
+    FlagNotRead,
+    FlagsInvalid,
+    FlagValueMissing,
+    RunArgumentsNotAccepted,
+    StartTaskNotMade,
+  ]),
+);
+
+const exitCodeOfRefusal = (refusal: Error) =>
+  isUsageError(refusal) ? USAGE_ERROR_EXIT_CODE : FAILURE_EXIT_CODE;
 
 class StandardErrorNotRead extends Schema.TaggedError<StandardErrorNotRead>()(
   "StandardErrorNotRead",
@@ -77,15 +112,6 @@ class StandardErrorNotRead extends Schema.TaggedError<StandardErrorNotRead>()(
   }
 }
 
-const findErrnoCode = flow(
-  Schema.decodeUnknownOption(Schema.Struct({ cause: Schema.Struct({ code: Schema.String }) })),
-  Option.map((reason) => reason.cause.code),
-  Option.getOrNull,
-);
-
-const readerHasGone = (errnoCode: string | null, isTerminal: boolean) =>
-  errnoCode === "EPIPE" || (errnoCode === "EIO" && isTerminal);
-
 const recordWriteFailure = (failure: PlatformError, isTerminal: boolean) =>
   Effect.sync(() => {
     const errnoCode = findErrnoCode(failure.reason);
@@ -97,24 +123,72 @@ const recordWriteFailure = (failure: PlatformError, isTerminal: boolean) =>
     }
     return Deferred.doneUnsafe(
       standardErrorWriteFailedDeferred,
-      Exit.succeed(new StandardErrorWriteFailed({ errnoCode, reason: failure.message })),
+      Exit.succeed(new StandardErrorWriteFailed({ cause: failure })),
     );
   });
 
 const writeLines = (
   stdio: Stdio.Stdio,
-  lines: Queue.Queue<typeof StandardErrorLine.Type, Cause.Done>,
-  minimumLogLevel: LogLevel.LogLevel,
+  lines: Queue.Queue<ReturnType<typeof makeStandardErrorLine>, Cause.Done>,
+  shownOrigins: readonly (typeof LINE_ORIGINS)[number][],
   isTerminal: boolean,
 ) =>
   Stream.fromQueue(lines).pipe(
-    Stream.filter((line) => LogLevel.isGreaterThanOrEqualTo(line.logLevel, minimumLogLevel)),
-    Stream.map((line) => line.text),
-    Stream.run(stdio.stderr()),
+    Stream.mapAccum(
+      () => null,
+      (openSource: string | null, line) => {
+        const isRunningLineInsideAnOpenLine = line.origin === "status" && openSource !== null;
+        if (isRunningLineInsideAnOpenLine) {
+          return [openSource, [{ text: "", isLineOpen: true, onWritten: line.onWritten }]] as const;
+        }
+        if (!shownOrigins.includes(line.origin)) {
+          const hiddenLineEndsAnOpenLine =
+            openSource !== null && OutputToJoin.guards.Line(line.output);
+          return hiddenLineEndsAnOpenLine
+            ? ([null, [{ text: "\n", isLineOpen: false, onWritten: line.onWritten }]] as const)
+            : ([
+                openSource,
+                [{ text: "", isLineOpen: openSource !== null, onWritten: line.onWritten }],
+              ] as const);
+        }
+        const [nextOpenSource, texts] = joinOutput(openSource, line.output);
+        return [
+          nextOpenSource,
+          [
+            {
+              text: texts.join(""),
+              isLineOpen: nextOpenSource !== null,
+              onWritten: line.onWritten,
+            },
+          ],
+        ] as const;
+      },
+      {
+        onHalt: (openSource) =>
+          openSource === null ? [] : [{ text: "\n", isLineOpen: false, onWritten: Effect.void }],
+      },
+    ),
+    Stream.runForEachArray((written) => {
+      const text = written.map((line) => line.text).join("");
+      const write =
+        text === ""
+          ? Effect.void
+          : Stream.make(text).pipe(
+              Stream.run(stdio.stderr()),
+              Effect.andThen(Clock.currentTimeMillis),
+              Effect.flatMap((nowMilliseconds) =>
+                recordStandardErrorWrite(nowMilliseconds, written.at(-1)?.isLineOpen ?? false),
+              ),
+            );
+      return write.pipe(
+        Effect.andThen(Effect.forEach(written, (line) => line.onWritten, { discard: true })),
+      );
+    }),
     Effect.catchTag("PlatformError", (error) =>
       recordWriteFailure(error, isTerminal).pipe(Effect.andThen(Queue.end(lines))),
     ),
     Effect.asVoid,
+    Effect.ensuring(Deferred.done(standardErrorWriterStoppedDeferred, Exit.void)),
   );
 
 const exitCodeAfterWriting = <Ended extends NodeJS.Signals | number>(ended: Ended) =>
@@ -128,17 +202,17 @@ const exitCodeAfterWriting = <Ended extends NodeJS.Signals | number>(ended: Ende
 
 const printLinesDuring = <Ended extends NodeJS.Signals | number, Failure, Services>(
   program: Effect.Effect<Ended, Failure, Services>,
-  minimumLogLevel: LogLevel.LogLevel,
+  shownOrigins: readonly (typeof LINE_ORIGINS)[number][],
 ) =>
   Effect.gen(function* () {
     const stdio = yield* Stdio.Stdio;
     const stopSignals = yield* listenToSignals(STOP_SIGNALS);
-    const lines = yield* Queue.unbounded<typeof StandardErrorLine.Type, Cause.Done>();
+    const lines = yield* Queue.unbounded<ReturnType<typeof makeStandardErrorLine>, Cause.Done>();
     yield* Deferred.succeed(standardErrorLinesDeferred, lines);
     const writer = yield* writeLines(
       stdio,
       lines,
-      minimumLogLevel,
+      shownOrigins,
       isatty(STANDARD_ERROR_FILE_DESCRIPTOR),
     ).pipe(Effect.interruptible, Effect.forkScoped);
     const ended = yield* program;
@@ -173,11 +247,14 @@ const restoreStandardStreamFlagsAfter = <Ended, Failure, Services>(
     return yield* program.pipe(Effect.tap(() => restoreStandardStreamFlags));
   }).pipe(Effect.scoped);
 
-const MINIMUM_LOG_LEVEL_OF_LOG_OPTION = {
-  info: "Info",
-  error: "Error",
-} as const satisfies Record<string, LogLevel.LogLevel>;
-
+const SHOWN_ORIGINS_OF_LOG_OPTION = {
+  debug: LINE_ORIGINS,
+  info: ["runner", "task", "status"],
+  error: ["runner"],
+} as const satisfies Record<
+  (typeof LOG_LEVEL_NAMES)[number],
+  readonly (typeof LINE_ORIGINS)[number][]
+>;
 const runMain = Runtime.makeRunMain(({ fiber, teardown }) => {
   fiber.addObserver((taskExit) => {
     teardown(taskExit, (exitCode) => {
@@ -189,14 +266,6 @@ const runMain = Runtime.makeRunMain(({ fiber, teardown }) => {
 const RUN_PROCESS_FILE_PATH = Bun.fileURLToPath(import.meta.resolve("./start-the-run.ts"));
 
 const isTaskOwnThread = Bun.main === RUN_PROCESS_FILE_PATH || isInsideTaskWorkerThread();
-
-const printFailure = (error: Parameters<typeof formatFailureLines>[0]) =>
-  Stdio.Stdio.pipe(
-    Effect.flatMap((stdio) =>
-      Stream.make(`${formatFailureLines(error, null)}\n`).pipe(Stream.run(stdio.stderr())),
-    ),
-    Effect.ignore,
-  );
 
 const runTheRootTask = (
   rootTask: {
@@ -210,16 +279,26 @@ const runTheRootTask = (
   Effect.gen(function* () {
     const signals = yield* listenToSignals([...STOP_SIGNALS, ...JOB_CONTROL_SIGNALS]);
     const supervision = yield* Effect.promise(() => import("../../supervise-the-run/index.ts"));
+    const services = yield* Effect.context<Stdio.Stdio>();
     return yield* supervision
-      .superviseRun(signals, RUN_PROCESS_FILE_PATH, {
-        rootTaskName: rootTask.name,
-        rootTaskGroup: rootTask.group,
-        checksForgottenTasks: rootTask.checksForgottenTasks,
-        flags: rootTask.flags,
-        scriptFilePath: Bun.main,
-        log,
-      })
-      .pipe(Effect.catch((error) => printFailure(error).pipe(Effect.as(1))));
+      .superviseRun(
+        signals,
+        RUN_PROCESS_FILE_PATH,
+        {
+          rootTaskName: rootTask.name,
+          rootTaskGroup: rootTask.group,
+          checksForgottenTasks: rootTask.checksForgottenTasks,
+          flags: rootTask.flags,
+          scriptFilePath: Bun.main,
+          log,
+        },
+        (unknownOwnership) =>
+          printFailureNow(unknownOwnership).pipe(Effect.provideContext(services)),
+      )
+      .pipe(
+        Effect.provideService(Logger.CurrentLoggers, new Set()),
+        Effect.catch((error) => printFailureNow(error).pipe(Effect.as(1))),
+      );
   });
 
 const superviseTheRunInThisProcess = (
@@ -272,14 +351,6 @@ const startMainRun = Runtime.makeRunMain(({ fiber, teardown }) => {
     });
   });
 });
-
-const printCause = (cause: Cause.Cause<never>) =>
-  Stdio.Stdio.pipe(
-    Effect.flatMap((stdio) =>
-      Stream.make(`${formatCauseLines(cause, null)}\n`).pipe(Stream.run(stdio.stderr())),
-    ),
-    Effect.ignore,
-  );
 
 const isMadeByTheEntryFile = (location: string | undefined) =>
   Effect.gen(function* () {
@@ -340,7 +411,7 @@ const startTheDefaultExportOnceLoaded = Effect.gen(function* () {
   });
   return yield* EntryStart.match(start, {
     NotStarted: () => Effect.succeed(null),
-    Refused: ({ refusal }) => printFailure(refusal).pipe(Effect.as(1)),
+    Refused: ({ refusal }) => printFailureNow(refusal).pipe(Effect.as(exitCodeOfRefusal(refusal))),
     HelpAsked: ({ text }) =>
       Stdio.Stdio.pipe(
         Effect.flatMap((stdio) => Stream.make(text).pipe(Stream.run(stdio.stdout()))),
@@ -360,8 +431,8 @@ const startTheDefaultExportOnceLoaded = Effect.gen(function* () {
       }),
   });
 }).pipe(
-  Effect.catch((error) => printFailure(error).pipe(Effect.as(1))),
-  Effect.catchCause((cause) => printCause(cause).pipe(Effect.as(1))),
+  Effect.catch((error) => printFailureNow(error).pipe(Effect.as(exitCodeOfRefusal(error)))),
+  Effect.catchCause((cause) => printCauseNow(cause).pipe(Effect.as(FAILURE_EXIT_CODE))),
   Effect.provide(BunServices.layer),
   restoreStandardStreamFlagsAfter,
   Effect.flatMap((ended) =>
@@ -397,12 +468,17 @@ export const startTheRun = () => {
         return yield* mainThread.runRootTaskFiber.pipe(
           Effect.provide(mainThread.MainThreadLive(runArgument, signals, supervisorProcessId)),
           mainThread.exitCodeOfTheRun,
-          Effect.provide(mainThread.StopStateLive),
+          Effect.provide([mainThread.StopStateLive, mainThread.RunDirectoryLive]),
         );
       }).pipe(Effect.scoped, (program) =>
-        printLinesDuring(program, MINIMUM_LOG_LEVEL_OF_LOG_OPTION[log]),
+        printLinesDuring(program, SHOWN_ORIGINS_OF_LOG_OPTION[log]),
       );
     }).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasDies(cause)
+          ? printCauseNow(cause).pipe(Effect.as(FAILURE_EXIT_CODE))
+          : Effect.failCause(cause),
+      ),
       Effect.provide([BunServices.layer, BunCrypto.layerSecureRandom]),
       restoreStandardStreamFlagsAfter,
       Effect.uninterruptible,

@@ -11,6 +11,7 @@ import { RpcServer } from "effect/rpc";
 import { runtimeConfigProviderLayer } from "../../../shared/read-environment-config.ts";
 import { WorkerStateLive } from "../shared/provide-worker-state.ts";
 import { serveTheMainThread } from "./answer-main-thread-messages.ts";
+import { attributeConsoleCalls } from "./attribute-console-calls.ts";
 import { ParentPortWorkerRunnerLive } from "./serve-on-the-parent-port.ts";
 
 const workerThreadLayer = WorkerStateLive.pipe(
@@ -35,6 +36,7 @@ const endStandardOutput = Effect.flatMap(Stdio.Stdio, (stdio) =>
 
 export const startWorkerThread = () => {
   if (parentPort !== null) {
+    attributeConsoleCalls();
     Effect.runFork(
       serveTheMainThread.pipe(
         Effect.provide(workerThreadLayer),

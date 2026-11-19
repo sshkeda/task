@@ -20,7 +20,7 @@ export default ${taskSource};`,
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toMatch(expectedError);
-      expect(ran.standardError).toMatch(/^failed: main \(1 of 1 task\), [\d.]+s$/mu);
+      expect(ran.standardError).toMatch(/^failed: \[main\] \(1 of 1 task\), [\d.]+s$/mu);
     }),
   );
 
@@ -28,7 +28,7 @@ export const bodyStep = makeTest(
   "a task body step that is not an effect, as when types are bypassed, fails the task instead of hanging the run",
   failsInsteadOfHanging(
     `Task.make({ name: "main", run: ${NOT_AN_EFFECT} })`,
-    /^\[main\] error TaskBodyFailed: its body failed with Fiber.runLoop: Not a valid effect: x$/mu,
+    /^error: \[main\] main\.ts:4:21: UntaggedFailure: Fiber\.runLoop: Not a valid effect: x$/mu,
   ),
 );
 
@@ -39,7 +39,7 @@ export const bodyFinalizerStep = makeTest(
   yield* Effect.addFinalizer(() => ${NOT_AN_EFFECT});
   yield* Effect.log("body done");
 }) })`,
-    /^\[main\] error TaskCleanupFailed: its cleanup failed with Fiber.runLoop: Not a valid effect: x$/mu,
+    /^error: \[main\] main\.ts:4:21: UntaggedFailure: Fiber\.runLoop: Not a valid effect: x\nerror: \[main\] its cleanup failed$/mu,
   ),
 );
 
@@ -47,7 +47,7 @@ export const execStandardInputStep = makeTest(
   "a Task.exec standard input stream step that is not an effect fails the task instead of hanging the run",
   failsInsteadOfHanging(
     `Task.make({ name: "main", run: Task.exec("cat", [], { stdin: Stream.fromEffect(${NOT_AN_EFFECT}) }) })`,
-    /^\[main\] error CommandStandardInputFailed: the standard input stream of cat failed with Fiber.runLoop: Not a valid effect: x$/mu,
+    /^error: \[main\] main\.ts:4:52: UntaggedFailure: Fiber\.runLoop: Not a valid effect: x\nerror: \[main\] the standard input stream of cat failed$/mu,
   ),
 );
 
@@ -58,6 +58,6 @@ export const childProcessStandardInputStep = makeTest(
   const child = yield* ChildProcess.make("cat", [], { stdin: Stream.fromEffect(${NOT_AN_EFFECT}) });
   return yield* child.exitCode;
 })) })`,
-    /^\[main\] error TaskBodyFailed: its body failed with Fiber.runLoop: Not a valid effect: x$/mu,
+    /^error: \[main\] main\.ts:4:21: UntaggedFailure: Fiber\.runLoop: Not a valid effect: x$/mu,
   ),
 );

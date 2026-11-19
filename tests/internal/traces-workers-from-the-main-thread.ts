@@ -41,11 +41,15 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       expect(result.exitCode).toBe(0);
       expect(yield* fileSystem.exists(workerOpenedTraceFile)).toBe(false);
       expect(result.standardError).not.toContain("the trace file is incomplete");
-      expect(result.standardError).toContain("\nwrote the trace to");
-      const traceDirectory = `${project.home}/.sshkeda-task/traces/project`;
-      const traceNames = yield* fileSystem.readDirectory(traceDirectory);
-      expect(traceNames).toHaveLength(1);
-      const trace = yield* fileSystem.readFileString(`${traceDirectory}/${traceNames[0]}`);
+      const projectRunsDirectory = `${project.home}/.sshkeda-task/runs/project`;
+      const runDirectoryNames = yield* fileSystem.readDirectory(projectRunsDirectory);
+      expect(runDirectoryNames).toHaveLength(1);
+      expect(result.standardError).toEndWith(
+        `\nrun: ${projectRunsDirectory}/${String(runDirectoryNames[0])}/`,
+      );
+      const trace = yield* fileSystem.readFileString(
+        `${projectRunsDirectory}/${String(runDirectoryNames[0])}/trace.jsonl`,
+      );
       expect(trace).toContain('"stringValue":"main-thread"');
       expect(trace).toContain('"stringValue":"second worker log"');
       expect(

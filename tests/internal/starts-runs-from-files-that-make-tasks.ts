@@ -3,8 +3,16 @@ import { expect } from "bun:test";
 import { Effect } from "effect";
 
 import { exists } from "../shared/access-files.ts";
+import { USAGE_ERROR_EXIT_CODE } from "../shared/exit-codes-of-failures.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
+import { withRunDirectoryNamed, withSecondsNamed } from "../shared/name-output-files.ts";
+import {
+  readAttribute,
+  readProjectRunsDirectory,
+  readTracedFailures,
+  readTraces,
+} from "../shared/read-trace-files.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 
 const TASKS_FILE = `import { Effect } from "effect";
@@ -21,6 +29,19 @@ export const test = Task.make({ name: "test", run: Effect.gen(function* () {
 }) });
 export const unused = Task.make({ name: "unused", run: Effect.promise(() => Bun.write("unused-ran", "")) });
 ${defaultExport}`;
+
+const readTaskState = (
+  project: Parameters<typeof readProjectRunsDirectory>[0],
+  ran: Parameters<typeof readProjectRunsDirectory>[1],
+  taskName: string,
+) =>
+  Effect.gen(function* () {
+    const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
+    return readAttribute(
+      trace?.findTaskSpan("task", taskName)?.attributes ?? [],
+      "sshkeda_task.state",
+    );
+  });
 
 const expectMarkers = (directory: string, ranMarkers: readonly string[]) =>
   Effect.gen(function* () {
@@ -41,8 +62,7 @@ export const defaultGroup = makeTest(
         ),
       });
       const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.standardError).toMatch(/^\[main\.ts\] started$/mu);
-      expect(ran.standardError).toMatch(/^\[main\.ts\] passed in [\d.]+s$/mu);
+      expect(yield* readTaskState(project, ran, "main.ts")).toBe("passed");
       expect(ran.standardError).toMatch(/^passed: 4 tasks, [\d.]+s$/mu);
       expect(ran.exitCode).toBe(0);
       yield* expectMarkers(project.directory, ["build", "lint", "test"]);
@@ -61,7 +81,7 @@ import { build } from "./tasks.ts";
 export default Task.all([build], { concurrency: Infinity });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.standardError).toMatch(/^\[build\] started$/mu);
+      expect(yield* readTaskState(project, ran, "build")).toBe("passed");
       expect(ran.standardError).toMatch(/^passed: 2 tasks, [\d.]+s$/mu);
       expect(ran.exitCode).toBe(0);
       yield* expectMarkers(project.directory, ["build"]);
@@ -81,7 +101,7 @@ export default Task.all([build], { concurrency: Number.NaN });`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.standardError).toBe(
-        "main.ts: error DefaultExportNotRunnable: its default export is a Task.all() or Task.allSettled() list whose options can't be read",
+        "error: main.ts: DefaultExportNotRunnable: its default export is a Task.all() or Task.allSettled() list whose options can't be read",
       );
       expect(ran.standardOutput).toBe("");
       expect(ran.exitCode).toBe(1);
@@ -104,7 +124,7 @@ export default Task.all(listed);`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.standardError).toBe(
-        "main.ts: error TaskListNotGiven: Task.all() was called with an object, which is not a list or record of tasks",
+        "error: main.ts: TaskListNotGiven: Task.all() was called with an object, which is not a list or record of tasks",
       );
       expect(ran.standardOutput).toBe("");
       expect(ran.exitCode).toBe(1);
@@ -128,7 +148,7 @@ export default Task.make({
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.standardError).toContain("no stage file");
-      expect(ran.standardError).not.toContain("[main] started");
+      expect(ran.standardError).not.toContain("[main] stage ");
       expect(ran.standardOutput).toBe("");
       expect(ran.exitCode).toBe(1);
     }),
@@ -147,7 +167,7 @@ export const defaultTask = makeTest(
         const ran = yield* runTaskProcess(project, "main.ts", {
           SSHKEDA_TASK_WORKERS: workerCount,
         });
-        expect(ran.standardError).toMatch(/^\[test\] started$/mu);
+        expect(yield* readTaskState(project, ran, "test")).toBe("passed");
         expect(ran.standardError).toMatch(/^passed: 2 tasks, [\d.]+s$/mu);
         expect(ran.exitCode).toBe(0);
         yield* expectMarkers(project.directory, ["build", "test"]);
@@ -157,7 +177,7 @@ export const defaultTask = makeTest(
 );
 
 export const failingDefaultGroup = makeTest(
-  "a default-exported Task.allSettled() lets every task finish and exits 1 when one fails",
+  "a default-exported Task.allSettled() lets every task finish and exits 1 when one fails, printing that failure once while the trace keeps the group's count",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -168,11 +188,15 @@ export const bad = Task.make({ name: "bad", run: Task.exec("sh", ["-c", "exit 3"
 export default Task.allSettled([ok, bad]);`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.standardError).toMatch(/^\[bad\] error CommandFailed: sh exited with code 3$/mu);
       expect(ran.standardError).toMatch(
-        /^\[main\.ts\] error SettledTasksFailed: 1 of 2 tasks failed: bad$/mu,
+        /^error: \[bad\] main\.ts:4:55: CommandFailed: sh exited with code 3$/mu,
       );
-      expect(ran.standardError).toMatch(/^failed: bad \(1 of 3 tasks\), [\d.]+s$/mu);
+      expect(ran.standardError).not.toContain("SettledTasksFailed");
+      expect(yield* readTracedFailures(project, ran)).toContainEqual({
+        taskName: "main.ts",
+        failure: "error SettledTasksFailed: 1 of 2 tasks failed: [bad]",
+      });
+      expect(ran.standardError).toMatch(/^failed: \[bad\] \(1 of 3 tasks\), [\d.]+s$/mu);
       expect(ran.exitCode).toBe(1);
       expect(yield* exists(`${project.directory}/ok-ran`)).toBe(true);
     }),
@@ -212,7 +236,7 @@ export const defaultExportNotRunnable = makeTest(
           "main.ts": entryFileExporting(defaultExport),
         });
         const ran = yield* runTaskProcess(project, "main.ts");
-        expect(ran.standardError).toBe(`main.ts: error DefaultExportNotRunnable: ${refusal}`);
+        expect(ran.standardError).toBe(`error: main.ts: DefaultExportNotRunnable: ${refusal}`);
         expect(ran.standardOutput).toBe("");
         expect(ran.exitCode).toBe(1);
         yield* expectMarkers(project.directory, []);
@@ -238,7 +262,7 @@ export const reExportNotRunnable = makeTest(
           scriptArguments,
         );
         expect(ran.standardError).toBe(
-          "main.ts: error DefaultExportNotRunnable: exports tasks, but has no default export to run",
+          "error: main.ts: DefaultExportNotRunnable: exports tasks, but has no default export to run",
         );
         expect(ran.standardOutput).toBe("");
         expect(ran.exitCode).toBe(1);
@@ -267,7 +291,7 @@ export const forgottenTasks = makeTest(
       const ran = yield* runTaskProcess(project, "tests/commands.ts");
       expect(ran.standardError).toMatch(/^failed: 0 of 3 tasks, [\d.]+s$/mu);
       expect(ran.standardError).toMatch(
-        /^tests\/commands\.ts: error TasksNeverRan: makes "kills on timeout", "retries" but nothing ran them$/mu,
+        /^error: tests\/commands\.ts: TasksNeverRan: makes \[kills on timeout\], \[retries\] but nothing ran them$/mu,
       );
       expect(ran.exitCode).toBe(1);
       expect(yield* exists(`${project.directory}/prints-ran`)).toBe(true);
@@ -282,8 +306,60 @@ export const forgottenTasks = makeTest(
   ),
 );
 
+const emptyListFileFrom = (taskList: string) => `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export const lint = Task.make({ name: "lint", run: Effect.promise(() => Bun.write("lint-ran", "")) });
+export const test = Task.make({ name: "test", run: Effect.promise(() => Bun.write("test-ran", "")) });
+const enabled = process.env.LINT === "1";
+export default ${taskList};
+`;
+
+const EMPTY_LIST_FILES = {
+  "all.ts": emptyListFileFrom("Task.all([])"),
+  "all-settled.ts": emptyListFileFrom("Task.allSettled([])"),
+  "all-disabled.ts": emptyListFileFrom("Task.all(enabled ? [lint] : [])"),
+  "all-settled-disabled.ts": emptyListFileFrom("Task.allSettled(enabled ? [lint] : [])"),
+  "empty.ts": `import { Task } from "@sshkeda/task";
+export default Task.all([]);
+`,
+};
+
+export const emptyLists = makeTest(
+  "a run whose default export is Task.all() or Task.allSettled() of an empty list passes with exit 0 even when its file makes tasks, and a task it makes still runs by name",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject(EMPTY_LIST_FILES);
+      yield* Effect.forEach(
+        Object.keys(EMPTY_LIST_FILES),
+        (filePath) =>
+          Effect.gen(function* () {
+            const ran = yield* runTaskProcess(project, filePath);
+            expect([filePath, ran.exitCode], ran.standardError).toEqual([filePath, 0]);
+            expect(ran.standardError).toMatch(/^passed: 1 task, [\d.]+s$/mu);
+            expect(ran.standardError).not.toContain("NoTaskStarted");
+          }),
+        { discard: true },
+      );
+      expect(yield* exists(`${project.directory}/lint-ran`)).toBe(false);
+      expect(yield* exists(`${project.directory}/test-ran`)).toBe(false);
+      const picked = yield* runTaskProcess(project, "all-disabled.ts", {}, project.directory, [
+        "lint",
+      ]);
+      expect(picked.exitCode, picked.standardError).toBe(0);
+      expect(picked.standardError).toMatch(/^passed: 1 task, [\d.]+s$/mu);
+      expect(yield* exists(`${project.directory}/lint-ran`)).toBe(true);
+      const enabled = yield* runTaskProcess(project, "all-settled-disabled.ts", { LINT: "1" });
+      expect(enabled.exitCode, enabled.standardError).toBe(0);
+      expect(enabled.standardError).toMatch(/^passed: 2 tasks, [\d.]+s$/mu);
+      const helped = yield* runTaskProcess(project, "all.ts", {}, project.directory, ["--help"]);
+      expect(helped.exitCode, helped.standardError).toBe(0);
+      expect(helped.standardError).toBe("");
+    }),
+  ),
+);
+
 export const logLevelSetting = makeTest(
-  "SSHKEDA_TASK_LOG=error makes a passing run started from a default export print nothing, and any other value but info fails before a task starts",
+  "SSHKEDA_TASK_LOG=error makes a passing run started from a default export print only its summary and run line, and any value but debug, info or error, verbose and trace included, fails with exit 2 before a task starts",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -299,12 +375,14 @@ export default Task.make({
 `,
       });
       const quiet = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_LOG: "error" });
-      expect(quiet.standardError).toBe("");
+      expect(withSecondsNamed(withRunDirectoryNamed(quiet.standardError, project))).toBe(
+        "run: <run folder>/\npassed: 1 task, <seconds>\nrun: <run folder>/",
+      );
       expect(quiet.exitCode).toBe(0);
       expect(yield* exists(`${project.directory}/main-ran`)).toBe(true);
       const told = yield* runTaskProcess(project, "main.ts", { SSHKEDA_TASK_LOG: "info" });
       expect(told.standardError).toContain("[main] main ran\n");
-      for (const invalid of ["verbose", ""]) {
+      for (const invalid of ["verbose", "trace", ""]) {
         const refusedProject = yield* makeProject({
           "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
@@ -315,9 +393,9 @@ export default Task.make({ name: "main", run: Effect.promise(() => Bun.write("ma
           SSHKEDA_TASK_LOG: invalid,
         });
         expect(refused.standardError).toBe(
-          `error LogLevelInvalid: SSHKEDA_TASK_LOG is "${invalid}", not info or error`,
+          `error: LogLevelInvalid: SSHKEDA_TASK_LOG is "${invalid}", not debug or info or error`,
         );
-        expect(refused.exitCode).toBe(1);
+        expect(refused.exitCode).toBe(USAGE_ERROR_EXIT_CODE);
         expect(yield* exists(`${refusedProject.directory}/main-ran`)).toBe(false);
       }
     }),
@@ -337,7 +415,7 @@ export default late;
 await Bun.write("after-made", "");`,
       });
       const ran = yield* runTaskProcess(project, "main.ts");
-      expect(ran.standardError).toMatch(/^\[late\] started$/mu);
+      expect(yield* readTaskState(project, ran, "late")).toBe("passed");
       expect(ran.standardError).toMatch(/^passed: 1 task, [\d.]+s$/mu);
       expect(ran.exitCode).toBe(0);
       expect(yield* exists(`${project.directory}/late-ran`)).toBe(true);

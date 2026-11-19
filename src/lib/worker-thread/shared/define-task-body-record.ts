@@ -8,4 +8,5 @@ export const makeTaskBodyRecord = () => ({
   startedAtMilliseconds: 0,
   returnedBeforeCleanup: false,
   causeReportedBeforeCleanup: Option.none<Cause.Cause<unknown>>(),
+  hasEnded: false,
 });

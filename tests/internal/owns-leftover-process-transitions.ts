@@ -13,8 +13,15 @@ import {
   ProcessGroupEvent,
   ProcessGroupStage,
 } from "../../src/lib/kill-leftover-processes/internal/define-process-group-stage.ts";
+import { processIdentityKey } from "../../src/shared/claim-processes-to-report.ts";
+import type { ProcessIdentity } from "../../src/shared/claim-processes-to-report.ts";
 
-const LATEST_MEMBER_START_TIME = "1700000000.1";
+const MEMBERS_AT_LEADER_EXIT = [{ processId: 4243, startTime: "1700000000.1" }] as const;
+
+const describeMembers = (members: readonly (typeof ProcessIdentity.Type)[]) =>
+  members.length === 0
+    ? "with no members"
+    : `with ${members.map((member) => processIdentityKey(member)).join(" ")}`;
 
 const WITNESS = { processId: 4242, processGroupId: 4240, startTime: "1700000000.0" } as const;
 
@@ -22,7 +29,7 @@ const SIGNAL_RESULTS = ["EPERM", "ESRCH", "sent"] as const;
 
 const describeGroupStage = ProcessGroupStage.match({
   Started: () => "Started",
-  LeaderExited: ({ latestMemberStartTime }) => `LeaderExited at ${latestMemberStartTime}`,
+  LeaderExited: ({ membersAtLeaderExit }) => `LeaderExited ${describeMembers(membersAtLeaderExit)}`,
   ProbedAlive: () => "ProbedAlive",
   WitnessFound: ({ witness }) => `WitnessFound ${witness.processId}`,
   StillTheSame: () => "StillTheSame",
@@ -35,8 +42,7 @@ const describeGroupStage = ProcessGroupStage.match({
 const describeGroupEvent = ProcessGroupEvent.match({
   CheckMembers: ({ hasOnlyEndedMembers }) =>
     `CheckMembers ${hasOnlyEndedMembers ? "only ended" : "some live"}`,
-  ExitLeader: ({ latestMemberStartTime }) =>
-    `ExitLeader ${latestMemberStartTime === null ? "with no members" : `at ${latestMemberStartTime}`}`,
+  ExitLeader: ({ membersAtLeaderExit }) => `ExitLeader ${describeMembers(membersAtLeaderExit)}`,
   FindWitness: ({ witness }) =>
     `FindWitness ${witness === null ? "none" : String(witness.processId)}`,
   KillGroup: ({ result }) => `KillGroup ${result}`,
@@ -46,7 +52,7 @@ const describeGroupEvent = ProcessGroupEvent.match({
 
 const groupStages = [
   ProcessGroupStage.cases.Started.make({}),
-  ProcessGroupStage.cases.LeaderExited.make({ latestMemberStartTime: LATEST_MEMBER_START_TIME }),
+  ProcessGroupStage.cases.LeaderExited.make({ membersAtLeaderExit: MEMBERS_AT_LEADER_EXIT }),
   ProcessGroupStage.cases.ProbedAlive.make({}),
   ProcessGroupStage.cases.WitnessFound.make({ witness: WITNESS }),
   ProcessGroupStage.cases.StillTheSame.make({}),
@@ -57,8 +63,8 @@ const groupStages = [
 ];
 
 const groupEvents = [
-  ProcessGroupEvent.cases.ExitLeader.make({ latestMemberStartTime: null }),
-  ProcessGroupEvent.cases.ExitLeader.make({ latestMemberStartTime: LATEST_MEMBER_START_TIME }),
+  ProcessGroupEvent.cases.ExitLeader.make({ membersAtLeaderExit: [] }),
+  ProcessGroupEvent.cases.ExitLeader.make({ membersAtLeaderExit: MEMBERS_AT_LEADER_EXIT }),
   ...SIGNAL_RESULTS.map((result) => ProcessGroupEvent.cases.Probe.make({ result })),
   ProcessGroupEvent.cases.FindWitness.make({ witness: null }),
   ProcessGroupEvent.cases.FindWitness.make({ witness: WITNESS }),
@@ -122,7 +128,7 @@ const leftoverEvents = [
 
 const EXPECTED_GROUP_MOVES = `
 Started | ExitLeader with no members -> Ended | forget
-Started | ExitLeader at 1700000000.1 -> LeaderExited at 1700000000.1 | record
+Started | ExitLeader with 4243@1700000000.1 -> LeaderExited with 4243@1700000000.1 | record
 Started | Probe EPERM -> ProbedAlive | findWitness
 Started | Probe ESRCH -> Ended | forget
 Started | Probe sent -> ProbedAlive | findWitness
@@ -135,22 +141,22 @@ Started | KillGroup ESRCH -> Started | none
 Started | KillGroup sent -> Started | none
 Started | CheckMembers only ended -> Started | none
 Started | CheckMembers some live -> Started | none
-LeaderExited at 1700000000.1 | ExitLeader with no members -> Ended | forget
-LeaderExited at 1700000000.1 | ExitLeader at 1700000000.1 -> LeaderExited at 1700000000.1 | record
-LeaderExited at 1700000000.1 | Probe EPERM -> ProbedAlive | findWitness
-LeaderExited at 1700000000.1 | Probe ESRCH -> Ended | forget
-LeaderExited at 1700000000.1 | Probe sent -> ProbedAlive | findWitness
-LeaderExited at 1700000000.1 | FindWitness none -> LeaderExited at 1700000000.1 | none
-LeaderExited at 1700000000.1 | FindWitness 4242 -> LeaderExited at 1700000000.1 | none
-LeaderExited at 1700000000.1 | Recheck same -> LeaderExited at 1700000000.1 | none
-LeaderExited at 1700000000.1 | Recheck changed -> LeaderExited at 1700000000.1 | none
-LeaderExited at 1700000000.1 | KillGroup EPERM -> LeaderExited at 1700000000.1 | none
-LeaderExited at 1700000000.1 | KillGroup ESRCH -> LeaderExited at 1700000000.1 | none
-LeaderExited at 1700000000.1 | KillGroup sent -> LeaderExited at 1700000000.1 | none
-LeaderExited at 1700000000.1 | CheckMembers only ended -> LeaderExited at 1700000000.1 | none
-LeaderExited at 1700000000.1 | CheckMembers some live -> LeaderExited at 1700000000.1 | none
+LeaderExited with 4243@1700000000.1 | ExitLeader with no members -> Ended | forget
+LeaderExited with 4243@1700000000.1 | ExitLeader with 4243@1700000000.1 -> LeaderExited with 4243@1700000000.1 | record
+LeaderExited with 4243@1700000000.1 | Probe EPERM -> ProbedAlive | findWitness
+LeaderExited with 4243@1700000000.1 | Probe ESRCH -> Ended | forget
+LeaderExited with 4243@1700000000.1 | Probe sent -> ProbedAlive | findWitness
+LeaderExited with 4243@1700000000.1 | FindWitness none -> LeaderExited with 4243@1700000000.1 | none
+LeaderExited with 4243@1700000000.1 | FindWitness 4242 -> LeaderExited with 4243@1700000000.1 | none
+LeaderExited with 4243@1700000000.1 | Recheck same -> LeaderExited with 4243@1700000000.1 | none
+LeaderExited with 4243@1700000000.1 | Recheck changed -> LeaderExited with 4243@1700000000.1 | none
+LeaderExited with 4243@1700000000.1 | KillGroup EPERM -> LeaderExited with 4243@1700000000.1 | none
+LeaderExited with 4243@1700000000.1 | KillGroup ESRCH -> LeaderExited with 4243@1700000000.1 | none
+LeaderExited with 4243@1700000000.1 | KillGroup sent -> LeaderExited with 4243@1700000000.1 | none
+LeaderExited with 4243@1700000000.1 | CheckMembers only ended -> LeaderExited with 4243@1700000000.1 | none
+LeaderExited with 4243@1700000000.1 | CheckMembers some live -> LeaderExited with 4243@1700000000.1 | none
 ProbedAlive | ExitLeader with no members -> ProbedAlive | none
-ProbedAlive | ExitLeader at 1700000000.1 -> ProbedAlive | none
+ProbedAlive | ExitLeader with 4243@1700000000.1 -> ProbedAlive | none
 ProbedAlive | Probe EPERM -> ProbedAlive | none
 ProbedAlive | Probe ESRCH -> ProbedAlive | none
 ProbedAlive | Probe sent -> ProbedAlive | none
@@ -164,7 +170,7 @@ ProbedAlive | KillGroup sent -> ProbedAlive | none
 ProbedAlive | CheckMembers only ended -> ProbedAlive | none
 ProbedAlive | CheckMembers some live -> ProbedAlive | none
 WitnessFound 4242 | ExitLeader with no members -> WitnessFound 4242 | none
-WitnessFound 4242 | ExitLeader at 1700000000.1 -> WitnessFound 4242 | none
+WitnessFound 4242 | ExitLeader with 4243@1700000000.1 -> WitnessFound 4242 | none
 WitnessFound 4242 | Probe EPERM -> WitnessFound 4242 | none
 WitnessFound 4242 | Probe ESRCH -> WitnessFound 4242 | none
 WitnessFound 4242 | Probe sent -> WitnessFound 4242 | none
@@ -178,7 +184,7 @@ WitnessFound 4242 | KillGroup sent -> WitnessFound 4242 | none
 WitnessFound 4242 | CheckMembers only ended -> WitnessFound 4242 | none
 WitnessFound 4242 | CheckMembers some live -> WitnessFound 4242 | none
 StillTheSame | ExitLeader with no members -> StillTheSame | none
-StillTheSame | ExitLeader at 1700000000.1 -> StillTheSame | none
+StillTheSame | ExitLeader with 4243@1700000000.1 -> StillTheSame | none
 StillTheSame | Probe EPERM -> StillTheSame | none
 StillTheSame | Probe ESRCH -> StillTheSame | none
 StillTheSame | Probe sent -> StillTheSame | none
@@ -192,7 +198,7 @@ StillTheSame | KillGroup sent -> Ended | forget
 StillTheSame | CheckMembers only ended -> StillTheSame | none
 StillTheSame | CheckMembers some live -> StillTheSame | none
 KillDenied | ExitLeader with no members -> KillDenied | none
-KillDenied | ExitLeader at 1700000000.1 -> KillDenied | none
+KillDenied | ExitLeader with 4243@1700000000.1 -> KillDenied | none
 KillDenied | Probe EPERM -> KillDenied | none
 KillDenied | Probe ESRCH -> KillDenied | none
 KillDenied | Probe sent -> KillDenied | none
@@ -206,7 +212,7 @@ KillDenied | KillGroup sent -> KillDenied | none
 KillDenied | CheckMembers only ended -> Ended | forget
 KillDenied | CheckMembers some live -> NotSignalable | keep
 NotSignalable | ExitLeader with no members -> NotSignalable | none
-NotSignalable | ExitLeader at 1700000000.1 -> NotSignalable | none
+NotSignalable | ExitLeader with 4243@1700000000.1 -> NotSignalable | none
 NotSignalable | Probe EPERM -> NotSignalable | none
 NotSignalable | Probe ESRCH -> NotSignalable | none
 NotSignalable | Probe sent -> NotSignalable | none
@@ -220,7 +226,7 @@ NotSignalable | KillGroup sent -> NotSignalable | none
 NotSignalable | CheckMembers only ended -> NotSignalable | none
 NotSignalable | CheckMembers some live -> NotSignalable | none
 ChangedBeforeKill | ExitLeader with no members -> ChangedBeforeKill | none
-ChangedBeforeKill | ExitLeader at 1700000000.1 -> ChangedBeforeKill | none
+ChangedBeforeKill | ExitLeader with 4243@1700000000.1 -> ChangedBeforeKill | none
 ChangedBeforeKill | Probe EPERM -> ChangedBeforeKill | none
 ChangedBeforeKill | Probe ESRCH -> ChangedBeforeKill | none
 ChangedBeforeKill | Probe sent -> ChangedBeforeKill | none
@@ -234,7 +240,7 @@ ChangedBeforeKill | KillGroup sent -> ChangedBeforeKill | none
 ChangedBeforeKill | CheckMembers only ended -> ChangedBeforeKill | none
 ChangedBeforeKill | CheckMembers some live -> ChangedBeforeKill | none
 Ended | ExitLeader with no members -> Ended | none
-Ended | ExitLeader at 1700000000.1 -> Ended | none
+Ended | ExitLeader with 4243@1700000000.1 -> Ended | none
 Ended | Probe EPERM -> Ended | none
 Ended | Probe ESRCH -> Ended | none
 Ended | Probe sent -> Ended | none

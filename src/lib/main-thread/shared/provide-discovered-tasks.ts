@@ -2,8 +2,8 @@ import { Context, Effect, Layer, Schema } from "effect";
 
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
 import {
+  findRootFileTaskNames,
   findTasksMadeByRootTaskFile,
-  findUnexportedRootFileTaskNames,
 } from "./find-tasks-made-by-root-task-file.ts";
 import { BrokenTasksFound } from "./main-thread-errors.ts";
 import { StopState } from "./provide-stop-state.ts";
@@ -17,11 +17,16 @@ const discoverTasks = Effect.gen(function* () {
     Effect.raceFirst(shutdown.awaitFailure.pipe(Effect.as(null))),
   );
   if (isBrokenTasksFound(discovery)) {
-    return { tasksByName: null, unexportedRootFileTaskNames: [], brokenTasks: discovery };
+    return {
+      tasksByName: null,
+      rootFileTaskNames: { made: [], unexported: [] },
+      brokenTasks: discovery,
+    };
   }
   return {
     tasksByName: discovery,
-    unexportedRootFileTaskNames: discovery === null ? [] : yield* findUnexportedRootFileTaskNames(),
+    rootFileTaskNames:
+      discovery === null ? { made: [], unexported: [] } : yield* findRootFileTaskNames(),
     brokenTasks: null,
   };
 });

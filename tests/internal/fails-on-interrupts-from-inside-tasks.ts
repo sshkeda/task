@@ -1,18 +1,25 @@
 import { expect } from "bun:test";
 
-import { Effect, FileSystem } from "effect";
+import { Effect } from "effect";
 
 import { EXIT_CODE_AFTER_SIGINT } from "../shared/exit-codes-after-stop-signals.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTemporaryDirectory } from "../shared/make-temporary-directories.ts";
 import { makeTest } from "../shared/make-tests.ts";
+import { readProjectRunsDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
+
+const STOPPED_LINE = "stopped: the run ended before it finished";
+
+const RUN_ENDED_EVENT = "run ended before it finished";
 
 const printedErrorLinesOf = (standardError: string, taskName: string) =>
   standardError
     .split("\n")
     .filter(
-      (line) => line.startsWith(`[${taskName}] `) && /^\[[^\]]+\] (?:\S+: )?error /u.test(line),
+      (line) =>
+        line.startsWith(`error: [${taskName}] `) &&
+        /^error: \[[^\]]+\] \S+: [A-Z]\w*: /u.test(line),
     );
 
 const makeMainTaskProject = (mainTaskSource: string) =>
@@ -24,13 +31,30 @@ ${mainTaskSource}`,
 
 const runMainTaskSource = (mainTaskSource: string) =>
   Effect.flatMap(makeMainTaskProject(mainTaskSource), (project) =>
-    runTaskProcess(project, "main.ts"),
+    Effect.map(runTaskProcess(project, "main.ts"), (ran) => ({ ...ran, project })),
   );
 
 const startMainTaskSource = (mainTaskSource: string) =>
   Effect.flatMap(makeMainTaskProject(mainTaskSource), (project) =>
-    startTaskProcess(project, "main.ts"),
+    Effect.map(startTaskProcess(project, "main.ts"), (command) => ({
+      waitForLine: command.waitForLine,
+      sendSignal: command.sendSignal,
+      waitForExit: Effect.map(command.waitForExit, (exited) => ({ ...exited, project })),
+    })),
   );
+
+const findTaskNamesWhoseRunEnded = (
+  ran: Parameters<typeof readProjectRunsDirectory>[1] & {
+    readonly project: Parameters<typeof readProjectRunsDirectory>[0];
+  },
+  taskNames: readonly string[],
+) =>
+  Effect.gen(function* () {
+    const [trace] = yield* readTraces(yield* readProjectRunsDirectory(ran.project, ran));
+    return taskNames.filter((taskName) =>
+      (trace?.findTaskEventNames("task", taskName) ?? []).includes(RUN_ENDED_EVENT),
+    );
+  });
 
 const INTERRUPTED_FROM_INSIDE = {
   interrupt: "Effect.interrupt",
@@ -40,8 +64,8 @@ const INTERRUPTED_FROM_INSIDE = {
 
 const IMPORT_FIBER = 'import { Fiber } from "effect";';
 
-const interruptedWithoutAFailure = (taskName: string) =>
-  `[${taskName}] error CauseWithoutFailure: was interrupted without a failure`;
+const interruptedWithoutAFailure = (taskName: string, location: string) =>
+  `error: [${taskName}] ${location}: CauseWithoutFailure: was interrupted without a failure`;
 
 const requestedByBody = (options: string) =>
   `Task.make({ name: "main", run: Effect.gen(function* () { yield* dependency; })${options} })`;
@@ -55,11 +79,9 @@ export default ${requesterTask};`,
     );
     expect(ran.exitCode).toBe(1);
     expect(printedErrorLinesOf(ran.standardError, "dependency")).toEqual([
-      interruptedWithoutAFailure("dependency"),
+      interruptedWithoutAFailure("dependency", "main.ts:4:32"),
     ]);
-    expect(printedErrorLinesOf(ran.standardError, "main")).toEqual([
-      "[main] error AwaitedTaskFailed: dependency failed",
-    ]);
+    expect(printedErrorLinesOf(ran.standardError, "main")).toEqual([]);
   });
 
 const expectRootTaskFails = (rootTask: string) =>
@@ -68,9 +90,9 @@ const expectRootTaskFails = (rootTask: string) =>
 export default ${rootTask};`);
     expect(ran.exitCode).toBe(1);
     expect(printedErrorLinesOf(ran.standardError, "main")).toEqual([
-      interruptedWithoutAFailure("main"),
+      interruptedWithoutAFailure("main", "main.ts:4:21"),
     ]);
-    expect(ran.standardError).toMatch(/^failed: main \(1 of 1 task\), /mu);
+    expect(ran.standardError).toMatch(/^failed: \[main\] \(1 of 1 task\), /mu);
   });
 
 const bodyTask = (body: string) => `Task.make({ name: "dependency", run: ${body} })`;
@@ -123,8 +145,8 @@ export const bodyInterruptWithEndlessCleanup = makeTest(
       );
       expect(ran.exitCode).toBe(1);
       expect(printedErrorLinesOf(ran.standardError, "main")).toEqual([
-        interruptedWithoutAFailure("main"),
-        "[main] error TaskCleanupTimedOut: its cleanup did not finish within 100ms, so the run stopped waiting for it",
+        interruptedWithoutAFailure("main", "main.ts:3:21"),
+        "error: [main] main.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 100ms, so the run stopped waiting for it",
       ]);
     }),
   ),
@@ -138,11 +160,10 @@ export const bodyInterruptWithFailingCleanup = makeTest(
         'export default Task.make({ name: "main", run: Effect.gen(function* () { yield* Effect.addFinalizer(() => Effect.die(new Error("cleanup broke"))); yield* Effect.interrupt; }) });',
       );
       expect(ran.exitCode).toBe(1);
-      const mainErrorLines = printedErrorLinesOf(ran.standardError, "main");
-      expect(mainErrorLines[0]).toBe(interruptedWithoutAFailure("main"));
-      expect(mainErrorLines.slice(1).join("\n")).toMatch(
-        /error TaskCleanupFailed: .*cleanup broke/u,
-      );
+      expect(printedErrorLinesOf(ran.standardError, "main")).toEqual([
+        interruptedWithoutAFailure("main", "main.ts:3:21"),
+        "error: [main] main.ts:3:121: Error: cleanup broke",
+      ]);
     }),
   ),
 );
@@ -167,18 +188,18 @@ export const bodyStoppedByTimeout = makeTest(
     Effect.gen(function* () {
       const lines = yield* expectOnlyTimedOutPrinted(
         'Task.make({ name: "timed", run: Effect.log("waiting").pipe(Effect.andThen(Effect.never)), timeout: "3 seconds", cleanup: "5 seconds" })',
-        "[timed] error TaskTimedOut: timed out after 3s",
+        "error: [timed] main.ts:3:27: TaskTimedOut: timed out after 3s",
       );
       expect(lines.indexOf("[timed] waiting")).toBeGreaterThan(-1);
       expect(lines.indexOf("[timed] waiting")).toBeLessThan(
-        lines.indexOf("[timed] error TaskTimedOut: timed out after 3s"),
+        lines.indexOf("error: [timed] main.ts:3:27: TaskTimedOut: timed out after 3s"),
       );
     }),
   ),
 );
 
 export const bodiesStoppedByCtrlC = makeTest(
-  "two bodies stopped by Ctrl-C print no error and say they stopped",
+  "two bodies stopped by Ctrl-C print no error or end line, and the trace records that the run ended before each finished",
   Effect.scoped(
     Effect.gen(function* () {
       const command = yield* startMainTaskSource(
@@ -193,12 +214,11 @@ export default Task.make({ name: "main", run: Effect.all([waitingQuiet, waitingB
       expect(exited.standardError).not.toContain("CauseWithoutFailure");
       expect(printedErrorLinesOf(exited.standardError, "waiting-quiet")).toEqual([]);
       expect(printedErrorLinesOf(exited.standardError, "waiting-body")).toEqual([]);
-      expect(exited.standardError).toContain(
-        "[waiting-quiet] stopped: the run ended before it finished",
-      );
-      expect(exited.standardError).toContain(
-        "[waiting-body] stopped: the run ended before it finished",
-      );
+      expect(exited.standardError).not.toContain(STOPPED_LINE);
+      expect(yield* findTaskNamesWhoseRunEnded(exited, ["waiting-quiet", "waiting-body"])).toEqual([
+        "waiting-quiet",
+        "waiting-body",
+      ]);
     }),
   ),
 );
@@ -221,14 +241,20 @@ export const a = Task.make({ name: "a", run: Effect.gen(function* () { return yi
 
 const expectTasksStoppedWithoutFailure = (
   tasks: (typeof TASKS_AWAITING_A_WAITING_TASK)[keyof typeof TASKS_AWAITING_A_WAITING_TASK],
-  standardError: string,
-) => {
-  expect(standardError).not.toContain("CauseWithoutFailure");
-  for (const taskName of tasks.stoppedTaskNames) {
-    expect(printedErrorLinesOf(standardError, taskName)).toEqual([]);
-    expect(standardError).toContain(`[${taskName}] stopped: the run ended before it finished`);
-  }
-};
+  ran: Parameters<typeof findTaskNamesWhoseRunEnded>[0],
+) =>
+  Effect.gen(function* () {
+    expect(ran.standardError).not.toContain("CauseWithoutFailure");
+    expect(ran.standardError).not.toContain(STOPPED_LINE);
+    expect(
+      tasks.stoppedTaskNames.flatMap((taskName) =>
+        printedErrorLinesOf(ran.standardError, taskName),
+      ),
+    ).toEqual([]);
+    expect(yield* findTaskNamesWhoseRunEnded(ran, tasks.stoppedTaskNames)).toEqual([
+      ...tasks.stoppedTaskNames,
+    ]);
+  });
 
 const expectTasksStoppedByCtrlC = (tasks: Parameters<typeof expectTasksStoppedWithoutFailure>[0]) =>
   Effect.gen(function* () {
@@ -238,7 +264,7 @@ export default Task.make({ name: "main", run: Effect.asVoid(a) });`);
     yield* command.sendSignal("INT");
     const exited = yield* command.waitForExit;
     expect(exited.exitCode).toBe(EXIT_CODE_AFTER_SIGINT);
-    expectTasksStoppedWithoutFailure(tasks, exited.standardError);
+    yield* expectTasksStoppedWithoutFailure(tasks, exited);
   });
 
 const expectTasksStoppedBySiblingFailure = (
@@ -251,10 +277,8 @@ export default Task.make({ name: "main", run: Effect.all([a, bad], { concurrency
     expect(ran.exitCode).toBe(1);
     const badLines = printedErrorLinesOf(ran.standardError, "bad");
     expect(badLines).toHaveLength(1);
-    expect(badLines[0]).toMatch(
-      /^\[bad\] main\.ts:\d+:\d+: error TaskBodyFailed: its body failed with bad broke$/u,
-    );
-    expectTasksStoppedWithoutFailure(tasks, ran.standardError);
+    expect(badLines[0]).toMatch(/^error: \[bad\] main\.ts:\d+:\d+: Error: bad broke$/u);
+    yield* expectTasksStoppedWithoutFailure(tasks, ran);
   });
 
 const expectTasksStoppedBySiblingTimeout = (
@@ -265,59 +289,59 @@ const expectTasksStoppedBySiblingTimeout = (
 export const timed = Task.make({ name: "timed", run: Effect.never, timeout: "3 seconds", cleanup: "5 seconds" });
 export default Task.make({ name: "main", run: Effect.all([a, timed], { concurrency: "unbounded", discard: true }) });`);
     expect(ran.exitCode).toBe(1);
-    expect(printedErrorLinesOf(ran.standardError, "timed")).toEqual([
-      "[timed] error TaskTimedOut: timed out after 3s",
-    ]);
-    expectTasksStoppedWithoutFailure(tasks, ran.standardError);
+    const timedLines = printedErrorLinesOf(ran.standardError, "timed");
+    expect(timedLines).toHaveLength(1);
+    expect(timedLines[0]).toMatch(
+      /^error: \[timed\] main\.ts:\d+:\d+: TaskTimedOut: timed out after 3s$/u,
+    );
+    yield* expectTasksStoppedWithoutFailure(tasks, ran);
   });
 
 export const bodyAwaitingATaskStoppedByCtrlC = makeTest(
-  "a body awaiting a task that Ctrl-C stops prints no error and says it stopped",
+  "a body awaiting a task that Ctrl-C stops prints no error, and the trace records that the run ended before it finished",
   Effect.scoped(expectTasksStoppedByCtrlC(TASKS_AWAITING_A_WAITING_TASK.direct)),
 );
 
 export const bodyAwaitingATaskStoppedBySiblingFailure = makeTest(
-  "a body awaiting a task that a failing sibling stops prints no error and says it stopped",
+  "a body awaiting a task that a failing sibling stops prints no error, and the trace records that the run ended before it finished",
   Effect.scoped(expectTasksStoppedBySiblingFailure(TASKS_AWAITING_A_WAITING_TASK.direct)),
 );
 
 export const bodyAwaitingATaskStoppedBySiblingTimeout = makeTest(
-  "a body awaiting a task that a sibling's timeout stops prints no error and says it stopped",
+  "a body awaiting a task that a sibling's timeout stops prints no error, and the trace records that the run ended before it finished",
   Effect.scoped(expectTasksStoppedBySiblingTimeout(TASKS_AWAITING_A_WAITING_TASK.direct)),
 );
 
 export const chainedBodiesAwaitingATaskStoppedByCtrlC = makeTest(
-  "a chain of bodies awaiting a task that Ctrl-C stops prints no error and every task in it says it stopped",
+  "a chain of bodies awaiting a task that Ctrl-C stops prints no error, and the trace records that the run ended before each finished",
   Effect.scoped(expectTasksStoppedByCtrlC(TASKS_AWAITING_A_WAITING_TASK.chain)),
 );
 
 export const chainedBodiesAwaitingATaskStoppedBySiblingFailure = makeTest(
-  "a chain of bodies awaiting a task that a failing sibling stops prints no error and every task in it says it stopped",
+  "a chain of bodies awaiting a task that a failing sibling stops prints no error, and the trace records that the run ended before each finished",
   Effect.scoped(expectTasksStoppedBySiblingFailure(TASKS_AWAITING_A_WAITING_TASK.chain)),
 );
 
 export const chainedBodiesAwaitingATaskStoppedBySiblingTimeout = makeTest(
-  "a chain of bodies awaiting a task that a sibling's timeout stops prints no error and every task in it says it stopped",
+  "a chain of bodies awaiting a task that a sibling's timeout stops prints no error, and the trace records that the run ended before each finished",
   Effect.scoped(expectTasksStoppedBySiblingTimeout(TASKS_AWAITING_A_WAITING_TASK.chain)),
 );
 
 export const ctrlCAsABodyInterruptsItself = makeTest(
-  "a body that interrupts itself while uninterruptible, after Ctrl-C began the stop, prints stopped: and never CauseWithoutFailure",
+  "a body that interrupts itself while uninterruptible, once the Ctrl-C stop reached it, never prints CauseWithoutFailure, and the trace records that the run ended before it finished",
   Effect.scoped(
     Effect.gen(function* () {
-      const directory = yield* makeTemporaryDirectory();
-      const stoppingFile = `${directory}/stopping`;
       const command = yield* startMainTaskSource(
-        `export default Task.make({ name: "main", run: Effect.log("waiting").pipe(Effect.andThen(Effect.uninterruptible(Effect.promise(async () => { while (!(await Bun.file("${stoppingFile}").exists())) await Bun.sleep(5); }).pipe(Effect.andThen(Effect.interrupt))))) });`,
+        `import { Exit } from "effect";
+export default Task.make({ name: "main", run: Effect.log("waiting").pipe(Effect.andThen(Effect.uninterruptible(Effect.exit(Effect.interruptible(Effect.sleep("5 millis"))).pipe(Effect.repeat({ until: Exit.hasInterrupts }), Effect.andThen(Effect.interrupt))))) });`,
       );
       yield* command.waitForLine("[main] waiting");
       yield* command.sendSignal("INT");
-      yield* command.waitForLine("[main] still stopping after 2s");
-      yield* (yield* FileSystem.FileSystem).writeFileString(stoppingFile, "");
       const exited = yield* command.waitForExit;
       expect(exited.exitCode, exited.standardError).toBe(EXIT_CODE_AFTER_SIGINT);
-      expect(exited.standardError).not.toContain(interruptedWithoutAFailure("main"));
-      expect(exited.standardError).toContain("[main] stopped: the run ended before it finished");
+      expect(exited.standardError).not.toContain("CauseWithoutFailure");
+      expect(exited.standardError).not.toContain(STOPPED_LINE);
+      expect(yield* findTaskNamesWhoseRunEnded(exited, ["main"])).toEqual(["main"]);
     }),
   ),
 );
@@ -335,9 +359,9 @@ export const cleaning = Task.make({ name: "cleaning", run: Effect.gen(function* 
 export default Task.make({ name: "main", run: Effect.all([interrupting, cleaning], { concurrency: "unbounded", discard: true }) });`,
       );
       expect(ran.exitCode, ran.standardError).toBe(1);
-      expect(ran.standardError).toContain("[main] passed in");
+      expect(ran.standardError).toMatch(/^failed: \[interrupting\] \(1 of 3 tasks\), [\d.]+s$/mu);
       expect(printedErrorLinesOf(ran.standardError, "interrupting"), ran.standardError).toEqual([
-        interruptedWithoutAFailure("interrupting"),
+        interruptedWithoutAFailure("interrupting", "main.ts:4:34"),
       ]);
       expect(printedErrorLinesOf(ran.standardError, "cleaning")).toEqual([]);
     }),

@@ -6,7 +6,7 @@ import { EXIT_CODE_AFTER_SIGINT } from "../shared/exit-codes-after-stop-signals.
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
-import { readAttribute, readTraceDirectory, readTraces } from "../shared/read-trace-files.ts";
+import { readAttribute, readProjectRunsDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess, startTaskProcess } from "../shared/run-task-processes.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
@@ -23,7 +23,7 @@ const listTaskBodiesOnWorkers = (
     const worker = readAttribute(span.attributes, "sshkeda_task.worker");
     const name = readAttribute(span.attributes, "sshkeda_task.task");
     const isTaskBodyOnAWorker =
-      span.thread === "worker" && typeof worker === "number" && typeof name === "string";
+      span.role === "body" && typeof worker === "number" && typeof name === "string";
     return isTaskBodyOnAWorker
       ? [
           {
@@ -90,7 +90,7 @@ export const isolatedWorkerDropsChanges = makeTest(
         "[reader] prepareStackTrace replaced: false, global: undefined\n",
       );
       expect(ran.standardError).toMatch(/^passed: 3 tasks, [\d.]+s$/mu);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       expect(
         listTaskBodiesOnWorkers(trace)
           .map((body) => body.label)
@@ -123,7 +123,7 @@ const compile = Task.make({
   isolated: true,
   run: Effect.sync(() => {
     process.on("exit", () => writeFileSync("isolated-worker-exited", ""));
-    console.log("compile printed this last");
+    process.stdout.write("compile printed this last\\n");
   }),
 });
 const after = Task.make({
@@ -144,7 +144,8 @@ export default Task.make({
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(0);
-      expect(ran.standardOutput).toBe("compile printed this last\n");
+      expect(ran.standardOutput).toBe("");
+      expect(ran.standardError).toContain("output: compile printed this last\n");
       expect(ran.standardError).toContain("[after] the isolated worker exited\n");
       expect(ran.standardError).toMatch(/^passed: 3 tasks, [\d.]+s$/mu);
     }),
@@ -166,12 +167,9 @@ export default Task.make({ name: "main", run: Task.all([first, second]) });
       const ran = yield* runTaskProcess(project, "main.ts", ONE_WORKER);
       expect(ran.exitCode, ran.standardError).toBe(0);
       expect(ran.standardError).toMatch(/^passed: 3 tasks, [\d.]+s$/mu);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(project, ran));
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
       expect(
-        readAttribute(
-          trace?.findOnlySpan("runRootTaskFiber")?.attributes ?? [],
-          "sshkeda_task.workers.started",
-        ),
+        readAttribute(trace?.findRunSpan()?.attributes ?? [], "sshkeda_task.workers.started"),
       ).toBe(ISOLATED_WORKER_COUNT_WITH_TWO_ISOLATED_TASKS);
       const [earlier, later] = listTaskBodiesOnWorkers(trace)
         .filter((body) => body.label !== "main on 0")
@@ -217,7 +215,9 @@ export default Task.make({ name: "main", run: Effect.gen(function* () { yield* i
       expect(second.standardError).toContain("[shared] shared ran\n");
       expect(second.standardError).toContain("[made] made ran\n");
       expect(second.standardError).toMatch(/^passed: 4 tasks, [\d.]+s$/mu);
-      const [trace] = yield* readTraces(yield* readTraceDirectory(isolatedAwaitsShared, second));
+      const [trace] = yield* readTraces(
+        yield* readProjectRunsDirectory(isolatedAwaitsShared, second),
+      );
       expect(
         listTaskBodiesOnWorkers(trace)
           .map((body) => body.label)
@@ -287,7 +287,7 @@ export default Task.make({
       expect(ran.standardError).toContain("[main] server is up\n");
       expect(ran.standardError).toContain("[after] server worker exited: false\n");
       expect(ran.standardError).toContain("[server] server stopped\n");
-      expect(ran.standardError).toContain("[server] closed\n");
+      expect(ran.standardError).toContain("closed: [server]\n");
     }),
   ),
 );
@@ -322,9 +322,11 @@ export default Task.make({ name: "main", run: Effect.gen(function* () { yield* d
       const exited = yield* command.waitForExit;
       expect(exited.exitCode, exited.standardError).toBe(EXIT_CODE_AFTER_SIGINT);
       expect(exited.standardError).toContain(
-        "[deploy] error TaskCleanupCutOff: its cleanup was cut off because the stop was forced\n",
+        "\nerror: [deploy] main.ts:3:21: TaskCleanupCutOff: its cleanup was cut off because the stop was forced\n",
       );
-      expect(exited.standardError).toMatch(/^error StopRequested: received SIGINT$/mu);
+      expect(exited.standardError).toMatch(
+        /\nfailed: \[deploy\] (?:\[main\] \(2 of 2 tasks\)|\(1 of 2 tasks\), 1 stopped), [\d.]+s\nrun: \S+\/$/u,
+      );
     }),
   ),
 );
@@ -341,8 +343,8 @@ export default Task.make({ name: "main", run: Effect.log("main ran"), isolated: 
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        "main: error TaskIsolatedInvalid: sets isolated to 'yes', which is not true or false\n",
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [main] TaskIsolatedInvalid: sets isolated to 'yes', which is not true or false",
       );
       expect(ran.standardError).not.toContain("main ran");
     }),
@@ -367,8 +369,8 @@ export default Task.make({
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
-      expect(ran.standardError).toContain(
-        'made: error TaskIsolatedInBody: is made inside the body of "main", so it cannot run on a worker of its own\n',
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [made] TaskIsolatedInBody: is made inside the body of [main], so it cannot run on a worker of its own",
       );
       expect(ran.standardError).not.toContain("made ran");
       expect(ran.standardError).not.toContain("main went on");

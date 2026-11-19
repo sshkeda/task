@@ -5,7 +5,7 @@ import type { STOP_SIGNALS } from "../../../shared/stop-signals.ts";
 import { completeOnceSent } from "./complete-discarded-calls-once-sent.ts";
 import { callTheSupervisor } from "./talk-to-the-supervisor.ts";
 
-export const acknowledgeStops = Effect.fn("acknowledgeStops")(function* (
+export const acknowledgeStops = Effect.fn(function* (
   received: Queue.Dequeue<(typeof STOP_SIGNALS)[number]>,
 ) {
   const scope = yield* Effect.scope;

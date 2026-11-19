@@ -1,16 +1,9 @@
-const BYTE_ORDER_MARK = "\uFEFF";
+export const baseNameOf = (filePath: string) => filePath.slice(filePath.lastIndexOf("/") + 1);
 
-export const commandWordsOf = (argumentWords: readonly string[]) =>
-  argumentWords
-    .map((argumentWord) =>
-      argumentWord.startsWith(BYTE_ORDER_MARK)
-        ? argumentWord.slice(BYTE_ORDER_MARK.length)
-        : argumentWord,
-    )
-    .filter((commandWord) => commandWord !== "");
+export const nameWithoutExecutable = (name: string) => `${name}, executable unknown`;
 
-export const programNameOf = (argumentWords: readonly string[], commandName: string) => {
-  const [programPath] = commandWordsOf(argumentWords.slice(0, 1));
-  const programName = programPath?.slice(programPath.lastIndexOf("/") + 1) ?? "";
-  return programName === "" ? commandName : programName;
+export const nameFromArgumentsOf = (argumentWords: readonly string[], commandName: string) => {
+  const [programPath = ""] = argumentWords;
+  const programName = baseNameOf(programPath);
+  return nameWithoutExecutable(programName === "" ? commandName : programName);
 };

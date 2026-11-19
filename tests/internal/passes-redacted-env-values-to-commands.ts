@@ -96,7 +96,7 @@ export const redactedValueWithNulIsRefusedWithoutShowingIt = Task.make({
     }).pipe(failureAsValue);
     expect(failure._tag).toBe("CommandNotStarted");
     expect(failure.message).toBe(
-      "could not start sh: task's process service refused the environment variable SECRET for sh, a Redacted value holding a NUL character",
+      "task's process service refused the environment variable SECRET for sh, a Redacted value holding a NUL character\ncould not start sh",
     );
     for (const shownSecret of SHOWN_SECRETS) {
       expect(String(failure)).not.toContain(shownSecret);
@@ -116,14 +116,17 @@ export const redactedValueStaysOutOfOutputTracesAndErrors = makeTest(
       expect(ran.standardError).toContain(
         `[seen] the command saw ${FAKE_SECRET.length} characters\n`,
       );
-      expect(ran.standardError).toContain(
-        `[seen] error CommandFailed: sh exited with code ${SECRET_SEEN_EXIT_CODE}\n`,
+      expect(ran.standardError).toMatch(
+        new RegExp(
+          `^error: \\[seen\\] main\\.ts:\\d+:\\d+: CommandFailed: sh exited with code ${SECRET_SEEN_EXIT_CODE}$`,
+          "mu",
+        ),
       );
-      expect(ran.standardError).toContain(
-        "[nul] error CommandNotStarted: could not start sh: task's process service refused the environment variable SECRET for sh, a Redacted value holding a NUL character\n",
+      expect(ran.standardError).toMatch(
+        /^error: \[nul\] main\.ts:\d+:\d+: RedactedValueWithNulRefused: task's process service refused the environment variable SECRET for sh, a Redacted value holding a NUL character\nerror: \[nul\] could not start sh$/mu,
       );
       const stateFiles = yield* readStateDirectoryTexts(project.home);
-      expect(stateFiles.some((file) => file.path.startsWith("traces/"))).toBe(true);
+      expect(stateFiles.some((file) => file.path.startsWith("runs/"))).toBe(true);
       for (const shownSecret of SHOWN_SECRETS) {
         expect(ran.standardOutput).not.toContain(shownSecret);
         expect(ran.standardError).not.toContain(shownSecret);
@@ -147,12 +150,15 @@ export const nonStringRedactedValueIsRefusedWithoutShowingIt = makeTest(
         ["numeric", "sh", "the environment variable TOKEN"],
         ["argument", "echo", "argument 2"],
       ]) {
-        expect(ran.standardError).toContain(
-          `[${taskName}] error CommandNotStarted: could not start ${programName}: task's process service refused ${valueName} for ${programName}, a Redacted value that is not a string\n`,
+        expect(ran.standardError).toMatch(
+          new RegExp(
+            `^error: \\[${taskName}\\] main\\.js:\\d+:\\d+: RedactedNonStringRefused: task's process service refused ${valueName} for ${programName}, a Redacted value that is not a string\nerror: \\[${taskName}\\] could not start ${programName}$`,
+            "mu",
+          ),
         );
       }
       const stateFiles = yield* readStateDirectoryTexts(project.home);
-      expect(stateFiles.some((file) => file.path.startsWith("traces/"))).toBe(true);
+      expect(stateFiles.some((file) => file.path.startsWith("runs/"))).toBe(true);
       for (const shownSecret of [NON_STRING_SECRET_PART, String(NUMERIC_SECRET)]) {
         expect(ran.standardOutput).not.toContain(shownSecret);
         expect(ran.standardError).not.toContain(shownSecret);
@@ -182,7 +188,7 @@ export const returnedRedactedValueReachesOtherTasks = makeTest(
         `${RETURNED_SECRET}|${RETURNED_SECRET}|${RETURNED_SECRET}`,
       );
       const stateFiles = yield* readStateDirectoryTexts(project.home);
-      expect(stateFiles.some((file) => file.path.startsWith("traces/"))).toBe(true);
+      expect(stateFiles.some((file) => file.path.startsWith("runs/"))).toBe(true);
       expect(ran.standardOutput).not.toContain(RETURNED_SECRET);
       expect(ran.standardError).not.toContain(RETURNED_SECRET);
       expect(

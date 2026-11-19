@@ -15,14 +15,14 @@ const ROOT_TASK_NAME = "hook";
 
 const OTHER_TASK_NAME = "reader";
 
-const FAILURE_REASON = "broken pipe";
+const FAILURE_REASON = { tag: "Error", message: "broken pipe" } as const;
 
 const CHUNK_BYTES = 3;
 
 const describeRead = StandardInputRead.match({
   Chunks: ({ chunks }) => `Chunks ${chunks.length}`,
   Ended: () => "Ended",
-  Failed: ({ reason }) => `Failed ${reason}`,
+  Failed: ({ reason }) => `Failed ${reason.message}`,
   Refused: ({ rootTaskName, taskName }) => `Refused ${taskName} for ${rootTaskName}`,
 });
 
@@ -31,14 +31,14 @@ const describeStage = StandardInputStage.match({
   Reading: () => "Reading",
   Idle: () => "Idle",
   Ended: () => "Ended",
-  Failed: ({ reason }) => `Failed ${reason}`,
+  Failed: ({ reason }) => `Failed ${reason.message}`,
 });
 
 const describeEvent = StandardInputEvent.match({
   Read: ({ taskName }) => `Read by ${taskName}`,
   ReceiveChunks: ({ chunks }) => `ReceiveChunks ${chunks.length}`,
   ReceiveEnd: () => "ReceiveEnd",
-  ReceiveFailure: ({ reason }) => `ReceiveFailure ${reason}`,
+  ReceiveFailure: ({ reason }) => `ReceiveFailure ${reason.message}`,
 });
 
 const describeAction = StandardInputAction.match({

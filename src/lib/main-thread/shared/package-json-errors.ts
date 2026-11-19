@@ -1,25 +1,33 @@
-import { Schema } from "effect";
+import { Array as Arrays, Schema } from "effect";
 
 import { TASK_ERROR_FIELDS } from "../../../shared/error-fields.ts";
-import { describeCauseMessage } from "../../../shared/report-errors.ts";
+import { joinMessages } from "../../../shared/join-messages.ts";
+import { reportWrappedCause } from "../../../shared/report-cause.ts";
+import type { PrintableError } from "../../errors/index.ts";
 
 export class PackageJsonUnreadable extends Schema.TaggedError<PackageJsonUnreadable>()(
   "PackageJsonUnreadable",
   { ...TASK_ERROR_FIELDS, filePath: Schema.String, cause: Schema.Defect() },
 ) {
+  public get reportedErrors() {
+    return reportWrappedCause(this, "could not read package.json");
+  }
   public override get message() {
-    return `could not read it because ${describeCauseMessage(this.cause)}`;
+    return joinMessages(this.reportedErrors);
   }
 }
 
 export class PackageJsonNotJson extends Schema.TaggedError<PackageJsonNotJson>()(
   "PackageJsonNotJson",
-  { ...TASK_ERROR_FIELDS, filePath: Schema.String, parserMessage: Schema.NullOr(Schema.String) },
+  { ...TASK_ERROR_FIELDS, filePath: Schema.String, cause: Schema.NullOr(Schema.Defect()) },
 ) {
+  public get reportedErrors(): Arrays.NonEmptyReadonlyArray<PrintableError> {
+    return this.cause === null
+      ? Arrays.of({ tag: this._tag, location: this.filePath, message: "is not JSON" })
+      : reportWrappedCause(this, "could not parse package.json");
+  }
   public override get message() {
-    return this.parserMessage === null
-      ? "is not JSON"
-      : `is not JSON because ${this.parserMessage}`;
+    return joinMessages(this.reportedErrors);
   }
 }
 
@@ -78,7 +86,10 @@ export class PackageJsonSearchFailed extends Schema.TaggedError<PackageJsonSearc
   "PackageJsonSearchFailed",
   { ...TASK_ERROR_FIELDS, filePath: Schema.String, cause: Schema.Defect() },
 ) {
+  public get reportedErrors() {
+    return reportWrappedCause(this, "could not check for package.json");
+  }
   public override get message() {
-    return `could not check for package.json because ${describeCauseMessage(this.cause)}`;
+    return joinMessages(this.reportedErrors);
   }
 }

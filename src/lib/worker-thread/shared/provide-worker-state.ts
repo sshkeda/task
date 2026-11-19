@@ -2,6 +2,7 @@ import { workerData } from "node:worker_threads";
 
 import type * as BunServices from "@effect/platform-bun/BunServices";
 import {
+  Clock,
   Context,
   Deferred,
   Effect,
@@ -19,17 +20,21 @@ import type { RpcMessage } from "effect/rpc";
 
 import { setProjectDirectoryPath } from "../../../shared/find-user-locations-in-stack-traces.ts";
 import { dieOnInvariantFailure } from "../../../shared/invariant-errors.ts";
-import { standardErrorLinesToTheMainThreadDeferred } from "../../../shared/print-to-standard-error.ts";
+import { printedLinesToTheMainThreadDeferred } from "../../../shared/print-to-standard-error.ts";
 import {
   MainThreadRpcs,
   MainThreadRpcRequest,
   MessageFromMainThreadRpcServer,
   TaskEvent,
+  WorkerLine,
   WorkerData,
   WorkerInitialMessage,
 } from "../../../shared/rpc.ts";
+import type { WorkerTraceRecord } from "../../../shared/rpc.ts";
+import { setStartDirectoryPath } from "../../../shared/start-directory-path.ts";
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
 import { makeMainThreadAnswers } from "./await-main-thread-answers.ts";
+import { makeStreamOutputPoster } from "./post-stream-output.ts";
 
 const decodeMessageFromMainThreadRpcServer = Schema.decodeUnknownEffect(
   MessageFromMainThreadRpcServer,
@@ -118,6 +123,7 @@ const connectToMainThread = Effect.gen(function* () {
     dieOnInvariantFailure("worker startup", "worker data matches the worker protocol"),
   );
   yield* setProjectDirectoryPath(decodedWorkerData.projectDirectoryPath);
+  yield* setStartDirectoryPath(decodedWorkerData.startDirectoryPath);
   const { mainThreadPort } = yield* RpcWorker.initialMessage(WorkerInitialMessage).pipe(
     dieOnInvariantFailure("worker startup", "the main thread hands over its RPC port first"),
   );
@@ -149,11 +155,15 @@ const connectToMainThread = Effect.gen(function* () {
   const reportToMainThreadNow = (event: typeof TaskEvent.Type) => {
     runInWorkerScope(reportToMainThread(event));
   };
-  const recordTraceSpanNow = (spanJson: string) => {
-    notifyMainThread({ tag: "RecordTraceSpan", payload: { spanJson } });
+  const recordTraceNow = (record: typeof WorkerTraceRecord.Type) => {
+    mainThreadPort.postMessage(record);
   };
-  yield* Deferred.succeed(standardErrorLinesToTheMainThreadDeferred, (logLevel, text) =>
-    reportToMainThread(TaskEvent.cases.StandardErrorLineRequested.make({ logLevel, text })),
+  yield* Deferred.succeed(printedLinesToTheMainThreadDeferred, (taskName, text) =>
+    reportToMainThread(
+      TaskEvent.cases.StandardErrorLineRequested.make({
+        line: WorkerLine.cases.Printed.make({ taskName, text }),
+      }),
+    ),
   );
   return {
     ...decodedWorkerData,
@@ -161,7 +171,16 @@ const connectToMainThread = Effect.gen(function* () {
     reportToMainThread,
     reportBodyStarted,
     reportToMainThreadNow,
-    recordTraceSpanNow,
+    recordTraceNow,
+    postStreamOutputNow: makeStreamOutputPoster(
+      yield* Clock.Clock,
+      decodedWorkerData.workerId,
+      decodedWorkerData.taskOutputBudget,
+      decodedWorkerData.taskLogHold,
+      (message) => {
+        mainThreadPort.postMessage(message);
+      },
+    ),
   };
 });
 

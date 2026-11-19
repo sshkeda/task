@@ -3,6 +3,7 @@ import { expect } from "bun:test";
 import { Effect } from "effect";
 
 import { exists, read } from "../shared/access-files.ts";
+import { FAILURE_EXIT_CODE, USAGE_ERROR_EXIT_CODE } from "../shared/exit-codes-of-failures.ts";
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
@@ -162,18 +163,18 @@ export const taskNameWithFlags = makeTest(
 );
 
 export const refusedCommandLines = makeTest(
-  "a missing, malformed or unaccepted flag of the task the run starts with, a flag no task reads, or a second task name fails the run with one line before any task starts",
+  "a missing, malformed or unaccepted flag of the task the run starts with, a flag no task reads, or a second task name fails the run with one line before any task starts and exits 2",
   Effect.scoped(
     Effect.gen(function* () {
       for (const [scriptArguments, refusal] of [
-        [[], 'FlagMissing: the task "deploy" reads the flag --stage, which was not given'],
+        [[], "FlagMissing: the task [deploy] reads the flag --stage, which was not given"],
         [
           ["--stage", "staging"],
-          'FlagInvalid: the flag --stage is "staging", which the task "deploy" does not accept: Expected "dev" | "prod"',
+          'FlagInvalid: the flag --stage is "staging", which the task [deploy] does not accept: Expected "dev" | "prod"',
         ],
         [
           ["--stage", "dev", "--dry-run=yes"],
-          'FlagInvalid: the flag --dry-run is "yes", which the task "deploy" does not accept: Expected "true" | "false"',
+          'FlagInvalid: the flag --dry-run is "yes", which the task [deploy] does not accept: Expected "true" | "false"',
         ],
         [["--stage"], "FlagValueMissing: the flag --stage is given without a value"],
         [
@@ -192,18 +193,18 @@ export const refusedCommandLines = makeTest(
         ],
         [
           ["migrate"],
-          'FlagMissing: the task "migrate" reads the flag --stage, which was not given',
+          "FlagMissing: the task [migrate] reads the flag --stage, which was not given",
         ],
         [
           ["migrate", "--stage", "dev", "--batch-size", "many"],
-          'FlagInvalid: the flag --batch-size is "many", which the task "migrate" does not accept: Expected a string representing a finite number',
+          'FlagInvalid: the flag --batch-size is "many", which the task [migrate] does not accept: Expected a string representing a finite number',
         ],
       ] as const) {
         const project = yield* makeProject({ "main.ts": DEPLOY_FILE });
         const ran = yield* runWithArguments(project, scriptArguments);
-        expect(ran.standardError).toBe(`error ${refusal}`);
+        expect(ran.standardError).toBe(`error: ${refusal}`);
         expect(ran.standardOutput).toBe("");
-        expect(ran.exitCode).toBe(1);
+        expect(ran.exitCode).toBe(USAGE_ERROR_EXIT_CODE);
         expect(yield* readDeployMarkers(project.directory)).toEqual({
           deploy: null,
           migrate: null,
@@ -214,30 +215,56 @@ export const refusedCommandLines = makeTest(
   ),
 );
 
+export const refusedFlagCombination = makeTest(
+  "flags that each fit but that a check across the whole flag set rejects fail the run naming every flag given, not one of them, and exit 2",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect, Schema } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({
+  name: "window",
+  flags: Schema.Struct({ start: Schema.Number, end: Schema.Number, label: Schema.optional(Schema.String) }).check(
+    Schema.makeFilter((flags) => (flags.start < flags.end ? undefined : "start must come before end")),
+  ),
+  run: () => Effect.promise(() => Bun.write("window-ran", "")).pipe(Effect.asVoid),
+});
+`,
+      });
+      const ran = yield* runWithArguments(project, ["--start", "9", "--end=3"]);
+      expect(ran.standardError).toBe(
+        'error: FlagsInvalid: the flags --start "9" --end "3" are not accepted together by the task [window]: start must come before end',
+      );
+      expect(ran.exitCode).toBe(USAGE_ERROR_EXIT_CODE);
+      expect(yield* exists(`${project.directory}/window-ran`)).toBe(false);
+    }),
+  ),
+);
+
 export const refusedDeclarations = makeTest(
-  "two loaded tasks of which one reads a flag as a switch and the other with a value, a flag a command line cannot carry, or a task that reads --help fail the run with one line before any task starts",
+  "two loaded tasks of which one reads a flag as a switch and the other with a value, a flag a command line cannot carry, or a task that reads --help fail the run with one line before any task starts and exit 1, since the task definitions are wrong rather than the command line",
   Effect.scoped(
     Effect.gen(function* () {
       for (const [migrateFlags, refusal] of [
         [
           "{ stage: Schema.Boolean }",
-          'FlagReadTwoWays: the task "migrate" reads the flag --stage as a switch without a value, but the task "deploy" reads it with a value',
+          "FlagReadTwoWays: the task [migrate] reads the flag --stage as a switch without a value, but the task [deploy] reads it with a value",
         ],
         [
           "{ stage: Schema.optional(Schema.Boolean) }",
-          'FlagReadTwoWays: the task "migrate" reads the flag --stage as a switch without a value, but the task "deploy" reads it with a value',
+          "FlagReadTwoWays: the task [migrate] reads the flag --stage as a switch without a value, but the task [deploy] reads it with a value",
         ],
         [
           "{ targetHosts: Schema.Array(Schema.String) }",
-          'FlagNotFlat: the task "migrate" reads the flag --target-hosts as a value a command line cannot carry',
+          "FlagNotFlat: the task [migrate] reads the flag --target-hosts as a value a command line cannot carry",
         ],
         [
           "{ target: Schema.optional(Schema.Struct({ host: Schema.String })) }",
-          'FlagNotFlat: the task "migrate" reads the flag --target as a value a command line cannot carry',
+          "FlagNotFlat: the task [migrate] reads the flag --target as a value a command line cannot carry",
         ],
         [
           "{ help: Schema.optional(Schema.Boolean) }",
-          'FlagReserved: the task "migrate" reads the flag --help, which is kept for printing what the file accepts',
+          "FlagReserved: the task [migrate] reads the flag --help, which is kept for printing what the file accepts",
         ],
       ] as const) {
         const project = yield* makeProject({
@@ -256,8 +283,8 @@ export default Task.make({
 `,
         });
         const ran = yield* runWithArguments(project, []);
-        expect(ran.standardError).toBe(`error ${refusal}`);
-        expect(ran.exitCode).toBe(1);
+        expect(ran.standardError).toBe(`error: ${refusal}`);
+        expect(ran.exitCode).toBe(FAILURE_EXIT_CODE);
         expect(yield* exists(`${project.directory}/deploy-ran`)).toBe(false);
         expect(yield* exists(`${project.directory}/migrate-ran`)).toBe(false);
       }
@@ -323,19 +350,17 @@ export const flagReadDifferently = makeTest(
 );
 
 export const flagFitsOneReader = makeTest(
-  "when a flag's value fits one task that reads it but not another, the task it does not fit fails when it starts, or before any task starts when the run starts with it",
+  "when a flag's value fits one task that reads it but not another, the task it does not fit fails when it starts and the run exits 1, or before any task starts with exit 2 when the run starts with it",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({ "main.ts": MODE_FILE });
       const ran = yield* runWithArguments(project, ["--mode", "fast"]);
-      expect(ran.standardError).toMatch(/^\[release\] started$/mu);
-      expect(ran.standardError).toMatch(/^\[audit\] started$/mu);
       expect(ran.standardError).toMatch(
-        /^\[audit\] error FlagInvalid: the flag --mode is "fast", which the task "audit" does not accept: Expected "strict" \| "loose"$/mu,
+        /^error: \[audit\] main\.ts:10:27: FlagInvalid: the flag --mode is "fast", which the task \[audit\] does not accept: Expected "strict" \| "loose"$/mu,
       );
-      expect(ran.standardError).toMatch(/^\[release\] error AwaitedTaskFailed: audit failed$/mu);
-      expect(ran.standardError).toMatch(/^failed: audit \(1 of 2 tasks\), [\d.]+s$/mu);
-      expect(ran.exitCode).toBe(1);
+      expect(ran.standardError).not.toContain("AwaitedTaskFailed");
+      expect(ran.standardError).toMatch(/^failed: \[audit\] \(1 of 2 tasks\), [\d.]+s$/mu);
+      expect(ran.exitCode).toBe(FAILURE_EXIT_CODE);
       expect(yield* readModeMarkers(project.directory)).toEqual({
         check: null,
         audit: null,
@@ -344,10 +369,10 @@ export const flagFitsOneReader = makeTest(
       const refusedProject = yield* makeProject({ "main.ts": MODE_FILE });
       const refused = yield* runWithArguments(refusedProject, ["check", "--mode", "strict"]);
       expect(refused.standardError).toBe(
-        'error FlagInvalid: the flag --mode is "strict", which the task "check" does not accept: Expected "fast" | "full"',
+        'error: FlagInvalid: the flag --mode is "strict", which the task [check] does not accept: Expected "fast" | "full"',
       );
       expect(refused.standardOutput).toBe("");
-      expect(refused.exitCode).toBe(1);
+      expect(refused.exitCode).toBe(USAGE_ERROR_EXIT_CODE);
       expect(yield* readModeMarkers(refusedProject.directory)).toEqual({
         check: null,
         audit: null,
@@ -358,7 +383,7 @@ export const flagFitsOneReader = makeTest(
 );
 
 export const laterTaskFlags = makeTest(
-  "a task further down that reads a flag the command line does not give fails when it starts, and the run fails like any task failure",
+  "a task further down that reads a flag the command line does not give fails when it starts, and the run fails and exits 1 like any task failure",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -379,13 +404,12 @@ export default Task.make({
 `,
       });
       const ran = yield* runWithArguments(project, []);
-      expect(ran.standardError).toMatch(/^\[notify\] started$/mu);
       expect(ran.standardError).toMatch(
-        /^\[notify\] error FlagMissing: the task "notify" reads the flag --channel, which was not given$/mu,
+        /^error: \[notify\] main\.ts:3:28: FlagMissing: the task \[notify\] reads the flag --channel, which was not given$/mu,
       );
-      expect(ran.standardError).toMatch(/^\[deploy\] error AwaitedTaskFailed: notify failed$/mu);
-      expect(ran.standardError).toMatch(/^failed: notify \(1 of 2 tasks\), [\d.]+s$/mu);
-      expect(ran.exitCode).toBe(1);
+      expect(ran.standardError).not.toContain("AwaitedTaskFailed");
+      expect(ran.standardError).toMatch(/^failed: \[notify\] \(1 of 2 tasks\), [\d.]+s$/mu);
+      expect(ran.exitCode).toBe(FAILURE_EXIT_CODE);
       expect(yield* exists(`${project.directory}/notify-ran`)).toBe(false);
       expect(yield* exists(`${project.directory}/deploy-ran`)).toBe(false);
     }),

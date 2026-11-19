@@ -9,6 +9,7 @@ import {
   MAXIMUM_WORKER_COUNT,
   requireSupportedBunVersion,
 } from "../../src/shared/read-environment-config.ts";
+import { USAGE_ERROR_EXIT_CODE } from "../shared/exit-codes-of-failures.ts";
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { findMisprintedErrorLines } from "../shared/find-misprinted-error-lines.ts";
 import { makeProject } from "../shared/make-projects.ts";
@@ -19,7 +20,7 @@ import { runTaskProcess } from "../shared/run-task-processes.ts";
 const DIGITS_BEYOND_THE_LARGEST_NUMBER = 401;
 
 export const stateDirectory = makeTest(
-  "configured state directories hold the traces and reject blank paths",
+  "configured state directories hold the runs and reject blank paths with exit 2",
   Effect.scoped(
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -35,26 +36,26 @@ export default Task.make({ name: "main", run: Effect.log("computed") });`,
         const environment = { SSHKEDA_TASK_STATE_DIRECTORY: directory };
         const ran = yield* runTaskProcess(project, "main.ts", environment);
         expect(ran.exitCode).toBe(0);
-        expect(ran.standardError).toContain(`wrote the trace to ${location}/traces/project/`);
-        expect(yield* fileSystem.readDirectory(location)).toEqual(["traces"]);
+        expect(ran.standardError).toContain(`run: ${location}/runs/project/`);
+        expect(yield* fileSystem.readDirectory(location)).toEqual(["runs"]);
       }
       expect(yield* fileSystem.exists(`${project.home}/.sshkeda-task`)).toBe(false);
       for (const emptyDirectoryPath of ["", "   "]) {
         const invalid = yield* runTaskProcess(project, "main.ts", {
           SSHKEDA_TASK_STATE_DIRECTORY: emptyDirectoryPath,
         });
-        expect(invalid.exitCode).toBe(1);
-        expect(invalid.standardError).toContain(
-          `error StateDirectoryPathBlank: SSHKEDA_TASK_STATE_DIRECTORY is "${emptyDirectoryPath}", which is blank`,
+        expect(invalid.exitCode).toBe(USAGE_ERROR_EXIT_CODE);
+        expect(invalid.standardError.split("\n")).toContain(
+          `error: StateDirectoryPathBlank: SSHKEDA_TASK_STATE_DIRECTORY is "${emptyDirectoryPath}", which is blank`,
         );
-        expect(invalid.standardError).not.toContain("[main] started");
+        expect(invalid.standardError).not.toMatch(/^(?:passed|failed|stopped): /mu);
       }
     }),
   ),
 );
 
 export const homeDirectoryPath = makeTest(
-  "runtime configuration requires HOME only without an explicit state directory",
+  "runtime configuration requires HOME only without an explicit state directory, and exits 2 without it",
   Effect.scoped(
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -89,23 +90,23 @@ export default Task.make({ name: "main", run: Effect.void });`,
           ],
           { concurrency: "unbounded" },
         );
-        expect(Number(exitCode)).toBe(configuration.succeeds ? 0 : 1);
+        expect(Number(exitCode)).toBe(configuration.succeeds ? 0 : USAGE_ERROR_EXIT_CODE);
         if (!configuration.succeeds) {
           expect(standardError).toMatch(
-            /^error HomeDirectoryPathMissing: SSHKEDA_TASK_STATE_DIRECTORY (?:and HOME are both unset|is unset and HOME is " *", which is blank)$/mu,
+            /^error: HomeDirectoryPathMissing: SSHKEDA_TASK_STATE_DIRECTORY (?:and HOME are both unset|is unset and HOME is " *", which is blank)$/mu,
           );
           expect(findMisprintedErrorLines(standardError)).toEqual([]);
-          expect(standardError).not.toContain("[main] started");
+          expect(standardError).not.toMatch(/^(?:passed|failed|stopped): /mu);
         }
       }
-      expect(yield* fileSystem.exists(`${project.home}/.sshkeda-task/traces`)).toBe(true);
-      expect(yield* fileSystem.exists(`${project.directory}/explicit-state/traces`)).toBe(true);
+      expect(yield* fileSystem.exists(`${project.home}/.sshkeda-task/runs`)).toBe(true);
+      expect(yield* fileSystem.exists(`${project.directory}/explicit-state/runs`)).toBe(true);
     }),
   ),
 );
 
 export const workerCount = makeTest(
-  "runtime configuration rejects worker counts that are not whole decimal numbers above 0 or that exceed the maximum",
+  "runtime configuration rejects worker counts that are not whole decimal numbers above 0 or that exceed the maximum with exit 2",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -117,11 +118,11 @@ export default Task.make({ name: "main", run: Effect.void });`,
         const invalid = yield* runTaskProcess(project, "main.ts", {
           SSHKEDA_TASK_WORKERS: configuredWorkerCount,
         });
-        expect(invalid.exitCode).toBe(1);
-        expect(invalid.standardError).toContain(
-          `error WorkerCountInvalid: SSHKEDA_TASK_WORKERS is "${configuredWorkerCount}", not a whole decimal number above 0`,
+        expect(invalid.exitCode).toBe(USAGE_ERROR_EXIT_CODE);
+        expect(invalid.standardError.split("\n")).toContain(
+          `error: WorkerCountInvalid: SSHKEDA_TASK_WORKERS is "${configuredWorkerCount}", not a whole decimal number above 0`,
         );
-        expect(invalid.standardError).not.toContain("[main] started");
+        expect(invalid.standardError).not.toMatch(/^(?:passed|failed|stopped): /mu);
       }
       const maximum = MAXIMUM_WORKER_COUNT;
       for (const configuredWorkerCount of [
@@ -132,11 +133,11 @@ export default Task.make({ name: "main", run: Effect.void });`,
         const tooMany = yield* runTaskProcess(project, "main.ts", {
           SSHKEDA_TASK_WORKERS: configuredWorkerCount,
         });
-        expect(tooMany.exitCode).toBe(1);
-        expect(tooMany.standardError).toContain(
-          `error WorkerCountAboveMaximum: SSHKEDA_TASK_WORKERS is "${configuredWorkerCount}", above the maximum of ${maximum} worker threads`,
+        expect(tooMany.exitCode).toBe(USAGE_ERROR_EXIT_CODE);
+        expect(tooMany.standardError.split("\n")).toContain(
+          `error: WorkerCountAboveMaximum: SSHKEDA_TASK_WORKERS is "${configuredWorkerCount}", above the maximum of ${maximum} worker threads`,
         );
-        expect(tooMany.standardError).not.toContain("[main] started");
+        expect(tooMany.standardError).not.toMatch(/^(?:passed|failed|stopped): /mu);
       }
       const atMaximum = yield* runTaskProcess(project, "main.ts", {
         SSHKEDA_TASK_WORKERS: String(maximum),
@@ -170,14 +171,18 @@ export const parentEnvironment = makeTest(
 );
 
 export const bunVersionRange = makeTest(
-  "a Bun older than the package's engines.bun range fails startup naming the package and both versions",
+  "a Bun older than the package's engines.bun range, or a prerelease the range does not accept, fails startup naming the package and both versions",
   Effect.gen(function* () {
-    const refused = yield* failureAsValue(requireSupportedBunVersion("1.3.14", ">=1.4.2"));
-    expect(refused._tag).toBe("BunVersionUnsupported");
-    expect(refused.message).toBe(
-      `${packageJson.name} ${packageJson.version} needs Bun >=1.4.2, but Bun 1.3.14 is running`,
-    );
-    for (const supportedVersion of ["1.4.2", "1.5.0", "1.4.3-canary.12+0d9b296af", Bun.version]) {
+    for (const unsupportedVersion of ["1.3.14", "1.4.2-canary.12+0d9b296af"]) {
+      const refused = yield* failureAsValue(
+        requireSupportedBunVersion(unsupportedVersion, ">=1.4.2"),
+      );
+      expect(refused._tag).toBe("BunVersionUnsupported");
+      expect(refused.message).toBe(
+        `${packageJson.name} ${packageJson.version} needs Bun >=1.4.2, but Bun ${unsupportedVersion} is running`,
+      );
+    }
+    for (const supportedVersion of ["1.4.2", "1.5.0", "1.4.2+0d9b296af", Bun.version]) {
       yield* requireSupportedBunVersion(supportedVersion, ">=1.4.2");
     }
     yield* requireSupportedBunVersion(Bun.version);
@@ -185,7 +190,7 @@ export const bunVersionRange = makeTest(
 );
 
 export const setupLimit = makeTest(
-  "runtime configuration rejects setup limits that are not durations above 0, and accepts a duration",
+  "runtime configuration rejects setup limits that are not durations above 0 with exit 2, and accepts a duration",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -205,11 +210,11 @@ export default Task.make({ name: "main", run: Effect.void });`,
         const invalid = yield* runTaskProcess(project, "main.ts", {
           SSHKEDA_TASK_SETUP_LIMIT: configuredSetupLimit,
         });
-        expect(invalid.exitCode).toBe(1);
-        expect(invalid.standardError).toContain(
-          `error SetupLimitInvalid: SSHKEDA_TASK_SETUP_LIMIT is "${configuredSetupLimit}", not a duration above 0 such as "90 seconds"`,
+        expect(invalid.exitCode).toBe(USAGE_ERROR_EXIT_CODE);
+        expect(invalid.standardError.split("\n")).toContain(
+          `error: SetupLimitInvalid: SSHKEDA_TASK_SETUP_LIMIT is "${configuredSetupLimit}", not a duration above 0 such as "90 seconds"`,
         );
-        expect(invalid.standardError).not.toContain("[main] started");
+        expect(invalid.standardError).not.toMatch(/^(?:passed|failed|stopped): /mu);
       }
       for (const configuredSetupLimit of ["90 seconds", "1.5 minutes", "10 minutes"]) {
         const valid = yield* runTaskProcess(project, "main.ts", {

@@ -5,6 +5,7 @@ import { write } from "./access-files.ts";
 import { encodeJson } from "./encode-json.ts";
 import { REPOSITORY_DIRECTORY } from "./find-repository-directory.ts";
 import { makeScratchDirectory } from "./make-temporary-directories.ts";
+import { SourceDidNotCompile } from "./test-errors.ts";
 
 export const typeCheckSource = (text: string) =>
   Effect.gen(function* () {
@@ -20,5 +21,13 @@ export const typeCheckSource = (text: string) =>
       "-p",
       directory,
       "--singleThreaded",
-    ]);
+    ]).pipe(
+      Effect.catchTag("CommandFailed", (failure) =>
+        Effect.fail(
+          new SourceDidNotCompile({
+            compilerOutput: `${failure.standardOutput}${failure.standardError}`,
+          }),
+        ),
+      ),
+    );
   });

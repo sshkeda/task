@@ -1,8 +1,12 @@
-import { Context, Duration, Effect, Exit, Option, Predicate, Schema } from "effect";
+import { Context, Effect, Exit, Option, Predicate, Schema } from "effect";
+import type { Duration } from "effect";
 import { SecureRandom } from "effect/crypto";
 import * as PlatformErrors from "effect/PlatformError";
 
-import { STOP_GRACE_PERIOD, STOP_SIGNALS } from "./stop-signals.ts";
+import { PrintableError, ReportedErrors } from "../lib/errors/index.ts";
+import { reportUnderlyingErrors } from "./report-cause.ts";
+import { UNTAGGED_FAILURE_TAG } from "./report-errors.ts";
+import { countSignalsReceived, STOP_GRACE_PERIOD, STOP_SIGNALS } from "./stop-signals.ts";
 import { TASK_PACKAGE } from "./task-package.ts";
 
 export const TerminalCommand = Schema.Struct({
@@ -19,22 +23,40 @@ export const TerminalCommandId = Schema.Struct({ id: Schema.String });
 export const TerminalCommandEnded = Schema.TaggedUnion({
   Exited: { code: Schema.Int },
   Signaled: { signal: Schema.String },
-  NotStarted: { notFound: Schema.Boolean, description: Schema.String },
+  NotStarted: { notFound: Schema.Boolean, cause: PrintableError },
 });
 
-const GRACE_FOR_A_STOP_AFTER_A_STOP_SIGNAL = Duration.seconds(1);
-
-class TerminalCommandNotSpawned extends Schema.TaggedError<TerminalCommandNotSpawned>()(
+export class TerminalCommandNotSpawned extends Schema.TaggedError<TerminalCommandNotSpawned>()(
   "TerminalCommandNotSpawned",
   { cause: Schema.Defect() },
 ) {}
 
-const isStopSignal = (signal: string) => STOP_SIGNALS.some((stopSignal) => stopSignal === signal);
+export const notStartedBecauseSpawnThrew = (error: TerminalCommandNotSpawned) =>
+  TerminalCommandEnded.cases.NotStarted.make({
+    notFound: Predicate.hasProperty(error.cause, "code") && error.cause.code === "ENOENT",
+    cause: reportUnderlyingErrors(error, UNTAGGED_FAILURE_TAG)[0],
+  });
 
-const commandsInTerminal = new Map<string, Bun.Subprocess>();
+const commandsInTerminal = new Map<
+  string,
+  { readonly processId: number; readonly exited: Effect.Effect<unknown> }
+>();
 
 export const isCommandInTerminal = (processId: number) =>
-  [...commandsInTerminal.values()].some((subprocess) => subprocess.pid === processId);
+  [...commandsInTerminal.values()].some((command) => command.processId === processId);
+
+export const trackCommandInTerminal = (
+  id: string,
+  processId: number,
+  exited: Effect.Effect<unknown>,
+) => {
+  commandsInTerminal.set(id, { processId, exited });
+};
+
+export const forgetCommandInTerminal = (id: string) =>
+  Effect.sync(() => {
+    commandsInTerminal.delete(id);
+  });
 
 const terminate = (subprocess: Bun.Subprocess, cleanup: Duration.Duration) =>
   Effect.sync(() => {
@@ -51,12 +73,15 @@ const terminate = (subprocess: Bun.Subprocess, cleanup: Duration.Duration) =>
   );
 
 export const runInTerminal =
-  (stopRequested: Effect.Effect<void>, runMarkerFileDescriptor: number | null) =>
+  (stopRequested: Effect.Effect<void> | null, runMarkerFileDescriptor: number | null) =>
   (command: typeof TerminalCommand.Type) =>
     Effect.acquireUseRelease(
       Effect.try({
-        try: () =>
-          Bun.spawn([command.command, ...command.args], {
+        try: () => {
+          const signalsReceivedBeforeSpawn = new Map<string, number>(
+            STOP_SIGNALS.map((stopSignal) => [stopSignal, countSignalsReceived(stopSignal)]),
+          );
+          const subprocess = Bun.spawn([command.command, ...command.args], {
             cwd: command.cwd,
             env: command.env,
             stdio: [
@@ -65,16 +90,17 @@ export const runInTerminal =
               "inherit",
               ...(runMarkerFileDescriptor === null ? [] : [runMarkerFileDescriptor]),
             ],
-          }),
+          });
+          trackCommandInTerminal(
+            command.id,
+            subprocess.pid,
+            Effect.promise(() => subprocess.exited),
+          );
+          return { subprocess, signalsReceivedBeforeSpawn };
+        },
         catch: (cause) => new TerminalCommandNotSpawned({ cause }),
-      }).pipe(
-        Effect.tap((subprocess) =>
-          Effect.sync(() => {
-            commandsInTerminal.set(command.id, subprocess);
-          }),
-        ),
-      ),
-      (subprocess) =>
+      }),
+      ({ subprocess, signalsReceivedBeforeSpawn }) =>
         Effect.promise(() => subprocess.exited).pipe(
           Effect.flatMap((code): Effect.Effect<typeof TerminalCommandEnded.Type> => {
             const signal = subprocess.signalCode;
@@ -82,43 +108,30 @@ export const runInTerminal =
               return Effect.succeed(TerminalCommandEnded.cases.Exited.make({ code }));
             }
             const signaled = TerminalCommandEnded.cases.Signaled.make({ signal: String(signal) });
-            return isStopSignal(signaled.signal)
-              ? stopRequested.pipe(
-                  Effect.timeoutOption(GRACE_FOR_A_STOP_AFTER_A_STOP_SIGNAL),
-                  Effect.flatMap((stopped) =>
-                    Option.isSome(stopped) ? Effect.never : Effect.succeed(signaled),
-                  ),
-                )
+            const signalsReceivedBefore = signalsReceivedBeforeSpawn.get(signaled.signal);
+            const isPartOfARunStop =
+              stopRequested !== null &&
+              signalsReceivedBefore !== undefined &&
+              countSignalsReceived(signaled.signal) > signalsReceivedBefore;
+            return isPartOfARunStop
+              ? stopRequested.pipe(Effect.andThen(Effect.never))
               : Effect.succeed(signaled);
           }),
         ),
-      (subprocess, exit) =>
+      ({ subprocess }, exit) =>
         (Exit.isSuccess(exit) ? Effect.void : terminate(subprocess, command.cleanup)).pipe(
-          Effect.ensuring(
-            Effect.sync(() => {
-              commandsInTerminal.delete(command.id);
-            }),
-          ),
+          Effect.ensuring(forgetCommandInTerminal(command.id)),
         ),
     ).pipe(
-      Effect.catchTag("TerminalCommandNotSpawned", (error) => {
-        const isNotFound =
-          Predicate.hasProperty(error.cause, "code") && error.cause.code === "ENOENT";
-        return Effect.succeed(
-          TerminalCommandEnded.cases.NotStarted.make({
-            notFound: isNotFound,
-            description: String(error.cause),
-          }),
-        );
-      }),
+      Effect.catchTag("TerminalCommandNotSpawned", (error) =>
+        Effect.succeed(notStartedBecauseSpawnThrew(error)),
+      ),
     );
 
 export const awaitTerminalCommandExit = (command: typeof TerminalCommandId.Type) =>
   Effect.suspend(() => {
-    const subprocess = commandsInTerminal.get(command.id);
-    return subprocess === undefined
-      ? Effect.void
-      : Effect.promise(() => subprocess.exited).pipe(Effect.asVoid);
+    const tracked = commandsInTerminal.get(command.id);
+    return tracked === undefined ? Effect.void : Effect.asVoid(tracked.exited);
   });
 
 export const failUnlessStarted =
@@ -130,7 +143,7 @@ export const failUnlessStarted =
             module: "ChildProcess",
             method: "spawn",
             pathOrDescriptor: commandName.slice(commandName.lastIndexOf("/") + 1),
-            description: ended.description,
+            cause: new ReportedErrors({ reportedErrors: [ended.cause] }),
           }),
         )
       : Effect.succeed(ended);
@@ -145,7 +158,7 @@ export const TerminalCommands = Context.Reference<
 >(`${TASK_PACKAGE.name}/TerminalCommands`, {
   defaultValue: () => (command) =>
     runInTerminal(
-      Effect.never,
+      null,
       null,
     )({
       ...command,

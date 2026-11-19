@@ -15,6 +15,11 @@ import {
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 
 import { CapturedCommandFailed, CommandFailed } from "../../src/lib/errors/index.ts";
+import {
+  checkWorkingDirectoryBeforeSpawn,
+  recheckWorkingDirectoryAfterSpawnFailure,
+} from "../../src/lib/worker-thread/lib/provide-task-services/internal/spawn-commands-with-bun.ts";
+import { WorkingDirectoryUnusable } from "../../src/shared/command-errors.ts";
 import { inheritedEnvironment } from "../../src/shared/read-environment-config.ts";
 import { exists, read } from "../shared/access-files.ts";
 import { encodeJson } from "../shared/encode-json.ts";
@@ -25,8 +30,20 @@ import { isProcessAlive } from "../shared/is-process-alive.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTemporaryDirectory } from "../shared/make-temporary-directories.ts";
 import { makeTest } from "../shared/make-tests.ts";
+import { findRunDirectoryPath, withRunLinePathNamed } from "../shared/name-output-files.ts";
+import { readAttribute, readProjectRunsDirectory, readTraces } from "../shared/read-trace-files.ts";
 import { runTaskProcess } from "../shared/run-task-processes.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
+
+const readTaskSpan = (
+  project: Parameters<typeof readProjectRunsDirectory>[0],
+  ran: Parameters<typeof readProjectRunsDirectory>[1],
+  taskName: string,
+) =>
+  Effect.gen(function* () {
+    const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
+    return trace?.findTaskSpan("task", taskName);
+  });
 
 export const input = Task.make({
   name: "Task.exec streams exact input, closes default stdin and retains failure output",
@@ -38,15 +55,18 @@ export const input = Task.make({
       }),
     ).toBe(contents);
     expect(yield* Task.exec("cat", [])).toBe("");
-    const failure = yield* Task.exec("sh", ["-c", "printf error-output >&2; exit 7"]).pipe(
-      failureAsValue,
+    const failedOutput = yield* Task.exec("sh", ["-c", "printf error-output >&2; exit 7"]).pipe(
+      Effect.flatMap((output) => Effect.die(`the command succeeded and printed ${output}`)),
+      Effect.catchTag("CommandFailed", (failure) =>
+        Effect.succeed([failure.standardOutput, failure.standardError]),
+      ),
     );
-    expect(failure.message).toContain("error-output");
+    expect(failedOutput).toEqual(["", "error-output"]);
   }),
 });
 
 export const separateStreams = Task.make({
-  name: "a failed command keeps its standard output and standard error apart and exact, and its message shows both",
+  name: "a failed command keeps its standard output and standard error apart and exact on its CommandFailed, whose message is the command, how it ended and each stream under its name",
   run: Effect.gen(function* () {
     const report = '{"diagnostics":[]}\n';
     yield* Task.exec("sh", [
@@ -60,7 +80,7 @@ export const separateStreams = Task.make({
           expect(failure.standardOutput).toBe(report);
           expect(failure.standardError).toBe("progress line\n");
           expect(failure.message).toBe(
-            `${failure.command} exited with code 1\n{"diagnostics":[]}\nprogress line`,
+            `${failure.command} exited with code 1\nstandard output:\n${report.trimEnd()}\nstandard error:\nprogress line`,
           );
         }),
       ),
@@ -69,18 +89,87 @@ export const separateStreams = Task.make({
 });
 
 export const emptyStandardOutput = Task.make({
-  name: "a failed command that prints nothing on standard output keeps it empty and leaves it out of the message",
+  name: "a failed command that prints nothing on standard output keeps it empty and its standard error exact, and its message ends with that standard error",
   run: Task.exec("sh", ["-c", String.raw`printf 'only error\n' >&2; exit 2`]).pipe(
     Effect.flatMap((output) => Effect.die(`the command succeeded and printed ${output}`)),
     Effect.catchTag("CommandFailed", (failure) =>
       Effect.sync(() => {
         expect(failure.standardOutput).toBe("");
         expect(failure.standardError).toBe("only error\n");
-        expect(failure.message).toBe(`${failure.command} exited with code 2\nonly error`);
+        expect(failure.message).toBe(
+          `${failure.command} exited with code 2\nstandard error:\nonly error`,
+        );
       }),
     ),
   ),
 });
+
+const MESSAGE_LINES = 20;
+
+const MESSAGE_CHARACTERS = 4096;
+
+const WRITTEN_LINES = 30;
+
+const LONG_LINE_CHARACTERS = 8192;
+
+const SURROGATE_PAIRS = 4096;
+
+const SURROGATE_PAIRS_KEPT_WHOLE = 2047;
+
+const writtenLines = (count: number) =>
+  Array.from({ length: count }, (_unused, index) => `line ${String(index + 1)}`);
+
+const ERROR_HEADING = "c exited with code 1\nstandard error:";
+
+const failedWith = (standardError: string) =>
+  new CommandFailed({ command: "c", code: 1, standardOutput: "", standardError }).message;
+
+export const commandFailedMessageBound = makeTest(
+  "a CommandFailed message carries at most the last 20 lines and 4096 characters of each of standard output and standard error, from its first whole line, under the name of each stream, and a CapturedCommandFailed message carries none",
+  Effect.sync(() => {
+    expect(failedWith(`${writtenLines(WRITTEN_LINES).join("\n")}\n\n`)).toBe(
+      [ERROR_HEADING, ...writtenLines(WRITTEN_LINES).slice(WRITTEN_LINES - MESSAGE_LINES)].join(
+        "\n",
+      ),
+    );
+    expect(failedWith(`first\n${"y".repeat(LONG_LINE_CHARACTERS)}`)).toBe(
+      `${ERROR_HEADING}\n…${"y".repeat(MESSAGE_CHARACTERS)}`,
+    );
+    expect(failedWith(`${"\u{1F600}".repeat(SURROGATE_PAIRS)}b`)).toBe(
+      `${ERROR_HEADING}\n…${"\u{1F600}".repeat(SURROGATE_PAIRS_KEPT_WHOLE)}b`,
+    );
+    expect(failedWith(`cut ${"z".repeat(MESSAGE_CHARACTERS)}\nwhole\n`)).toBe(
+      `${ERROR_HEADING}\nwhole`,
+    );
+    expect(failedWith(`a\n${"x".repeat(MESSAGE_CHARACTERS)}`)).toBe(
+      `${ERROR_HEADING}\n${"x".repeat(MESSAGE_CHARACTERS)}`,
+    );
+    expect(
+      new CommandFailed({
+        command: "c",
+        code: 1,
+        standardOutput: `${writtenLines(WRITTEN_LINES).join("\n")}\n`,
+        standardError: `first\n${"y".repeat(LONG_LINE_CHARACTERS)}`,
+      }).message,
+    ).toBe(
+      [
+        "c exited with code 1",
+        "standard output:",
+        ...writtenLines(WRITTEN_LINES).slice(WRITTEN_LINES - MESSAGE_LINES),
+        "standard error:",
+        `…${"y".repeat(MESSAGE_CHARACTERS)}`,
+      ].join("\n"),
+    );
+    expect(
+      new CapturedCommandFailed({
+        command: "c",
+        code: 1,
+        standardOutput: Redacted.make("out"),
+        standardError: Redacted.make("secret error"),
+      }).message,
+    ).toBe("c exited with code 1, and its captured output is not shown");
+  }),
+);
 
 export const leadingWhitespace = Task.make({
   name: "a failed command keeps leading and trailing whitespace on both outputs",
@@ -171,7 +260,7 @@ export const rootTaskCommandExitCode = makeTest(
 const KILLED_COMMAND_ATTEMPTS = ["first", "second", "third", "fourth", "fifth"] as const;
 
 export const killedCommandOutput = makeTest(
-  "a command killed by a signal right after printing still logs everything it printed",
+  "a command killed by a signal right after writing still has everything it wrote in its task's file",
   Effect.scoped(
     Effect.gen(function* () {
       const attempts = yield* encodeJson(KILLED_COMMAND_ATTEMPTS);
@@ -189,9 +278,10 @@ export default Task.make({ name: "main", run: Effect.forEach(
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(0);
+      const written = yield* read(`${findRunDirectoryPath(ran.standardError)}/1.output`);
       for (const attempt of KILLED_COMMAND_ATTEMPTS) {
-        expect(ran.standardError).toContain(`[main] out-${attempt}\n`);
-        expect(ran.standardError).toContain(`[main] err-${attempt}\n`);
+        expect(written).toContain(`[main] out-${attempt}\n`);
+        expect(written).toContain(`[main] err-${attempt}\n`);
       }
     }),
   ),
@@ -222,8 +312,8 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       );
       expect(ran.standardError).toContain("[main] out\n");
       expect(ran.standardError).toContain("[main] err\n");
-      expect(ran.standardError).toContain(
-        "[main] error CommandFailed: sh was killed by signal SIGSEGV\nfailed: main (1 of 1 task), ",
+      expect(withRunLinePathNamed(ran.standardError)).toMatch(
+        /\nerror: \[main\] main\.ts:10:15: CommandFailed: sh was killed by signal SIGSEGV\nerror: \[main\] its output is in <run folder>\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:10:15: CommandFailed: sh was killed by signal SIGSEGV\nrecap: \[main\] out\nrecap: \[main\] err\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: .+\/$/u,
       );
       expect(findMisprintedErrorLines(ran.standardError)).toEqual([]);
     }),
@@ -241,6 +331,10 @@ export const commandEndsWithCodeOrSignal = makeTest(
     expect(new CommandFailed({ command: "c", code: 1, ...output }).message).toBe(
       "c exited with code 1",
     );
+    expect(
+      new CommandFailed({ command: "c", code: 1, standardOutput: "out\n", standardError: "\n" })
+        .message,
+    ).toBe("c exited with code 1\nstandard output:\nout");
     expect(
       new CommandFailed({ command: "c", code: null, signal: "SIGKILL", ...output }).message,
     ).toBe("c was killed by signal SIGKILL");
@@ -324,7 +418,7 @@ export const nestedRunConfig = makeTest(
         "outer/package.json": `{ "name": "outer", "type": "module" }`,
         "outer/main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
-export default Task.make({ name: "main", run: Task.exec("bun", ["inner.ts"], { cwd: "nested" }) });`,
+export default Task.make({ name: "main", run: Task.exec("bun", ["inner.ts"], { cwd: "nested", print: true }) });`,
         "outer/nested/package.json": `{ "name": "nested", "type": "module" }`,
         "outer/nested/inner.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
@@ -336,15 +430,23 @@ export default inner;`,
         SSHKEDA_TASK_WORKERS: "3",
         SSHKEDA_TASK_SETUP_LIMIT: "50 seconds",
       };
-      const first = yield* runTaskProcess(project, "outer/main.ts", taskConfig);
+      const first = yield* runTaskProcess(project, "outer/main.ts", {
+        ...taskConfig,
+      });
       expect(first.exitCode, first.standardError).toBe(0);
       expect(first.standardError).toContain(
         "[main] [inner] inner sees workers=3 setup=50 seconds\n",
       );
       const fileSystem = yield* FileSystem.FileSystem;
+      const runDirectoryNames = yield* fileSystem.readDirectory(
+        `${project.directory}/state/runs/nested`,
+      );
+      expect(runDirectoryNames).toHaveLength(1);
       expect(
-        yield* fileSystem.readDirectory(`${project.directory}/state/traces/nested`),
-      ).toHaveLength(1);
+        yield* fileSystem.exists(
+          `${project.directory}/state/runs/nested/${String(runDirectoryNames[0])}/trace.jsonl`,
+        ),
+      ).toBe(true);
       expect(yield* fileSystem.exists(`${project.directory}/outer/state`)).toBe(false);
       expect(yield* fileSystem.exists(`${project.directory}/outer/nested/state`)).toBe(false);
       expect(yield* fileSystem.exists(`${project.home}/.sshkeda-task`)).toBe(false);
@@ -375,7 +477,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
         TASK_TEST_DECLARED: "a",
       });
       expect(first.exitCode, first.standardError).toBe(0);
-      expect(first.standardError).toContain(`\n[main] ${printed("a")}\n`);
+      expect(first.standardError.split("\n")).toContain(`[main] ${printed("a")}`);
       const pathChanged = yield* runTaskProcess(project, "main.ts", {
         TASK_TEST_DECLARED: "b",
         PATH: `${runPath}:${project.directory}`,
@@ -401,15 +503,92 @@ export default Task.make({ name: "main", run: Task.allSettled([piped, shell]) })
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode, result.standardError).toBe(1);
-      expect(result.standardError).toContain(
-        "[piped] error CommandPipelineRefused: task's process service refused the pipeline echo | cat\n",
+      expect(result.standardError.split("\n")).toContain(
+        "error: [piped] main.ts:4:27: CommandPipelineRefused: task's process service refused the pipeline echo | cat",
       );
-      expect(result.standardError).toContain(
-        "[shell] error CommandOptionsRefused: task's process service refused shell for echo\n",
+      expect(result.standardError.split("\n")).toContain(
+        "error: [shell] main.ts:7:27: CommandOptionsRefused: task's process service refused shell for echo",
       );
       expect(findMisprintedErrorLines(result.standardError)).toEqual([]);
     }),
   ),
+);
+
+export const missingWorkingDirectoryCheckedBeforeSpawn = makeTest(
+  "a command whose working directory doesn't exist is not spawned, so its CommandNotStarted cause is the check of that directory, while a spawn failure in an existing directory keeps Bun's own error",
+  Effect.gen(function* () {
+    const directory = yield* makeTemporaryDirectory();
+    const missing = yield* Task.exec("sh", ["-c", "true"], { cwd: `${directory}/missing` }).pipe(
+      failureAsValue,
+    );
+    expect(missing.message).toBe(
+      `the working directory ${directory}/missing doesn't exist\ncould not start sh`,
+    );
+    const checked = Predicate.hasProperty(missing.cause, "reason") ? missing.cause.reason : null;
+    const unusable = Predicate.hasProperty(checked, "cause") ? checked.cause : null;
+    expect(unusable).toBeInstanceOf(WorkingDirectoryUnusable);
+    expect(Predicate.hasProperty(unusable, "cause") ? unusable.cause : null).toMatchObject({
+      module: "FileSystem",
+      method: "stat",
+      pathOrDescriptor: `${directory}/missing`,
+    });
+    yield* Task.exec("sh", ["-c", `printf '' > '${directory}/not-executable'`]);
+    const notExecutable = yield* Task.exec(`${directory}/not-executable`, [], {
+      cwd: directory,
+    }).pipe(failureAsValue);
+    const spawnFailure = Predicate.hasProperty(notExecutable.cause, "reason")
+      ? notExecutable.cause.reason
+      : null;
+    expect(Predicate.hasProperty(spawnFailure, "cause") ? spawnFailure.cause : null).toMatchObject({
+      code: "EACCES",
+      syscall: "posix_spawn",
+    });
+  }),
+);
+
+export const workingDirectoryRemovedBetweenCheckAndSpawn = makeTest(
+  "a working directory removed after the check and before the spawn is named as the cause, with Bun's spawn error inside, while a spawn failure in a directory that still exists keeps Bun's error unchanged",
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const directory = yield* makeTemporaryDirectory();
+    const removed = `${directory}/removed`;
+    yield* fileSystem.makeDirectory(removed);
+    yield* checkWorkingDirectoryBeforeSpawn("true", directory, removed);
+    yield* fileSystem.remove(removed, { recursive: true });
+    const spawnFailure = yield* Effect.try({
+      try: () => Bun.spawn(["/usr/bin/true"], { cwd: removed }),
+      catch: (cause) =>
+        PlatformError.systemError({
+          _tag: "NotFound",
+          module: "ChildProcess",
+          method: "spawn",
+          pathOrDescriptor: "true",
+          description: String(cause),
+          cause,
+        }),
+    }).pipe(failureAsValue);
+    expect(spawnFailure.message).toContain("posix_spawn");
+    const blamed = yield* recheckWorkingDirectoryAfterSpawnFailure(
+      "true",
+      directory,
+      removed,
+      spawnFailure,
+    ).pipe(failureAsValue);
+    expect(blamed.message).toBe(
+      "NotFound: ChildProcess.spawn (true): the working directory removed doesn't exist",
+    );
+    expect(blamed.reason.cause).toBeInstanceOf(WorkingDirectoryUnusable);
+    expect(
+      Predicate.hasProperty(blamed.reason.cause, "cause") ? blamed.reason.cause.cause : null,
+    ).toBe(spawnFailure);
+    const kept = yield* recheckWorkingDirectoryAfterSpawnFailure(
+      "true",
+      directory,
+      directory,
+      spawnFailure,
+    ).pipe(failureAsValue);
+    expect(kept).toBe(spawnFailure);
+  }),
 );
 
 export const commandsThatCannotStart = makeTest(
@@ -427,19 +606,19 @@ export const missingProgram = Task.make({ name: "missing-program", run: Task.exe
 export const caught = Task.make({ name: "caught", run: Task.exec("sh", ["build.sh"], { cwd: "tool" }).pipe(
   Effect.catchTag("CommandNotStarted", (failure) => Effect.log(\`caught: \${failure.command}\`)),
 ) });
-export const started = Task.make({ name: "started", run: Task.exec("sh", ["build.sh"], { cwd: "tools" }) });
+export const started = Task.make({ name: "started", run: Task.exec("sh", ["build.sh"], { cwd: "tools", print: true }) });
 export default Task.make({ name: "main", run: Task.allSettled([missingDirectory, fileDirectory, missingProgram, caught, started]) });`,
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode, result.standardError).toBe(1);
       expect(result.standardError).toContain(
-        "[missing-directory] error CommandNotStarted: could not start sh: the working directory tool doesn't exist\n",
+        "error: [missing-directory] main.ts:3:82: WorkingDirectoryUnusable: the working directory tool doesn't exist\nerror: [missing-directory] could not start sh\n",
       );
       expect(result.standardError).toContain(
-        "[file-directory] error CommandNotStarted: could not start sh: the working directory a-file.txt is not a directory\n",
+        "error: [file-directory] main.ts:4:76: WorkingDirectoryUnusable: the working directory a-file.txt is not a directory\nerror: [file-directory] could not start sh\n",
       );
       expect(result.standardError).toContain(
-        '[missing-program] error CommandNotStarted: could not start no-such-program: Executable not found in $PATH: "no-such-program"\n',
+        'error: [missing-program] main.ts:5:78: Error: Executable not found in $PATH: "no-such-program"\nerror: [missing-program] could not start no-such-program\n',
       );
       expect(result.standardError).toContain("[caught] caught: sh\n");
       expect(result.standardError).toContain("[started] built\n");
@@ -449,7 +628,7 @@ export default Task.make({ name: "main", run: Task.allSettled([missingDirectory,
 );
 
 export const failingStandardInputStreams = makeTest(
-  "a standard input stream that fails or dies fails the run with CommandStandardInputFailed, next to CommandFailed when the command it stopped still exits non-zero, while a command that stops reading its standard input still passes",
+  "a standard input stream that fails or dies fails the run with its own error and says which command's standard input stream failed, next to CommandFailed when the command it stopped still exits non-zero, while a command that stops reading its standard input still passes",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -471,21 +650,26 @@ export default Task.make({ name: "main", run: Task.allSettled([failing, dying, d
       });
       const result = yield* runTaskProcess(project, "main.ts");
       expect(result.exitCode, result.standardError).toBe(1);
-      expect(result.standardError).toContain(
-        "[failing] error CommandStandardInputFailed: the standard input stream of cat failed with input file missing\n",
+      const lines = result.standardError.split("\n");
+      expect(lines).toContain(
+        "error: [failing] main.ts:4:36: PlatformError: NotFound: FileSystem.stream: input file missing",
       );
-      expect(result.standardError).toContain(
-        "[dying] error CommandStandardInputFailed: the standard input stream of cat failed with input stream died\n",
-      );
+      expect(lines).toContain("error: [failing] the standard input stream of cat failed");
+      expect(lines).toContain("error: [dying] main.ts:6:99: Error: input stream died");
+      expect(lines).toContain("error: [dying] the standard input stream of cat failed");
       expect(
-        result.standardError
-          .split("\n")
-          .filter((line) => line.startsWith("[dying-and-exiting] ") && line.includes(" error ")),
+        lines.filter((line) => line.startsWith("error: [dying-and-exiting] main.ts:")),
       ).toEqual([
-        "[dying-and-exiting] error CommandFailed: sh exited with code 3",
-        "[dying-and-exiting] error CommandStandardInputFailed: the standard input stream of sh failed with input stream died",
+        "error: [dying-and-exiting] main.ts:11:81: CommandFailed: sh exited with code 3",
+        "error: [dying-and-exiting] main.ts:10:39: Error: input stream died",
       ]);
-      expect(result.standardError).toMatch(/^\[stops-reading\] passed in /mu);
+      expect(lines).toContain("error: [dying-and-exiting] the standard input stream of sh failed");
+      expect(
+        readAttribute(
+          (yield* readTaskSpan(project, result, "stops-reading"))?.attributes ?? [],
+          "sshkeda_task.state",
+        ),
+      ).toBe("passed");
       expect(findMisprintedErrorLines(result.standardError)).toEqual([]);
     }),
   ),
@@ -494,6 +678,8 @@ export default Task.make({ name: "main", run: Task.allSettled([failing, dying, d
 const STANDARD_INPUT_CHUNK_BYTES = 65_536;
 
 const PROMPT_FAILURE_LIMIT_MILLISECONDS = 3000;
+
+const NANOSECONDS_PER_MILLISECOND = 1_000_000;
 
 const HELD_OUTPUT_FAILURE_LIMIT_MILLISECONDS = 20_000;
 
@@ -583,9 +769,9 @@ export default Task.make({ name: "main", run: Task.exec("cat", [], { stdin: Stre
       expect(
         result.standardError
           .split("\n")
-          .filter((line) => line.startsWith("[main] ") && line.includes(" error ")),
+          .filter((line) => line.startsWith("error: [main] main.ts:")),
       ).toEqual([
-        "[main] error CommandStandardInputFailed: the standard input stream of cat failed with the upstream socket closed",
+        "error: [main] main.ts:3:37: PlatformError: Unknown: Upstream.read: the upstream socket closed",
       ]);
     }),
   ),
@@ -620,14 +806,17 @@ export default Task.make({ name: "main", run: Task.allSettled([throughRunCommand
       expect(
         result.standardError
           .split("\n")
-          .filter((line) => line.startsWith("[through-") && line.includes(" error "))
+          .filter((line) => /^error: \[through-[a-z-]+\] main\.ts:/u.test(line))
           .toSorted(),
       ).toEqual([
-        "[through-run-command-after-exit] error CommandStandardInputFailed: the standard input stream of sh was interrupted without a failure",
-        "[through-run-command] error CommandStandardInputFailed: the standard input stream of cat was interrupted without a failure",
-        "[through-stream-after-exit] error CauseWithoutFailure: was interrupted without a failure",
-        "[through-stream] error CauseWithoutFailure: was interrupted without a failure",
+        "error: [through-run-command-after-exit] main.ts:13:105: CauseWithoutFailure: was interrupted without a failure",
+        "error: [through-run-command] main.ts:8:85: CauseWithoutFailure: was interrupted without a failure",
+        "error: [through-stream-after-exit] main.ts:14:44: CauseWithoutFailure: was interrupted without a failure",
+        "error: [through-stream] main.ts:9:35: CauseWithoutFailure: was interrupted without a failure",
       ]);
+      expect(result.standardError).toContain(
+        "error: [through-run-command] main.ts:8:85: CauseWithoutFailure: was interrupted without a failure\nerror: [through-run-command] the standard input stream of cat failed\n",
+      );
     }),
   ),
 );
@@ -648,7 +837,7 @@ export const standardInputFailureStopsCommand = makeTest(
       }).pipe(failureAsValue, Effect.timed);
       expect(Duration.toMillis(execElapsed)).toBeLessThan(PROMPT_FAILURE_LIMIT_MILLISECONDS);
       expect(execFailure.message).toBe(
-        "the standard input stream of sleep failed with input file missing",
+        "NotFound: FileSystem.stream: input file missing\nthe standard input stream of sleep failed",
       );
       const child = yield* ChildProcess.make("sleep", ["30"], {
         stdin: Stream.fail(
@@ -689,10 +878,8 @@ export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "trap 'slee
       expect(
         result.standardError
           .split("\n")
-          .filter((line) => line.startsWith("[main] ") && line.includes(" error ")),
-      ).toEqual([
-        "[main] error CommandStandardInputFailed: the standard input stream of sh failed with input stream died",
-      ]);
+          .filter((line) => line.startsWith("error: [main] main.ts:")),
+      ).toEqual(["error: [main] main.ts:6:39: Error: input stream died"]);
       expect(Duration.toMillis(elapsed)).toBeLessThan(HELD_OUTPUT_FAILURE_LIMIT_MILLISECONDS);
     }),
   ),
@@ -742,10 +929,10 @@ export default Task.make({ name: "main", run: Task.exec("cat", [], {
       expect(
         result.standardError
           .split("\n")
-          .filter((line) => line.startsWith("[main] ") && line.includes(" error ")),
+          .filter((line) => line.startsWith("error: [main] main.ts:")),
       ).toEqual([
-        "[main] error CommandStandardInputFailed: the standard input stream of cat failed with first input failure",
-        "[main] error CommandStandardInputFailed: the standard input stream of cat failed with second input failure",
+        "error: [main] main.ts:4:55: Error: first input failure",
+        "error: [main] main.ts:4:100: Error: second input failure",
       ]);
     }),
   ),
@@ -766,35 +953,65 @@ export const signalKilledCommandWithBackgroundChild = makeTest(
 );
 
 export const successfulCommandWithBackgroundChild = makeTest(
-  "a command that exits 0 returns at once with its output and ends the background child it left holding its output open, through Task.exec and through ChildProcess",
+  "a command that exits 0 returns its output at once with its default cleanup limit, after printing that its output was still open and that it sent SIGTERM to the background child it left, through Task.exec and through ChildProcess",
   Effect.scoped(
     Effect.gen(function* () {
-      const fileSystem = yield* FileSystem.FileSystem;
-      const directory = yield* makeTemporaryDirectory();
-      const [elapsed, output] = yield* Task.exec("sh", [
-        "-c",
-        `sleep 600 & echo $! > '${directory}/pid'; printf finished`,
-      ]).pipe(Effect.timed);
-      expect(Duration.toMillis(elapsed)).toBeLessThan(PROMPT_FAILURE_LIMIT_MILLISECONDS);
-      expect(output).toBe("finished");
-      expect(
-        yield* isProcessAlive(
-          Number((yield* fileSystem.readFileString(`${directory}/pid`)).trim()),
-        ),
-      ).toBe(false);
-      const [childElapsed, childOutput] = yield* ChildProcess.make("sh", [
-        "-c",
-        "sleep 600 & printf '%s finished' $!",
-      ]).pipe(
-        Effect.flatMap((child) => Stream.mkString(Stream.decodeText(child.stdout))),
-        Effect.timed,
+      const project = yield* makeProject({
+        "main.ts": `import { Effect, Stream } from "effect";
+import { ChildProcess } from "effect/process";
+import { Task } from "@sshkeda/task";
+export const exec = Task.make({ name: "exec", run: Task.exec("sh", ["-c", "sleep 600 & echo $! > exec-pid; printf finished"]).pipe(Effect.flatMap((output) => Effect.log(\`output: \${output}\`))) });
+export const child = Task.make({ name: "child", run: Effect.scoped(ChildProcess.make("sh", ["-c", "sleep 600 & echo $! > child-pid; printf finished"]).pipe(
+  Effect.flatMap((spawned) => Stream.mkString(Stream.decodeText(spawned.stdout))),
+  Effect.flatMap((output) => Effect.log(\`output: \${output}\`)),
+)) });
+export default Task.make({ name: "main", run: Task.all([exec, child]) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      yield* Effect.forEach(
+        ["exec", "child"],
+        (taskName) =>
+          Effect.gen(function* () {
+            const sleep = (yield* read(`${project.directory}/${taskName}-pid`)).trim();
+            expect(ran.standardError).toContain(
+              `warning: [${taskName}] sh exited, but its output was still open 100ms later, so @sshkeda/task sent SIGTERM to the processes it left in its process group: ${sleep} (sleep)\n`,
+            );
+            expect(ran.standardError).toContain(`[${taskName}] output: finished\n`);
+            const taskSpan = yield* readTaskSpan(project, ran, taskName);
+            expect(readAttribute(taskSpan?.attributes ?? [], "sshkeda_task.state")).toBe("passed");
+            expect(
+              (Number(taskSpan?.endTimeUnixNano) - Number(taskSpan?.startTimeUnixNano)) /
+                NANOSECONDS_PER_MILLISECOND,
+            ).toBeLessThan(PROMPT_FAILURE_LIMIT_MILLISECONDS);
+            expect(yield* isProcessAlive(Number(sleep))).toBe(false);
+          }),
+        { discard: true },
       );
-      expect(Duration.toMillis(childElapsed)).toBeLessThan(PROMPT_FAILURE_LIMIT_MILLISECONDS);
-      const [backgroundChild, finished] = childOutput.split(" ");
-      expect(finished).toBe("finished");
-      expect(yield* isProcessAlive(Number(backgroundChild))).toBe(false);
     }),
   ),
+);
+
+export const helperHoldingOutputAfterTheCommandExits = makeTest(
+  "a helper process that passes on a command's output and then keeps it open is named in the notice and sent SIGTERM, and everything it passed on before that is returned",
+  Effect.gen(function* () {
+    const project = yield* makeProject({
+      "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Task.exec("bash", ["-c", "exec > >(exec perl -e 'open my $f, q(>), q(helper-pid) or die; print $f $$; close $f; $| = 1; while (<STDIN>) { print qq([helper] $_) } sleep 600'); until [ -s helper-pid ]; do sleep 0.01; done; echo finished"]).pipe(Effect.flatMap((output) => Effect.log(\`output: \${output.trim()}\`))) });`,
+    });
+    const ran = yield* runTaskProcess(project, "main.ts");
+    expect(ran.exitCode, ran.standardError).toBe(0);
+    const helper = (yield* read(`${project.directory}/helper-pid`)).trim();
+    expect(ran.standardError).toMatch(
+      new RegExp(
+        `^warning: \\[main\\] bash exited, but its output was still open 100ms later, so @sshkeda/task sent SIGTERM to the processes it left in its process group: .*\\b${helper} \\(perl[^)]*\\)`,
+        "mu",
+      ),
+    );
+    expect(ran.standardError).toContain("[main] output: [helper] finished\n");
+    expect(yield* isProcessAlive(Number(helper))).toBe(false);
+  }),
 );
 
 export const successfulCommandWithEscapedBackgroundChild = makeTest(
@@ -915,12 +1132,39 @@ export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "trap '' TE
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(0);
       const sleep = (yield* read(`${project.directory}/pid`)).trim();
-      expect(ran.standardError).toContain(`killed ${sleep} (sleep), started by "main"`);
+      expect(ran.standardError).toContain(`killed: [main] ${sleep} (sleep)`);
       expect(ran.standardError).toContain("[main] output: finished");
       expect(yield* isProcessAlive(Number(sleep))).toBe(false);
     }),
   ),
   "30 seconds",
+);
+
+export const outputHeldUnderInfiniteCleanup = makeTest(
+  "with an infinite cleanup limit, Task.exec still returns the output of a command whose background child ignores SIGTERM or leaves its session and holds the output open, and the child is killed",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Duration, Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const ignoresTerm = Task.exec("sh", ["-c", "trap '' TERM; sleep 600 & echo $! > ignores-term-pid; printf ignored"]);
+const leavesSession = Task.exec("perl", ["-MPOSIX", "-e", "if (fork) { select(undef, undef, undef, 0.01) until -s 'left-session-pid'; print 'left'; exit } POSIX::setsid(); open my $file, '>', 'left-session-pid.tmp'; print $file $$; close $file; rename 'left-session-pid.tmp', 'left-session-pid'; sleep 600"]);
+export default Task.make({ name: "main", run: Effect.all([ignoresTerm, leavesSession]).pipe(Effect.flatMap((outputs) => Effect.log(\`outputs: \${outputs.join(" ")}\`))), cleanup: Duration.infinity });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(ran.standardError).toContain("[main] outputs: ignored left");
+      const ignoresTerm = (yield* read(`${project.directory}/ignores-term-pid`)).trim();
+      const leftSession = (yield* read(`${project.directory}/left-session-pid`)).trim();
+      expect(ran.standardError).toContain(`killed: [main] ${ignoresTerm} (sleep)`);
+      expect(ran.standardError).toContain(
+        "warning: [main] perl exited, but its output was still open 100ms later, and no process it left in its process group is still running, so another process holds it; @sshkeda/task waits up to 5s for it to close\n",
+      );
+      expect(yield* isProcessAlive(Number(ignoresTerm))).toBe(false);
+      expect(yield* isProcessAlive(Number(leftSession))).toBe(false);
+    }),
+  ),
+  "1 minute",
 );
 
 const MORE_CHARACTERS_THAN_ONE_STRING_HOLDS = 2_147_483_648;
@@ -936,8 +1180,8 @@ export default Task.make({ name: "main", run: Effect.asVoid(Task.exec("sh", ["-c
       });
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(1);
-      expect(ran.standardError).toContain(
-        "[main] error CommandOutputTooLong: the standard output of sh is too long to hold in one string\n",
+      expect(ran.standardError.split("\n")).toContain(
+        "error: [main] main.ts:3:21: CommandOutputTooLong: the standard output of sh is too long to hold in one string",
       );
       expect(findMisprintedErrorLines(ran.standardError)).toEqual([]);
     }),

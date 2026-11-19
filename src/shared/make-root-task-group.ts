@@ -2,14 +2,17 @@ import { Effect, Ref } from "effect";
 
 import { TaskNotMadeWhileLoading } from "../lib/errors/index.ts";
 import { all, allSettled, make } from "../lib/task/index.ts";
-import { findTasksMadeWithName } from "./record-tasks-made.ts";
+import { findTasksMadeWithName, recordTaskMadeIn } from "./record-tasks-made.ts";
 import type { RootTaskGroup } from "./root-task-group.ts";
 
 const RUN_TASK_LIST = { all, allSettled } as const;
 
 const rootTaskGroupMade = Ref.makeUnsafe(false);
 
-export const makeRootTaskGroup = (rootTaskGroup: typeof RootTaskGroup.Type | null) =>
+export const makeRootTaskGroup = (
+  rootTaskGroup: typeof RootTaskGroup.Type | null,
+  rootTaskFilePath: string,
+) =>
   Effect.gen(function* () {
     if (rootTaskGroup === null) {
       return;
@@ -23,7 +26,7 @@ export const makeRootTaskGroup = (rootTaskGroup: typeof RootTaskGroup.Type | nul
     const listedTasks = rootTaskGroup.taskNames.flatMap((taskName) =>
       findTasksMadeWithName(taskName).slice(0, 1),
     );
-    return make({
+    const rootTask = make({
       name: rootTaskGroup.name,
       run: Effect.gen(function* () {
         if (missingTaskName !== undefined) {
@@ -37,4 +40,5 @@ export const makeRootTaskGroup = (rootTaskGroup: typeof RootTaskGroup.Type | nul
         });
       }),
     });
+    return recordTaskMadeIn(rootTask, rootTaskFilePath);
   });

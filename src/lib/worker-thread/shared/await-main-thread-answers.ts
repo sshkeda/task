@@ -14,7 +14,7 @@ const dieUnlessAnswered = dieOnInvariantFailure(
   "the main thread answers each request the worker makes",
 );
 
-export const makeMainThreadAnswers = Effect.fn("makeMainThreadAnswers")(function* (
+export const makeMainThreadAnswers = Effect.fn(function* (
   mainThread: RpcClient.FromGroup<typeof MainThreadRpcs, RpcClientError.RpcClientError>,
   reportToMainThread: (event: typeof TaskEvent.Type) => Effect.Effect<void>,
   forkInWorkerScope: (effect: Effect.Effect<void>) => Effect.Effect<Fiber.Fiber<void>>,

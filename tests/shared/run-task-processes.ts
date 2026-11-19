@@ -36,6 +36,29 @@ export const makeTaskProcessEnvironment = (
     };
   });
 
+const waitForWritten =
+  (chunks: Queue.Queue<string, Cause.Done>, captured: Ref.Ref<Chunk.Chunk<string>>) =>
+  (wanted: string) =>
+    Stream.fromEffectRepeat(Queue.take(chunks)).pipe(
+      Stream.scan(
+        () => "",
+        (written: string, chunk: string) => written + chunk,
+      ),
+      Stream.filter((written) => written.includes(wanted)),
+      Stream.runHead,
+      Effect.flatMap(
+        Option.match({
+          onNone: () =>
+            Ref.get(captured).pipe(
+              Effect.flatMap((written) =>
+                Effect.fail(new NeverPrinted({ wanted, seen: Chunk.join(written, "") })),
+              ),
+            ),
+          onSome: Effect.succeed,
+        }),
+      ),
+    );
+
 export const startTaskProcess = (
   project: Effect.Success<ReturnType<typeof makeProjectUsingTaskFrom>>,
   file: string,
@@ -72,27 +95,38 @@ export const startTaskProcess = (
               `stdout:\n${Chunk.join(yield* Ref.get(capturedOutput), "")}\nstderr:\n${Chunk.join(yield* Ref.get(capturedErrors), "")}`,
             );
             yield* Effect.log(
-              `kept failure artifacts: output ${outputFilePath}, traces ${project.home}/${TASK_STATE_DIRECTORY_NAME}/traces`,
+              `kept failure artifacts: output ${outputFilePath}, runs ${project.home}/${TASK_STATE_DIRECTORY_NAME}/runs`,
             );
-          }).pipe(failTestCleanup("preserve failed child output and traces")),
+          }).pipe(failTestCleanup("preserve failed child output and runs")),
     );
+    const outputChunks = yield* Queue.unbounded<string, Cause.Done>();
     const output = yield* child.stdout.pipe(
       Stream.decodeText,
-      Stream.runForEach((outputChunk) => Ref.update(capturedOutput, Chunk.append(outputChunk))),
+      Stream.runForEach((outputChunk) =>
+        Ref.update(capturedOutput, Chunk.append(outputChunk)).pipe(
+          Effect.andThen(Queue.offer(outputChunks, outputChunk)),
+        ),
+      ),
+      Effect.ensuring(Queue.end(outputChunks)),
 
       Effect.forkScoped,
     );
     const lines = yield* Queue.unbounded<string, Cause.Done>();
     const printed = yield* Ref.make(Chunk.empty<string>());
+    const errorChunks = yield* Queue.unbounded<string, Cause.Done>();
     const errors = yield* child.stderr.pipe(
       Stream.decodeText,
-      Stream.tap((errorChunk) => Ref.update(capturedErrors, Chunk.append(errorChunk))),
+      Stream.tap((errorChunk) =>
+        Ref.update(capturedErrors, Chunk.append(errorChunk)).pipe(
+          Effect.andThen(Queue.offer(errorChunks, errorChunk)),
+        ),
+      ),
       Stream.splitLines,
       Stream.runForEach((line) =>
         Ref.update(printed, Chunk.append(line)).pipe(Effect.andThen(Queue.offer(lines, line))),
       ),
       Effect.tapError((failure) => Effect.logError("Failed to read test child stderr", failure)),
-      Effect.ensuring(Queue.end(lines)),
+      Effect.ensuring(Queue.end(lines).pipe(Effect.andThen(Queue.end(errorChunks)))),
       Effect.forkScoped,
     );
 
@@ -114,8 +148,40 @@ export const startTaskProcess = (
             }),
           ),
         ),
+      waitForLines: (wanted: readonly string[]) =>
+        Stream.fromEffectRepeat(Queue.take(lines)).pipe(
+          Stream.scan(
+            () => wanted,
+            (missing: readonly string[], line: string) =>
+              missing.filter((part) => !line.includes(part)),
+          ),
+          Stream.filter((missing) => missing.length === 0),
+          Stream.runHead,
+          Effect.flatMap(
+            Option.match({
+              onNone: () =>
+                Ref.get(printed).pipe(
+                  Effect.flatMap((printedLines) =>
+                    Effect.fail(
+                      new NeverPrinted({
+                        wanted: wanted.join(" and "),
+                        seen: Chunk.join(printedLines, "\n"),
+                      }),
+                    ),
+                  ),
+                ),
+              onSome: () => Effect.void,
+            }),
+          ),
+        ),
+      waitForStandardOutput: waitForWritten(outputChunks, capturedOutput),
+      waitForStandardError: waitForWritten(errorChunks, capturedErrors),
       sendSignal: (name: "HUP" | "INT" | "KILL" | "TERM") =>
         Effect.sync(() => process.kill(child.pid, `SIG${name}`)),
+      waitForStandardErrorToClose: Fiber.join(errors).pipe(
+        Effect.andThen(Ref.get(printed)),
+        Effect.map((printedLines) => Chunk.join(printedLines, "\n")),
+      ),
       waitForExit: Effect.gen(function* () {
         const exitCode = Number(yield* child.exitCode);
         yield* Fiber.join(output);
