@@ -368,7 +368,7 @@ process.exitCode = await shell.exited;`,
 );
 
 export const longCommandOutput = makeTest(
-  "a failed command with long output prints each of its lines once, when the command fails, its error names its file instead of repeating them, and its recap repeats only its first line and its last two, whether or not SSHKEDA_TASK_LOG=error, while the trace keeps the error",
+  "a failed command with long output prints each of its lines once, when the command fails, its error names its file instead of repeating them, and its recap repeats only its first line, a note counting the lines it leaves out, and its last two, whether or not SSHKEDA_TASK_LOG=error, while the trace keeps the error",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -384,7 +384,7 @@ export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "seq -f 're
       const recapLines = [
         `recap: [main] 1.output | main.ts:2:52: CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}`,
         "recap: [main] report line 01",
-        "recap: [main] …",
+        "recap: [main] (44 lines are not shown)",
         `recap: [main] warning ${String(LONG_STANDARD_ERROR_LINES - 1)}`,
         `recap: [main] warning ${String(LONG_STANDARD_ERROR_LINES)}`,
       ];
@@ -1335,7 +1335,7 @@ export default Task.make({ name: "main", run: Effect.tryPromise(() => fetch(\`ht
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toMatch(
-        /^run: \S+\/\nerror: \[main\] main\.ts:6:21: UnknownError: An error occurred in Effect\.tryPromise\nerror: \[main\] caused by TypeError: ECONNREFUSED: Unable to connect\. Is the computer able to access the url\?\nerror: \[main\] its output is in \S+\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:6:21: UnknownError: An error occurred in Effect\.tryPromise\nfailed: /u,
+        /^run: \S+\/\nerror: \[main\] main\.ts:6:21: UnknownError: An error occurred in Effect\.tryPromise\nerror: \[main\] caused by TypeError: ECONNREFUSED: Unable to connect\. Is the computer able to access the url\?\nerror: \[main\] its output is in \S+\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:6:21: UnknownError: An error occurred in Effect\.tryPromise\nrecap: \[main\] caused by TypeError: ECONNREFUSED: Unable to connect\. Is the computer able to access the url\?\nfailed: /u,
       );
     }),
   ),
@@ -1904,7 +1904,7 @@ export const failureReasonOfUncaughtFailure = makeTest(
 );
 
 export const failureReasonOfMultiLineMessage = makeTest(
-  "the error of a multi-line message prints its headline and then each later line as an error line, without trailing blank lines",
+  "the error of a multi-line message prints its headline and then each later line as an error line, without trailing blank lines, and its recap repeats its non-blank lines",
   Effect.scoped(
     Effect.gen(function* () {
       const ran = yield* runFailureReasonProject(
@@ -1920,6 +1920,8 @@ export const failureReasonOfMultiLineMessage = makeTest(
         MAIN_OUTPUT_FILE_LINE,
         endedLineOf("main", "failed"),
         recapLineOf(`error: ${ROOT_TASK_FAILURE_PREFIX}: EvidenceRejected: first line`, "1.output"),
+        "recap: [main]   second line",
+        "recap: [main] third line",
       ]);
     }),
   ),
@@ -2033,7 +2035,7 @@ export default Task.make({ name: "main", run: Effect.fail(new ReportedErrors({ r
 );
 
 export const failureReasonOfLongMessage = makeTest(
-  "the error line keeps the whole first line of a long message",
+  "the error line keeps the whole first line of a long message, and its recap cuts it with a note counting what it leaves out",
   Effect.scoped(
     Effect.gen(function* () {
       const ran = yield* runFailureReasonProject(
@@ -2045,8 +2047,9 @@ export const failureReasonOfLongMessage = makeTest(
         `error: ${ROOT_TASK_FAILURE_PREFIX}: EvidenceRejected: ${"0".repeat(PRINTED_ZERO_COUNT)}`,
         MAIN_OUTPUT_FILE_LINE,
       ]);
-      expect(countOccurrences(ran.standardError, "0".repeat(PRINTED_ZERO_COUNT))).toBe(
-        ERROR_AND_RECAP_LINES,
+      expect(countOccurrences(ran.standardError, "0".repeat(PRINTED_ZERO_COUNT))).toBe(1);
+      expect(ran.standardError).toMatch(
+        /^recap: \[main\] 1\.output \| .+ \(\d+ more characters are not shown\)$/mu,
       );
     }),
   ),

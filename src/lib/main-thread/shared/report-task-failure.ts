@@ -1,4 +1,4 @@
-import { Cause, Effect, Predicate } from "effect";
+import { Cause, Effect, Predicate, Struct } from "effect";
 
 import {
   describeErrorLines,
@@ -6,6 +6,7 @@ import {
   listErrorLines,
 } from "../../../shared/format-error-lines.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
+import { describeLinesNotShown, recapLine } from "../../../shared/recap-entries.ts";
 import { reportCause } from "../../../shared/report-cause.ts";
 import { failureValuesOfReason } from "../../../shared/select-cause-reasons.ts";
 import { isAwaitedTasksFailurePrintable } from "../../../shared/task-errors.ts";
@@ -32,6 +33,26 @@ const failureEntriesOfItsOwn = (cause: Cause.Cause<unknown>) => {
     .filter((entry) => entry.printables.length > 0);
 };
 
+const MOST_RECAPPED_ERROR_LINES = 10;
+
+const recapErrorLines = (detailLines: readonly string[]) => {
+  const nonBlankIndexes = detailLines.flatMap((line, index) => (/\S/u.test(line) ? [index] : []));
+  const shownIndexes = nonBlankIndexes.slice(0, MOST_RECAPPED_ERROR_LINES);
+  const linesNotShown = (nonBlankIndexes.at(-1) ?? 0) - (shownIndexes.at(-1) ?? 0);
+  return [
+    ...shownIndexes.map((index) => detailLines[index] ?? ""),
+    ...(linesNotShown > 0 ? [describeLinesNotShown(linesNotShown)] : []),
+  ];
+};
+
+const recapError = (error: PrintableError) => {
+  const [firstLine = "", ...detailLines] = describeErrorLines(Struct.omit(error, ["context"]));
+  return {
+    text: recapLine(firstLine),
+    outputLines: error.outputLines ?? recapErrorLines(detailLines),
+  };
+};
+
 const printTaskErrors = Effect.fn(function* (
   taskName: string,
   printables: readonly PrintableError[],
@@ -42,13 +63,7 @@ const printTaskErrors = Effect.fn(function* (
   const shutdown = yield* StopState;
   const located = yield* shutdown.locatePrintables(taskName, printables);
   const lastError = located.at(-1);
-  const recap =
-    lastError === undefined
-      ? undefined
-      : {
-          text: describeErrorLines(lastError)[0] ?? "",
-          outputLines: lastError.outputLines ?? [],
-        };
+  const recap = lastError === undefined ? undefined : recapError(lastError);
   yield* TaskOutputFiles.use((taskOutputFiles) =>
     taskOutputFiles.printTaskErrors(taskName, listErrorLines(located, taskName), recap),
   );

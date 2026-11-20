@@ -176,7 +176,7 @@ export class BrokenTasksFound extends Schema.TaggedError<BrokenTasksFound>()("Br
   violations: Schema.NonEmptyArray(TaskDefinitionViolation),
 }) {
   public get reportedErrors() {
-    return Arrays.map(this.violations, reportError);
+    return Arrays.map(this.violations, (violation) => reportError(violation));
   }
   public override get message() {
     return `found ${this.violations.length} task definition ${this.violations.length === 1 ? "violation" : "violations"}`;

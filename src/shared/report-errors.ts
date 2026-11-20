@@ -11,6 +11,8 @@ import {
 import type { PrintableError } from "../lib/errors/index.ts";
 import { cutToGraphemes } from "./cut-to-graphemes.ts";
 import { TASK_ERROR_FIELDS } from "./error-fields.ts";
+import { readNestedRecapLines } from "./nested-recap-lines.ts";
+import { selectRecapOutputLines } from "./recap-output-lines.ts";
 import { TASK_PACKAGE } from "./task-package.ts";
 
 export const attributeUnplacedToTask = (printable: PrintableError, taskName: string) => {
@@ -28,25 +30,47 @@ export const TaskRaisedError = Schema.Struct({
   location: Schema.optional(Schema.String),
   filePath: Schema.optional(Schema.String),
   taskName: Schema.optional(Schema.NullOr(Schema.String)),
-  recapOutputLines: Schema.optional(Schema.Array(Schema.NullOr(Schema.String))),
 });
+
+const FailedCommandOutput = Schema.TaggedStruct("CommandFailed", {
+  raisedBy: Schema.Literal(TASK_PACKAGE.name),
+  standardOutput: Schema.String,
+  standardError: Schema.String,
+});
+
+export const recapCommandOutput = (failed: { readonly cause?: unknown }) =>
+  Option.map(Schema.decodeUnknownOption(FailedCommandOutput)(failed.cause), (command) => {
+    const [firstLine, ...laterLines] = selectRecapOutputLines([
+      command.standardOutput,
+      command.standardError,
+    ]);
+    const nestedRecapLines = Predicate.isObject(failed.cause)
+      ? readNestedRecapLines(failed.cause)
+      : [];
+    return firstLine === undefined
+      ? nestedRecapLines
+      : [firstLine, ...nestedRecapLines, ...laterLines];
+  });
 
 const printedMessageOf = (error: typeof TaskRaisedError.Type) => {
   const message = error.printedMessage ?? error.message;
   return message === "" ? error.name : message;
 };
 
-export const reportError = (error: typeof TaskRaisedError.Type): PrintableError => {
+export const reportError = (
+  error: typeof TaskRaisedError.Type,
+  recapped: Option.Option<readonly string[]> = Option.none(),
+): PrintableError => {
   const location = error.location ?? error.filePath;
   const taskName = location === undefined ? (error.taskName ?? undefined) : undefined;
-  const outputLines = error.recapOutputLines ?? [];
+  const outputLines = Option.getOrUndefined(recapped);
   return {
     tag: error.name,
     raisedBy: error.raisedBy,
     ...(location === undefined ? {} : { location }),
     ...(taskName === undefined ? {} : { taskName }),
     message: printedMessageOf(error),
-    ...(outputLines.length === 0 ? {} : { outputLines }),
+    ...(outputLines === undefined ? {} : { outputLines }),
   };
 };
 

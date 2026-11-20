@@ -1,7 +1,5 @@
-import {
-  cutRecapOutputLine,
-  RECAPPED_OUTPUT_LINE_READ_LIMIT,
-} from "../../../shared/cut-recap-output-line.ts";
+import { countLineBreaks } from "./count-line-breaks.ts";
+import { describeLinesNotShown, recapLine } from "./recap-entries.ts";
 
 const placeLineAround = (text: string, stream: number, index: number) => ({
   stream,
@@ -57,7 +55,28 @@ const isLaterLine = (
   line !== null &&
   (line.stream > than.stream || (line.stream === than.stream && line.start > than.start));
 
-export const selectRecapOutputLines = (outputs: readonly string[]) => {
+const countLines = (text: string) =>
+  text === "" ? 0 : countLineBreaks(text) + (/[\r\n]$/u.test(text) ? 0 : 1);
+
+const countLinesBetween = (
+  outputs: readonly string[],
+  after: ReturnType<typeof placeLineAround>,
+  before: ReturnType<typeof placeLineAround>,
+) => {
+  const textOf = (stream: number) => outputs[stream] ?? "";
+  if (after.stream === before.stream) {
+    return countLineBreaks(textOf(after.stream).slice(after.end, before.start)) - 1;
+  }
+  const restOfItsStream = Math.max(countLines(textOf(after.stream).slice(after.end)) - 1, 0);
+  const streamsBetween = outputs
+    .slice(after.stream + 1, before.stream)
+    .reduce((lineCount, text) => lineCount + countLines(text), 0);
+  return (
+    restOfItsStream + streamsBetween + countLineBreaks(textOf(before.stream).slice(0, before.start))
+  );
+};
+
+export const selectRecapOutputLines = (outputs: readonly string[]): readonly string[] => {
   const first = findNextLine(outputs, 0, 0);
   if (first === null) {
     return [];
@@ -69,16 +88,12 @@ export const selectRecapOutputLines = (outputs: readonly string[]) => {
   const beforeLast = isLaterLine(beforeLastFound, first) ? beforeLastFound : null;
   const lastLines = [beforeLast, last].filter((line) => line !== null);
   const afterFirst = findNextLine(outputs, first.stream, first.end);
-  const hasSkippedLines =
+  const skipsALine =
     beforeLast !== null && afterFirst !== null && !isSameLine(afterFirst, beforeLast);
-  return [first, ...(hasSkippedLines ? [null] : []), ...lastLines].map((line) =>
-    line === null
-      ? null
-      : cutRecapOutputLine(
-          (outputs[line.stream] ?? "").slice(
-            line.start,
-            Math.min(line.end, line.start + RECAPPED_OUTPUT_LINE_READ_LIMIT),
-          ),
-        ),
-  );
+  const skipped = skipsALine
+    ? [describeLinesNotShown(countLinesBetween(outputs, first, beforeLast))]
+    : [];
+  const take = (line: ReturnType<typeof placeLineAround>) =>
+    recapLine(outputs[line.stream] ?? "", line.start, line.end);
+  return [take(first), ...skipped, ...lastLines.map((line) => take(line))];
 };
