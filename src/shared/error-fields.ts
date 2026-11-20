@@ -19,5 +19,5 @@ export const PRINTABLE_ERROR_FIELDS = {
   taskName: Schema.optionalKey(Schema.String),
   message: Schema.String,
   context: Schema.optionalKey(Schema.Array(Schema.String)),
-  outputLines: Schema.optionalKey(Schema.Array(Schema.NullOr(Schema.String))),
+  outputLines: Schema.optionalKey(Schema.Array(Schema.String)),
 };

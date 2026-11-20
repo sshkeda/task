@@ -2,6 +2,8 @@ import { expect } from "bun:test";
 
 import { Effect, FileSystem } from "effect";
 
+import { formatRecapLines } from "../../src/lib/main-thread/shared/format-recap-lines.ts";
+import { countLineBreaks, countLineFeeds } from "../../src/shared/count-line-breaks.ts";
 import { nameTask } from "../../src/shared/label-lines.ts";
 import { countOccurrences } from "../shared/count-occurrences.ts";
 import { EXIT_CODE_AFTER_SIGINT } from "../shared/exit-codes-after-stop-signals.ts";
@@ -21,6 +23,8 @@ const FAILED_COMMAND_EXIT_CODE = 3;
 
 const IN_THE_ERROR_AND_THE_RECAP = 2;
 
+const RECAP_LINES_OF_TWO_LINE_ERROR = 2;
+
 const linesOf = (standardError: string) => withSecondsNamed(standardError).trimEnd().split("\n");
 
 const expectTheRunToEndWith = (standardError: string, lastLines: string[]) => {
@@ -39,7 +43,7 @@ const findSummaryIndex = (standardError: string) =>
   linesOf(standardError).findLastIndex((line) => /^(?:passed|failed|stopped): /u.test(line));
 
 export const oneFailedTask = makeTest(
-  "a failed run recaps its failed task right before the summary with one recap line naming its output file and the first line of its error, prints each error line once, and repeats nothing else of the error",
+  "a failed run recaps its failed task right before the summary with a recap line naming its output file and the first line of its error, then the error's next lines, and prints each error line once",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -59,14 +63,15 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       expectTheRunToEndWith(ran.standardError, [
         "ended: [main], <seconds>, failed",
         "recap: [main] 1.output | main.ts:6:17: TaskError: the check failed",
+        "recap: [main] see above",
         "failed: [main] (1 of 1 task), <seconds>",
         `run: ${runDirectoryPath}/`,
       ]);
       expect(countOccurrences(ran.standardError, `${errorLine}\n`)).toBe(1);
       expect(countOccurrences(ran.standardError, `${pointerLine}\n`)).toBe(1);
-      expect(countOccurrences(ran.standardError, "recap: ")).toBe(1);
+      expect(countOccurrences(ran.standardError, "recap: ")).toBe(RECAP_LINES_OF_TWO_LINE_ERROR);
       expectEachErrorLineOnce(ran.standardError);
-      expect(countOccurrences(ran.standardError, "see above")).toBe(1);
+      expect(countOccurrences(ran.standardError, "see above")).toBe(IN_THE_ERROR_AND_THE_RECAP);
       expect(countOccurrences(ran.standardError, "[main] checked")).toBe(1);
     }),
   ),
@@ -516,7 +521,7 @@ export const cleanupFailureIsRepeated = makeTest(
 );
 
 export const multiLineErrorNameIsSplit = makeTest(
-  "an error whose name spans lines prints each of its lines as its own error line, and its recap is the first line alone",
+  "an error whose name spans lines prints each of its lines as its own error line, and its recap repeats them",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -544,6 +549,7 @@ export default Task.make({ name: "main", run: Effect.fail(error) });`,
       expectTheRunToEndWith(standardError, [
         "ended: [main], <seconds>, failed",
         "recap: [main] 1.output | main.ts:3:19: Custom",
+        "recap: [main] error: [main] inner: broke",
         "failed: [main] (1 of 1 task), <seconds>",
         `run: ${runDirectoryPath}/`,
       ]);
@@ -572,7 +578,7 @@ export default Task.make({ name: "main", run: Task.exec("sh", ["script.sh"]${exe
   });
 
 export const failedCommandRecapsItsFirstAndLastLines = makeTest(
-  "a failed command's recap prints its first non-empty line, a … line and its last two non-empty lines, taking standard output's lines before standard error's",
+  "a failed command's recap prints its first non-empty line, a note counting the lines between that it leaves out, and its last two non-empty lines, taking standard output's lines before standard error's",
   Effect.scoped(
     Effect.gen(function* () {
       expect(
@@ -581,7 +587,7 @@ export const failedCommandRecapsItsFirstAndLastLines = makeTest(
         ),
       ).toEqual([
         "recap: [main] first",
-        "recap: [main] …",
+        "recap: [main] (2 lines are not shown)",
         "recap: [main] third",
         "recap: [main] fourth",
       ]);
@@ -615,7 +621,7 @@ export const nestedFailureRecap = makeTest(
         "recap: [main] run: <nested run>/",
         "recap: [main] [inner] 1.output | inner.ts:2:53: CommandFailed: sh exited with code 1",
         "recap: [main] [inner] bad",
-        "recap: [main] …",
+        "recap: [main] (6 lines are not shown)",
         "recap: [main] failed: [inner] (1 of 1 task), <seconds>",
         "recap: [main] run: <nested run>/",
       ]);
@@ -641,10 +647,10 @@ export const threeLevelFailureRecap = makeTest(
         "recap: [main] [middle] run: <nested run>/",
         "recap: [main] [middle] [inner] 1.output | inner.ts:2:53: CommandFailed: sh exited with code 1",
         "recap: [main] [middle] [inner] bad",
-        "recap: [main] [middle] …",
+        "recap: [main] [middle] (6 lines are not shown)",
         "recap: [main] [middle] failed: [inner] (1 of 1 task), <seconds>",
         "recap: [main] [middle] run: <nested run>/",
-        "recap: [main] …",
+        "recap: [main] (19 lines are not shown)",
         "recap: [main] failed: [middle] (1 of 1 task), <seconds>",
         "recap: [main] run: <nested run>/",
       ]);
@@ -679,7 +685,7 @@ export const wrappedNestedFailureRecap = makeTest(
 );
 
 export const longFailureRecapIsCut = makeTest(
-  "a recap file of more than 20 lines recaps its first 20 and a … line",
+  "a recap file of more than 20 lines recaps its first 20 and a note counting the rest",
   Effect.scoped(
     Effect.gen(function* () {
       const recapLines = yield* runFailingScript(
@@ -692,7 +698,7 @@ echo out`,
           { length: MAX_NESTED_RECAP_LINES },
           (_unused, index) => `recap: [main] line ${index + 1}`,
         ),
-        "recap: [main] …",
+        "recap: [main] (5 nested recap lines are not shown)",
       ]);
     }),
   ),
@@ -709,7 +715,7 @@ printf 'second\nthird\nfourth\n' >&2`,
         ),
       ).toEqual([
         "recap: [main] first",
-        "recap: [main] …",
+        "recap: [main] (1 line is not shown)",
         "recap: [main] third",
         "recap: [main] fourth",
       ]);
@@ -769,7 +775,7 @@ export default Task.make({ name: "inner", run: Effect.log("recap path " + proces
 );
 
 export const failedCommandRecapsFewLines = makeTest(
-  "a failed command that wrote one, two or three non-empty lines recaps all of them with no … line, and one that wrote nothing recaps only its error",
+  "a failed command that wrote one, two or three non-empty lines recaps all of them with no note, and one that wrote nothing recaps only its error",
   Effect.scoped(
     Effect.gen(function* () {
       expect(yield* runFailingScript("")).toEqual([]);
@@ -788,12 +794,12 @@ export const failedCommandRecapsFewLines = makeTest(
 );
 
 export const failedCommandRecapsOneStream = makeTest(
-  "a failed command that wrote only to standard output, or only to standard error, recaps that stream's first line, a … line and its last two",
+  "a failed command that wrote only to standard output, or only to standard error, recaps that stream's first line, a note counting the lines it leaves out, and its last two",
   Effect.scoped(
     Effect.gen(function* () {
       const fiveLines = [
         "recap: [main] 1",
-        "recap: [main] …",
+        "recap: [main] (2 lines are not shown)",
         "recap: [main] 4",
         "recap: [main] 5",
       ];
@@ -811,8 +817,18 @@ const COMBINING_MARKS_AFTER_ONE_LETTER = 300;
 
 const CONTROL_CHARACTERS_THAT_ESCAPE_PAST_THE_CUT = 60;
 
+const CONTROL_CHARACTERS_SHOWN_ESCAPED = 27;
+
+const roomBeforeTheNote = (lineLength: number) =>
+  MOST_CODE_UNITS_OF_A_RECAPPED_LINE -
+  ` (${String(lineLength)} more characters are not shown)`.length;
+
+const COMBINING_MARKS_SHOWN = roomBeforeTheNote(COMBINING_MARKS_AFTER_ONE_LETTER + 1) - 1;
+
+const LONG_OUTPUT_LINE_SHOWN = roomBeforeTheNote(LONG_OUTPUT_LINE_LENGTH);
+
 export const failedCommandRecapEscapesAndCuts = makeTest(
-  "a failed command's recapped lines escape control characters and every character a reader may take as a line break, and are cut to 200 code units ending in …, however few characters those units make, also when only escaping makes a line that long",
+  "a failed command's recapped lines escape control characters and every character a reader may take as a line break, and are cut to 200 code units with their note, never inside an escape, the note counting the code units left out, however few characters those units make, also when only escaping makes a line that long",
   Effect.scoped(
     Effect.gen(function* () {
       expect(
@@ -821,9 +837,9 @@ export const failedCommandRecapEscapesAndCuts = makeTest(
         ),
       ).toEqual([
         String.raw`recap: [main] tab\there\u001B[31mred`,
-        "recap: [main] …",
-        `recap: [main] a${"́".repeat(MOST_CODE_UNITS_OF_A_RECAPPED_LINE - 1 - 1)}…`,
-        `recap: [main] ${"0".repeat(MOST_CODE_UNITS_OF_A_RECAPPED_LINE - 1)}…`,
+        "recap: [main] (1 line is not shown)",
+        `recap: [main] a${"́".repeat(COMBINING_MARKS_SHOWN)} (${String(COMBINING_MARKS_AFTER_ONE_LETTER - COMBINING_MARKS_SHOWN)} more characters are not shown)`,
+        `recap: [main] ${"0".repeat(LONG_OUTPUT_LINE_SHOWN)} (${String(LONG_OUTPUT_LINE_LENGTH - LONG_OUTPUT_LINE_SHOWN)} more characters are not shown)`,
       ]);
       expect(
         yield* runFailingScript(
@@ -837,7 +853,7 @@ export const failedCommandRecapEscapesAndCuts = makeTest(
           String.raw`printf '%0${CONTROL_CHARACTERS_THAT_ESCAPE_PAST_THE_CUT}d\n' 0 | tr 0 '\001'`,
         ),
       ).toEqual([
-        `recap: [main] ${String.raw`\u0001`.repeat(CONTROL_CHARACTERS_THAT_ESCAPE_PAST_THE_CUT).slice(0, MOST_CODE_UNITS_OF_A_RECAPPED_LINE - 1)}…`,
+        `recap: [main] ${String.raw`\u0001`.repeat(CONTROL_CHARACTERS_SHOWN_ESCAPED)} (${String(CONTROL_CHARACTERS_THAT_ESCAPE_PAST_THE_CUT - CONTROL_CHARACTERS_SHOWN_ESCAPED)} more characters are not shown)`,
       ]);
     }),
   ),
@@ -931,7 +947,7 @@ export default Task.make({ name: "main", run: Task.exec("sh", ["-c", "seq 1 5; e
       expect(recapLinesOf(ran.standardError)).toEqual([
         `recap: [main] 1.output | main.ts:2:52: CommandFailed: sh exited with code ${FAILED_COMMAND_EXIT_CODE}`,
         "recap: [main] 1",
-        "recap: [main] …",
+        "recap: [main] (2 lines are not shown)",
         "recap: [main] 4",
         "recap: [main] 5",
       ]);
@@ -989,6 +1005,188 @@ export default Task.make({ name: "main", run: Task.allSettled([${TASKS_IN_FAILED
         ),
         ran.standardError,
       ).toEqual([...TASKS_IN_FAILED_LINE_ORDER]);
+    }),
+  ),
+);
+
+export const longErrorRecap = makeTest(
+  "an error of many lines recaps its first line, its next ten non-blank lines and a note counting the lines after them",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.die(new Error(["differs", "+ actual - expected", "", "  [", "    {", "      current: null,", "      model: 'fast',", "+     refused: null,", "-     refused: 'broken',", "      speed: 'fast'", "    },", "    {", "      current: null,", "      model: 'standard',"].join("\\n"))) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(recapLinesOf(ran.standardError), ran.standardError).toEqual([
+        "recap: [main] 1.output | main.ts:3:62: Error: differs",
+        "recap: [main] + actual - expected",
+        "recap: [main]   [",
+        "recap: [main]     {",
+        "recap: [main]       current: null,",
+        "recap: [main]       model: 'fast',",
+        "recap: [main] +     refused: null,",
+        "recap: [main] -     refused: 'broken',",
+        "recap: [main]       speed: 'fast'",
+        "recap: [main]     },",
+        "recap: [main]     {",
+        "recap: [main] (2 lines are not shown)",
+      ]);
+    }),
+  ),
+);
+
+const FAILED_INNER_TASKS = 25;
+
+const INNER_RECAP_LINES_SHOWN = 19;
+
+export const longNestedRecapIsCountedByItsWriter = makeTest(
+  "a nested run with more than 20 recap lines writes its first 19 and a note counting the rest, so the parent recaps that note",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": taskRunning("main", 'Task.exec("bun", ["inner.ts"])'),
+        "inner.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const failing = Array.from({ length: ${String(FAILED_INNER_TASKS)} }, (_unused, index) =>
+  Task.make({ name: \`t\${String(index)}\`, run: Effect.die(new Error("bad")) }));
+export default Task.make({ name: "inner", run: Task.allSettled(failing) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      const recapLines = recapLinesOf(ran.standardError);
+      expect(recapLines, ran.standardError).toContain(
+        `recap: [main] (${String(FAILED_INNER_TASKS - INNER_RECAP_LINES_SHOWN)} nested recap lines are not shown)`,
+      );
+      expect(
+        recapLines.filter((line) => line.startsWith("recap: [main] [t")),
+        ran.standardError,
+      ).toHaveLength(INNER_RECAP_LINES_SHOWN);
+    }),
+  ),
+);
+
+const LONG_MESSAGE_CHARACTERS = 201;
+
+const MOST_CODE_UNITS_OF_A_RECAP_LINE = 200;
+
+const LONG_HEADLINE_RECAP =
+  /^recap: \[main\] 1\.output \| (?<body>(?<shown>.+) \((?<notShown>\d+) more characters are not shown\))$/u;
+
+export const longRecapHeadlineIsCut = makeTest(
+  "a recap's first line longer than 200 code units is cut to 200 with a note counting the code units left out",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.die(new Error("x".repeat(${String(LONG_MESSAGE_CHARACTERS)}))) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      const errorLine =
+        linesOf(ran.standardError).find((line) => line.startsWith("error: [main] main.ts:")) ?? "";
+      const [recapLine] = recapLinesOf(ran.standardError);
+      const {
+        body = "",
+        shown = "",
+        notShown = "",
+      } = LONG_HEADLINE_RECAP.exec(recapLine ?? "")?.groups ?? {};
+      expect(body.length, ran.standardError).toBeLessThanOrEqual(MOST_CODE_UNITS_OF_A_RECAP_LINE);
+      expect(shown.length + Number(notShown)).toBe(errorLine.length - "error: [main] ".length);
+    }),
+  ),
+);
+
+export const recapEscapesGivenOutputLines = makeTest(
+  "recap output lines given in a reported error print escaped, so they can't start a line of their own or carry terminal codes",
+  Effect.sync(() => {
+    expect(
+      formatRecapLines("t", { text: "Step: bad", outputLines: ["a\nb\u001B[31m"] }, "1.output"),
+    ).toEqual(["recap: [t] 1.output | Step: bad", String.raw`recap: [t] a\nb\u001B[31m`]);
+  }),
+);
+
+export const lineBreaksAreCountedOnceEach = makeTest(
+  "a line break is a line feed, a carriage return or the two together, counted once",
+  Effect.sync(() => {
+    expect(
+      ["", "a", "a\n", "a\r\nb\r\n", "\r\r\n\n", "a\rb\nc", "\n\r"].map((text) =>
+        String(countLineBreaks(text)),
+      ),
+    ).toEqual(["0", "0", "1", "2", "3", "2", "2"]);
+  }),
+);
+
+const GIVEN_LINE_CHARACTERS = 198;
+
+const GIVEN_LINE_CHARACTERS_SHOWN = 164;
+
+const LONG_GIVEN_LINE = `${"x".repeat(GIVEN_LINE_CHARACTERS)}\u001B`;
+
+export const recapCutsGivenOutputLines = makeTest(
+  "a recap output line given in a reported error that is longer than 200 code units once escaped is cut to 200 with a note",
+  Effect.sync(() => {
+    expect(
+      formatRecapLines("t", { text: "Step: bad", outputLines: [LONG_GIVEN_LINE] }, "1.output"),
+    ).toEqual([
+      "recap: [t] 1.output | Step: bad",
+      `recap: [t] ${"x".repeat(GIVEN_LINE_CHARACTERS_SHOWN)} (35 more characters are not shown)`,
+    ]);
+  }),
+);
+
+const recapOfOneOutputLine = (outputLine: string) =>
+  formatRecapLines("t", { text: "Step: bad", outputLines: [outputLine] }, "1.output");
+
+export const cutRecapLineIsNotCutAgain = makeTest(
+  "a recap line that was already cut prints unchanged when it is recapped again",
+  Effect.sync(() => {
+    const [, cutOnce = ""] = recapOfOneOutputLine(LONG_GIVEN_LINE);
+    expect(recapOfOneOutputLine(cutOnce.slice("recap: [t] ".length))).toEqual([
+      "recap: [t] 1.output | Step: bad",
+      cutOnce,
+    ]);
+  }),
+);
+
+const MANY_LINES = 1_000_000;
+
+export const manyLineBreaksAreCounted = makeTest(
+  "a million line breaks are counted",
+  Effect.sync(() => {
+    expect(countLineBreaks("\r\nx".repeat(MANY_LINES))).toBe(MANY_LINES);
+    expect(countLineFeeds("\n".repeat(MANY_LINES))).toBe(MANY_LINES);
+  }),
+);
+
+const WIDE_TASK_NAME_CHARACTERS = 2000;
+
+const WIDE_INNER_DETAIL_LINES = 10;
+
+export const wideNestedRecapFitsItsFile = makeTest(
+  "a nested run whose recap lines are over 64 KiB together writes the lines that fit and a note counting the rest, so the parent recaps them",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": taskRunning("main", 'Task.exec("bun", ["inner.ts"])'),
+        "inner.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const details = Array.from({ length: ${String(WIDE_INNER_DETAIL_LINES)} }, (_unused, index) => \`detail \${String(index)}\`);
+export default Task.make({ name: "界".repeat(${String(WIDE_TASK_NAME_CHARACTERS)}), run: Effect.die(new Error(["bad", ...details].join("\\n"))) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      const recapLines = recapLinesOf(ran.standardError);
+      expect(recapLines, ran.standardError).toContain(
+        "recap: [main] (1 nested recap line is not shown)",
+      );
+      expect(
+        recapLines.filter((line) => line.startsWith("recap: [main] [界")),
+        ran.standardError,
+      ).toHaveLength(WIDE_INNER_DETAIL_LINES);
     }),
   ),
 );

@@ -10,6 +10,7 @@ import {
   describeCauseMessage,
   ErrorStack,
   PlatformErrorValue,
+  recapCommandOutput,
   reportError,
   restatesItsCause,
   TaskRaisedError,
@@ -161,7 +162,7 @@ const reportFailureValue = (
         onSome: (causedByRefusal) => Arrays.of(reportError(causedByRefusal.cause)),
         onNone: () =>
           Option.match(Schema.decodeUnknownOption(TaskRaisedError)(failureValue), {
-            onSome: (taskRaised) => Arrays.of(reportError(taskRaised)),
+            onSome: (taskRaised) => Arrays.of(reportError(taskRaised, recapCommandOutput(failed))),
             onNone: () => {
               const userError = Schema.decodeUnknownOption(UserError)(failureValue);
               const tag = Option.getOrElse(

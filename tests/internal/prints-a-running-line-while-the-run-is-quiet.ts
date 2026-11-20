@@ -356,8 +356,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
 
 const RUNNING_CHILD_LINE = /^running: \[child\] [\d.]+s \(1 task done\), [\d.]+s$/u;
 
-const RUNNING_OWN_WORK_LINE =
-  /^running: (?:\[quick\] [\d.]+s \(0 tasks done\)|\[child\] [\d.]+s \(1 task done\)), [\d.]+s$/u;
+const RUNNING_ONE_TASK_LINE = /^running: \[[^\]]+\] [\d.]+s \(\d+ tasks? done\), [\d.]+s$/u;
 
 const runningLinesOf = (standardError: string) =>
   standardError.split("\n").filter((line) => line.startsWith("running:"));
@@ -381,7 +380,11 @@ export const runningLineNamesOnlyOwnWork = makeTest(
           ran.standardError,
         ).toBe(true);
         for (const line of runningLines) {
-          expect(line, ran.standardError).toMatch(RUNNING_OWN_WORK_LINE);
+          expect(line, ran.standardError).toMatch(RUNNING_ONE_TASK_LINE);
+        }
+        const firstChildLine = runningLines.findIndex((line) => RUNNING_CHILD_LINE.test(line));
+        for (const line of runningLines.slice(firstChildLine)) {
+          expect(line, ran.standardError).toMatch(RUNNING_CHILD_LINE);
         }
         const lines = ran.standardError.split("\n");
         expect(lines.findLastIndex((line) => line.startsWith("running:"))).toBeLessThan(

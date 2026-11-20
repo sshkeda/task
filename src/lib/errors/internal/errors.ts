@@ -1,5 +1,7 @@
 import { Effect, Schema } from "effect";
 
+import { countLineFeeds } from "../../../shared/count-line-breaks.ts";
+import { counted } from "../../../shared/counted.ts";
 import {
   PRINTABLE_ERROR_FIELDS,
   TASK_ERROR_FIELDS,
@@ -8,10 +10,8 @@ import {
 import { findConstructingLocation } from "../../../shared/find-user-locations-in-stack-traces.ts";
 import { joinMessages } from "../../../shared/join-messages.ts";
 import { nameTask } from "../../../shared/label-lines.ts";
-import { readNestedRecapLines } from "../../../shared/nested-recap-lines.ts";
 import { reportWrappedCause } from "../../../shared/report-cause.ts";
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
-import { selectRecapOutputLines } from "./recap-output-lines.ts";
 
 export class PrintableError extends Schema.Opaque<PrintableError>()(
   Schema.Struct(PRINTABLE_ERROR_FIELDS),
@@ -152,11 +152,7 @@ const selectShownOutput = (trimmed: string) => {
     : { start: Math.max(lineStart, lastLinesStart), startsMidLine: false };
 };
 
-const countLineBreaksBefore = (text: string, end: number) =>
-  text.slice(0, end).split("\n").length - 1;
-
-const counted = (count: number, noun: string) =>
-  `${String(count)} ${noun}${count === 1 ? "" : "s"}`;
+const countLineBreaksBefore = (text: string, end: number) => countLineFeeds(text.slice(0, end));
 
 const describeLeftOut = (
   trimmed: string,
@@ -213,17 +209,6 @@ export class CommandFailed extends Schema.TaggedError<CommandFailed>()(
 
   public get printedMessage() {
     return describeCommandEnd(this.command, this.code, this.signal);
-  }
-
-  public get recapOutputLines() {
-    const [firstLine, ...laterLines] = selectRecapOutputLines([
-      this.standardOutput,
-      this.standardError,
-    ]);
-    const nestedRecapLines = readNestedRecapLines(this);
-    return firstLine === undefined
-      ? [...nestedRecapLines]
-      : [firstLine, ...nestedRecapLines, ...laterLines];
   }
 }
 

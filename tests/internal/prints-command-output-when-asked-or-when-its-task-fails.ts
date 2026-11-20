@@ -150,6 +150,7 @@ export const wrappedFailedCommand = makeTest(
         "error: [main] its output is in <run folder>/1.output",
         "ended: [main], <seconds>, failed",
         "recap: [main] 1.output | main.ts:<location>: Error: the deploy failed",
+        "recap: [main] caused by CommandFailed: bash exited with code 1",
         "failed: [main] (1 of 1 task), <seconds>",
       ]);
     }),
@@ -450,9 +451,16 @@ const DIGITS_PER_LINE = 1000;
 
 const RUNS_OF_A_CUT_STANDARD_OUTPUT = 4;
 
-const MOST_GRAPHEMES_OF_A_RECAPPED_LINE = 200;
+const RECAPPED_OUTPUT_LINES = 3;
 
-const RECAPPED_NUMBER_LINE = `recap: [main] ${"0".repeat(MOST_GRAPHEMES_OF_A_RECAPPED_LINE - 1)}…`;
+const MOST_CODE_UNITS_OF_A_RECAPPED_LINE = 200;
+
+const RECAP_NOTE_OF_A_WHOLE_NUMBER_LINE = ` (${String(DIGITS_PER_LINE)} more characters are not shown)`;
+
+const RECAPPED_DIGITS =
+  MOST_CODE_UNITS_OF_A_RECAPPED_LINE - RECAP_NOTE_OF_A_WHOLE_NUMBER_LINE.length;
+
+const RECAPPED_NUMBER_LINE = `recap: [main] ${"0".repeat(RECAPPED_DIGITS)} (${String(DIGITS_PER_LINE - RECAPPED_DIGITS)} more characters are not shown)`;
 
 const numberTexts = (printed: readonly string[]) =>
   printed.filter((line) => line.startsWith("[main] ")).map((line) => line.slice("[main] ".length));
@@ -481,7 +489,7 @@ export const cutCommand = makeTest(
         "ended: [main], <seconds>, failed",
         `recap: [main] 1.output | main.ts:<location>: CommandFailed: bash exited with code ${String(FAILED_COMMAND_EXIT_CODE)}`,
         RECAPPED_NUMBER_LINE,
-        "recap: [main] …",
+        `recap: [main] (${String(LINES_PAST_THE_HELD_BYTES - RECAPPED_OUTPUT_LINES)} lines are not shown)`,
         RECAPPED_NUMBER_LINE,
         RECAPPED_NUMBER_LINE,
         "failed: [main] (1 of 1 task), <seconds>",
