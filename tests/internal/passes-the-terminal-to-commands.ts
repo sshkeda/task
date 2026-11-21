@@ -618,3 +618,26 @@ export const terminalCommandSignalNotReceivedByTheRun = makeTest(
   ),
   "10 seconds",
 );
+
+export const terminalCommandKilledBySignalIsCommandFailed = makeTest(
+  "a terminal command killed by a signal fails with CommandFailed naming the signal, like a piped command, so catchTag catches it",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({
+  name: "main",
+  run: Task.exec("sh", ["-c", "kill -TERM $$"], { stdio: "inherit" }).pipe(
+    Effect.catchTag("CommandFailed", (failed) =>
+      Effect.log(\`caught \${failed._tag} \${failed.signal} \${failed.stdio}\`),
+    ),
+  ),
+});`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(ran.standardError).toContain("[main] caught CommandFailed SIGTERM inherit");
+    }),
+  ),
+);

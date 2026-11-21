@@ -449,6 +449,28 @@ export default Task.make({ name: "main", run: version });`,
   ),
 );
 
+export const stackLikeMessageKeepsRealLocation = makeTest(
+  "an error whose message holds a line that looks like a stack frame is reported at the line that raised it, not at the path in its message",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+const thrown = Task.make({ name: "thrown", run: Effect.sync(() => {
+  throw new Error("boom\\n    at fake (/x/y.ts:1:1)");
+}) });
+const failed = Task.make({ name: "failed", run: Effect.suspend(() => Effect.fail(new Error("tool failed\\n    at tool (/x/tool.ts:9:9)"))) });
+export default Task.make({ name: "main", run: Task.allSettled([thrown, failed]) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode).toBe(1);
+      expect(ran.standardError).toContain("error: [thrown] main.ts:4:13: Error: boom");
+      expect(ran.standardError).toContain("error: [failed] main.ts:6:86: Error: tool failed");
+      expect(ran.standardError).not.toMatch(/^error: \[\w+\] \/x\//mu);
+    }),
+  ),
+);
+
 const FILE_INSTALLED_PACKAGE = {
   "package.json": `{ "name": "@acme/tools", "type": "module", "exports": { ".": "./src/format.ts" } }`,
   "src/format.ts": `import { Effect, Schema } from "effect";

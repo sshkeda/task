@@ -10,6 +10,7 @@ import {
   describeCauseMessage,
   ErrorStack,
   PlatformErrorValue,
+  readErrorMessage,
   recapCommandOutput,
   reportError,
   restatesItsCause,
@@ -142,7 +143,10 @@ const reportFailureValue = (
   const failureValue = failed.cause;
   const stackLocation = Option.flatMap(
     Schema.decodeUnknownOption(ErrorStack)(failureValue),
-    (withStack) => Option.fromUndefinedOr(findUserLocationInStack(withStack.stack)),
+    (withStack) =>
+      Option.fromUndefinedOr(
+        findUserLocationInStack(withStack.stack, readErrorMessage(failureValue)),
+      ),
   );
   const userLocation = Option.match(stackLocation, {
     onSome: (location) => ({ location }),

@@ -22,12 +22,23 @@ const ALL_CALL_SITES_LIMIT = Number.MAX_SAFE_INTEGER;
 
 const ABSOLUTE_PATH_START = "/";
 
-const parseStackFrames = (stack: string) =>
-  stack.split("\n").flatMap((stackLine) => {
-    const [, filePath, lineAndColumn] = STACK_FRAME_LOCATION.exec(stackLine) ?? [];
-    const isFrameWithoutLocation = filePath === undefined || lineAndColumn === undefined;
-    return isFrameWithoutLocation ? [] : [{ filePath, lineAndColumn }];
-  });
+const framesAfterMessage = (stack: string, message: string | undefined) => {
+  const messageText = message ?? "";
+  const messageStart = messageText === "" ? -1 : stack.indexOf(messageText);
+  const firstLineEnd = stack.indexOf("\n");
+  const isMessageInHeader = firstLineEnd === -1 || messageStart <= firstLineEnd;
+  const startsInHeader = messageStart !== -1 && isMessageInHeader;
+  return startsInHeader ? stack.slice(messageStart + messageText.length) : stack;
+};
+
+const parseStackFrames = (stack: string, message: string | undefined) =>
+  framesAfterMessage(stack, message)
+    .split("\n")
+    .flatMap((stackLine) => {
+      const [, filePath, lineAndColumn] = STACK_FRAME_LOCATION.exec(stackLine) ?? [];
+      const isFrameWithoutLocation = filePath === undefined || lineAndColumn === undefined;
+      return isFrameWithoutLocation ? [] : [{ filePath, lineAndColumn }];
+    });
 
 const frameInFileOf = (callSite: NodeJS.CallSite) => {
   const filePath = callSite.getFileName();
@@ -115,8 +126,11 @@ const isUserFrame = (frame: { readonly filePath: string }) =>
 const describeFrame = (frame: { readonly filePath: string; readonly lineAndColumn: string }) =>
   `${frame.filePath}:${frame.lineAndColumn}`;
 
-export const findUserLocationInStack = (stack: string): string | undefined => {
-  const userFrame = parseStackFrames(stack).find((frame) => isUserFrame(frame));
+export const findUserLocationInStack = (
+  stack: string,
+  message: string | undefined,
+): string | undefined => {
+  const userFrame = parseStackFrames(stack, message).find((frame) => isUserFrame(frame));
   return userFrame === undefined ? undefined : describeFrame(userFrame);
 };
 
@@ -148,7 +162,11 @@ export const findMakingLocation = (): string | undefined => {
   return makingFrame === undefined ? undefined : describeFrame(makingFrame);
 };
 
-export const findLocationInFile = (stack: string, filePath: string): string | undefined => {
-  const frameInFile = parseStackFrames(stack).find((frame) => frame.filePath === filePath);
+export const findLocationInFile = (
+  stack: string,
+  message: string | undefined,
+  filePath: string,
+): string | undefined => {
+  const frameInFile = parseStackFrames(stack, message).find((frame) => frame.filePath === filePath);
   return frameInFile === undefined ? undefined : `${filePath}:${frameInFile.lineAndColumn}`;
 };
