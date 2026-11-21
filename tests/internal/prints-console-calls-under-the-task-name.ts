@@ -958,3 +958,26 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
     }),
   ),
 );
+
+export const ownLoggerSeesNoTaskLabel = makeTest(
+  "a task's own Effect logger prints no Task label, while Task's trace still names the task on each log record",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect, Logger } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "main", run: Effect.gen(function* () {
+  yield* Effect.log("through Task");
+  yield* Effect.log("through my logger").pipe(Effect.provide(Logger.layer([Logger.consolePretty()])));
+}) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(0);
+      expect(ran.standardError).toContain("through my logger");
+      expect(ran.standardError).not.toContain("sshkeda_task");
+      const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
+      const logged = trace?.logs.find((log) => log.body.stringValue === "through Task");
+      expect(readAttribute(logged?.attributes ?? [], "sshkeda_task.task")).toBe("main");
+    }),
+  ),
+);

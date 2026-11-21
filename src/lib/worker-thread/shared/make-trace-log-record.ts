@@ -3,6 +3,8 @@ import { Array as Arrays, Clock, Logger, Option, References } from "effect";
 import { OtlpResource } from "effect/observability";
 
 import { encodeTraceJson } from "../../../shared/encode-trace-json.ts";
+import { CurrentTaskName } from "../../../shared/mark-task-worker-thread-contexts.ts";
+import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
 import { describeTraceExceptions } from "../../../shared/report-cause.ts";
 import { TaskEvent } from "../../../shared/rpc.ts";
 
@@ -33,6 +35,9 @@ const describeExceptions = (cause: Cause.Cause<unknown>) => {
       };
 };
 
+const describeTaskName = (taskName: string | null) =>
+  taskName === null ? {} : { [`${TASK_TRACE_LABEL_PREFIX}.task`]: taskName };
+
 export const makeTraceLogRecordJson = (options: Logger.Options<unknown>) => {
   const eventMilliseconds = options.date.getTime();
   const message = Arrays.ensure(options.message);
@@ -45,6 +50,7 @@ export const makeTraceLogRecordJson = (options: Logger.Options<unknown>) => {
     attributes: OtlpResource.entriesToAttributes(
       Object.entries({
         ...options.fiber.getRef(References.CurrentLogAnnotations),
+        ...describeTaskName(options.fiber.getRef(CurrentTaskName)),
         "effect.fiberId": options.fiber.id,
         ...Object.fromEntries(
           options.fiber

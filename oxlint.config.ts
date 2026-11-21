@@ -36,7 +36,7 @@ export default lintConfig({
     allow: ["spawnsCommands", "handlesEveryFailure"],
   },
   "src/shared/mark-task-worker-thread-contexts.ts": {
-    services: ["InsideTaskBody", "CommandLineFlags", "TaskLines"],
+    services: ["InsideTaskBody", "CurrentTaskName", "CommandLineFlags", "TaskLines"],
   },
   "src/lib/main-thread/shared/find-tasks-made-by-root-task-file.ts": {
     allow: ["importsDynamically"],
