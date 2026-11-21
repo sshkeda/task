@@ -17,6 +17,11 @@ export const InsideTaskBody = Context.Reference<boolean>(`${TASK_PACKAGE.name}/I
 
 export const isInsideTaskBody = () => Fiber.getCurrent()?.getRef(InsideTaskBody) === true;
 
+export const CurrentTaskName = Context.Reference<string | null>(
+  `${TASK_PACKAGE.name}/CurrentTaskName`,
+  { defaultValue: () => null },
+);
+
 export const CommandLineFlags = Context.Reference<Readonly<Record<string, string>>>(
   `${TASK_PACKAGE.name}/CommandLineFlags`,
   { defaultValue: () => ({}) },

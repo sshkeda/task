@@ -8,8 +8,10 @@ import {
   makeCommandRecapPath,
   readCommandRecap,
 } from "../../../../../shared/command-recap-file.ts";
-import { TaskLines } from "../../../../../shared/mark-task-worker-thread-contexts.ts";
-import { TASK_TRACE_LABEL_PREFIX } from "../../../../../shared/names-from-package-json.ts";
+import {
+  CurrentTaskName,
+  TaskLines,
+} from "../../../../../shared/mark-task-worker-thread-contexts.ts";
 import { RUN_MARKERS_VARIABLE_NAME } from "../../../../../shared/read-environment-config.ts";
 import {
   describeTaskMadeInBody,
@@ -178,7 +180,7 @@ export const provideTaskServices =
             workerState.postStreamOutputNow,
           ),
         ),
-        Effect.annotateLogs(`${TASK_TRACE_LABEL_PREFIX}.task`, startMessage.taskName),
+        Effect.provideService(CurrentTaskName, startMessage.taskName),
         workerState.provideRuntimeServices,
       );
     });
