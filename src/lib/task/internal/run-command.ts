@@ -205,21 +205,15 @@ export const exec = <
           (failure) => new CommandNotStarted({ command, cause: failure, ...calledAt }),
         ),
       );
-      if (TerminalCommandEnded.guards.Signaled(ended)) {
-        return yield* PlatformErrors.systemError({
-          _tag: "Unknown",
-          module: "ChildProcess",
-          method: "exitCode",
-          pathOrDescriptor: command,
-          description: `process interrupted by signal ${ended.signal}`,
-        });
-      }
-      if (ended.code === 0) {
+      const isSignaled = TerminalCommandEnded.guards.Signaled(ended);
+      const hasPassed = !isSignaled && ended.code === 0;
+      if (hasPassed) {
         return outputMode.returnOutput("");
       }
       return yield* outputMode.makeFailure({
         command,
-        code: ended.code,
+        code: isSignaled ? null : ended.code,
+        signal: isSignaled ? ended.signal : null,
         standardOutput: "",
         standardError: "",
         ...calledAt,

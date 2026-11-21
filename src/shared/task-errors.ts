@@ -19,7 +19,7 @@ import {
 import { joinMessages } from "./join-messages.ts";
 import { nameTask } from "./label-lines.ts";
 import { reportWrappedCause } from "./report-cause.ts";
-import { ErrorStack } from "./report-errors.ts";
+import { ErrorStack, readErrorMessage } from "./report-errors.ts";
 import { TASK_PACKAGE } from "./task-package.ts";
 
 export class TaskModuleImportFailed extends Schema.TaggedError<TaskModuleImportFailed>()(
@@ -29,8 +29,10 @@ export class TaskModuleImportFailed extends Schema.TaggedError<TaskModuleImportF
   public get location() {
     return Option.match(Schema.decodeUnknownOption(ErrorStack)(this.cause), {
       onSome: (withStack) =>
-        findProjectLocation(findLocationInFile(withStack.stack, this.filePath)) ??
-        findUserLocationInStack(withStack.stack) ??
+        findProjectLocation(
+          findLocationInFile(withStack.stack, readErrorMessage(this.cause), this.filePath),
+        ) ??
+        findUserLocationInStack(withStack.stack, readErrorMessage(this.cause)) ??
         findProjectLocation(this.filePath),
       onNone: () => findProjectLocation(this.filePath),
     });

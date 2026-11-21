@@ -22,6 +22,13 @@ export const attributeUnplacedToTask = (printable: PrintableError, taskName: str
 
 export const ErrorStack = Schema.Struct({ stack: Schema.String });
 
+const ErrorMessage = Schema.Struct({ message: Schema.String });
+
+export const readErrorMessage = (value: unknown) =>
+  Option.getOrUndefined(
+    Option.map(Schema.decodeUnknownOption(ErrorMessage)(value), ({ message }) => message),
+  );
+
 export const TaskRaisedError = Schema.Struct({
   raisedBy: Schema.Literal(TASK_PACKAGE.name),
   name: Schema.String,
