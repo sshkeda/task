@@ -629,6 +629,28 @@ export const nestedFailureRecap = makeTest(
   ),
 );
 
+const BIGGER_THAN_THE_RECAP_FILE = 70_000;
+
+export const hugeNestedHeadlineIsCutInTheRecapFile = makeTest(
+  "a nested run's headline bigger than the recap file is cut to one recap line there, so the parent still recaps the inner error",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": taskRunning("main", 'Task.exec("bun", ["inner.ts"])'),
+        "inner.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "inner", run: Effect.die(new Error("x".repeat(${String(BIGGER_THAN_THE_RECAP_FILE)}))) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      const innerHeadline = recapLinesOf(ran.standardError).find((line) =>
+        line.startsWith("recap: [main] [inner] 1.output | inner.ts:"),
+      );
+      expect(innerHeadline, ran.standardError).toEndWith("more characters are not shown)");
+    }),
+  ),
+);
+
 export const threeLevelFailureRecap = makeTest(
   "a failed command recaps three levels of Task failures",
   Effect.scoped(
@@ -1070,13 +1092,8 @@ export default Task.make({ name: "inner", run: Task.allSettled(failing) });`,
 
 const LONG_MESSAGE_CHARACTERS = 201;
 
-const MOST_CODE_UNITS_OF_A_RECAP_LINE = 200;
-
-const LONG_HEADLINE_RECAP =
-  /^recap: \[main\] 1\.output \| (?<body>(?<shown>.+) \((?<notShown>\d+) more characters are not shown\))$/u;
-
-export const longRecapHeadlineIsCut = makeTest(
-  "a recap's first line longer than 200 code units is cut to 200 with a note counting the code units left out",
+export const longRecapHeadlineIsWhole = makeTest(
+  "a recap's first line longer than 200 code units is kept whole, so a path at its end still shows",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -1088,14 +1105,10 @@ export default Task.make({ name: "main", run: Effect.die(new Error("x".repeat(${
       expect(ran.exitCode, ran.standardError).toBe(1);
       const errorLine =
         linesOf(ran.standardError).find((line) => line.startsWith("error: [main] main.ts:")) ?? "";
-      const [recapLine] = recapLinesOf(ran.standardError);
-      const {
-        body = "",
-        shown = "",
-        notShown = "",
-      } = LONG_HEADLINE_RECAP.exec(recapLine ?? "")?.groups ?? {};
-      expect(body.length, ran.standardError).toBeLessThanOrEqual(MOST_CODE_UNITS_OF_A_RECAP_LINE);
-      expect(shown.length + Number(notShown)).toBe(errorLine.length - "error: [main] ".length);
+      expect(errorLine, ran.standardError).toEndWith("x".repeat(LONG_MESSAGE_CHARACTERS));
+      expect(recapLinesOf(ran.standardError)[0], ran.standardError).toBe(
+        `recap: [main] 1.output | ${errorLine.slice("error: [main] ".length)}`,
+      );
     }),
   ),
 );
@@ -1167,7 +1180,7 @@ const WIDE_TASK_NAME_CHARACTERS = 2000;
 const WIDE_INNER_DETAIL_LINES = 10;
 
 export const wideNestedRecapFitsItsFile = makeTest(
-  "a nested run whose recap lines are over 64 KiB together writes the lines that fit and a note counting the rest, so the parent recaps them",
+  "a nested run whose recap lines would be over 64 KiB together writes each cut to one recap line, so the parent recaps all of them",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -1180,13 +1193,11 @@ export default Task.make({ name: "界".repeat(${String(WIDE_TASK_NAME_CHARACTERS
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(1);
       const recapLines = recapLinesOf(ran.standardError);
-      expect(recapLines, ran.standardError).toContain(
-        "recap: [main] (1 nested recap line is not shown)",
-      );
       expect(
         recapLines.filter((line) => line.startsWith("recap: [main] [界")),
         ran.standardError,
-      ).toHaveLength(WIDE_INNER_DETAIL_LINES);
+      ).toHaveLength(1 + WIDE_INNER_DETAIL_LINES);
+      expect(recapLines.join("\n"), ran.standardError).not.toContain("nested recap line");
     }),
   ),
 );
