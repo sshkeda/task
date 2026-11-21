@@ -50,7 +50,7 @@ export const describeErrorLines = (printable: PrintableError) => {
   return [
     ...splitLines(`${locationPrefix}${printable.tag}: ${printable.message.trimEnd()}`),
     ...splitContextLines(printable),
-  ];
+  ].filter((line) => line !== "");
 };
 
 export const listErrorLines = <TaskName extends string | null>(

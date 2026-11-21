@@ -94,6 +94,7 @@ export const makeTaskOutputFiles = Effect.fn(function* (input: {
   const latestErrorsByTaskName = new Map<string, Parameters<typeof formatRecapLines>[1]>();
   const taskNamesOwedAPointer = new Set<string>();
   const stackFramesByTaskName = new Map<string, typeof StackFrameBlocks.Type>();
+  const writtenStackFrameBlocksByTaskName = new Map<string, readonly string[]>();
   const failedTaskNames = new Set<string>();
   const awaitedTaskNamesWithPrintedOutput = new Set<string>();
   const noTaskRuns: ReadonlyMap<string, { readonly bodyRequestedTaskNames: ReadonlySet<string> }> =
@@ -256,6 +257,18 @@ export const makeTaskOutputFiles = Effect.fn(function* (input: {
       awaitedTaskNamesWithPrintedOutput.add(taskName);
       yield* printHeldOutput(taskName);
     });
+  const appendNewStackFrames = (taskName: string) =>
+    Effect.gen(function* () {
+      const writtenBlocks = writtenStackFrameBlocksByTaskName.get(taskName) ?? [];
+      const blocks = (stackFramesByTaskName.get(taskName) ?? []).map(({ error, frames }) =>
+        [error, ...frames].map((text) => labelLine("error", taskName, text)).join("\n"),
+      );
+      const newBlocks = blocks.filter((block, index) => writtenBlocks[index] !== block);
+      writtenStackFrameBlocksByTaskName.set(taskName, blocks);
+      for (const block of newBlocks) {
+        yield* appendTaskLines(taskName, block);
+      }
+    });
   const pointAtOutputFile = (taskName: string) =>
     Effect.gen(function* () {
       taskNamesOwedAPointer.delete(taskName);
@@ -263,14 +276,9 @@ export const makeTaskOutputFiles = Effect.fn(function* (input: {
       const isFirstPointer =
         file !== null && !pointedFileNamesByTaskName.has(taskName) && !(yield* input.hasStopSignal);
       if (isFirstPointer) {
-        const line = labelLine("error", taskName, `its output is in ${file.filePath}`);
         pointedFileNamesByTaskName.set(taskName, file.fileName);
-        for (const { error, frames } of stackFramesByTaskName.get(taskName) ?? []) {
-          yield* appendTaskLines(
-            taskName,
-            [error, ...frames].map((text) => labelLine("error", taskName, text)).join("\n"),
-          );
-        }
+        yield* appendNewStackFrames(taskName);
+        const line = labelLine("error", taskName, `its output is in ${file.filePath}`);
         yield* appendTaskLines(taskName, line);
         yield* offerLines("runner", line);
       }
@@ -380,7 +388,7 @@ export const makeTaskOutputFiles = Effect.fn(function* (input: {
     printTaskErrors: (
       taskName: string,
       errorLineList: readonly { readonly printedTaskName: string; readonly text: string }[],
-      recap: Parameters<typeof formatRecapLines>[1] | undefined,
+      recap?: Parameters<typeof formatRecapLines>[1],
     ) =>
       Effect.gen(function* () {
         if (recap !== undefined) {
@@ -397,6 +405,7 @@ export const makeTaskOutputFiles = Effect.fn(function* (input: {
           yield* printHeldOutput(taskName);
           failedTaskNames.add(taskName);
         }
+        yield* appendNewStackFrames(taskName);
         yield* appendTaskLines(taskName, errorLines);
         yield* offerLines("runner", errorLines);
         if (!withOutput) {

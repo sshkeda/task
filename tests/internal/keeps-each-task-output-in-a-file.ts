@@ -505,3 +505,42 @@ export const commandOutputBatchIsOneAppend = Task.make({
     expect(yield* Queue.size(lines)).toBe(pieces.length);
   }),
 });
+
+export const replacedStackFramesAreWritten = Task.make({
+  name: "a stack frame block replaced after it was written, with the block count unchanged, is written again so the task's file keeps the new frames",
+  isolated: true,
+  timeout: "1 minute",
+  cleanup: "5 seconds",
+  run: Effect.gen(function* () {
+    const appendedTexts: string[] = [];
+    const lines = yield* Queue.unbounded<ReturnType<typeof makeStandardErrorLine>, Cause.Done>();
+    yield* Deferred.succeed(standardErrorLinesDeferred, lines);
+    const taskOutputFiles = yield* makeTaskOutputFiles({
+      runDirectoryPath: "/run",
+      isRunDirectoryWritable: true,
+      hasStopSignal: Effect.succeed(false),
+    }).pipe(
+      Effect.provideService(
+        FileSystem.FileSystem,
+        FileSystem.makeNoop({
+          writeFile: (_filePath, data) =>
+            Effect.sync(() => {
+              appendedTexts.push(new TextDecoder().decode(data));
+            }),
+        }),
+      ),
+      Effect.provideService(Path.Path, yield* Path.Path.pipe(Effect.provide(Path.layer))),
+    );
+    yield* taskOutputFiles.keepStackFrames("build", [
+      { error: "Error: bad", frames: ["at first"] },
+    ]);
+    yield* taskOutputFiles.printTaskErrors("build", [{ printedTaskName: "build", text: "bad" }]);
+    yield* taskOutputFiles.keepStackFrames("build", [
+      { error: "Error: bad", frames: ["at second"] },
+    ]);
+    yield* taskOutputFiles.printTaskErrors("build", [{ printedTaskName: "build", text: "worse" }]);
+    const written = appendedTexts.join("");
+    expect(written).toContain("error: [build] at first\n");
+    expect(written).toContain("error: [build] at second\n");
+  }),
+});

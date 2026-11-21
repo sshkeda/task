@@ -77,20 +77,13 @@ export const readCommandRecap = (fileSystem: FileSystem.FileSystem, recapPath: s
     ),
   );
 
-const fitsTheRecapFile = (json: string) => Buffer.byteLength(json) <= MAX_RECAP_FILE_BYTES;
-
-const encodeWithinRecapFile = (
-  lines: readonly string[],
-  shownCount: number,
-): Option.Option<string> => {
-  const json = encodeRecapLines(
-    shownCount === lines.length
-      ? lines
-      : [...lines.slice(0, shownCount), describeNestedLinesNotShown(lines.length - shownCount)],
-  );
-  const isWritten = shownCount === 0 || Option.exists(json, fitsTheRecapFile);
-  return isWritten ? json : encodeWithinRecapFile(lines, shownCount - 1);
-};
+const keepWithinNestedRecapLines = (lines: readonly string[]) =>
+  lines.length > MAX_NESTED_RECAP_LINES
+    ? [
+        ...lines.slice(0, MAX_NESTED_RECAP_LINES - 1),
+        describeNestedLinesNotShown(lines.length - MAX_NESTED_RECAP_LINES + 1),
+      ]
+    : lines;
 
 export const writeCommandRecap = (fileSystem: FileSystem.FileSystem, lines: readonly string[]) =>
   Effect.gen(function* () {
@@ -98,10 +91,7 @@ export const writeCommandRecap = (fileSystem: FileSystem.FileSystem, lines: read
     if (Option.isNone(recapFile)) {
       return;
     }
-    const json = encodeWithinRecapFile(
-      lines,
-      lines.length > MAX_NESTED_RECAP_LINES ? MAX_NESTED_RECAP_LINES - 1 : lines.length,
-    );
+    const json = encodeRecapLines(keepWithinNestedRecapLines(lines).map((line) => recapLine(line)));
     if (Option.isSome(json)) {
       yield* fileSystem.writeFileString(recapFile.value, json.value, { flag: "wx", mode: 0o600 });
     }

@@ -1904,18 +1904,18 @@ export const failureReasonOfUncaughtFailure = makeTest(
 );
 
 export const failureReasonOfMultiLineMessage = makeTest(
-  "the error of a multi-line message prints its headline and then each later line as an error line, without trailing blank lines, and its recap repeats its non-blank lines",
+  "the error of a multi-line message prints its headline and then each later line that is not empty as an error line, and its recap repeats the lines that are not blank",
   Effect.scoped(
     Effect.gen(function* () {
       const ran = yield* runFailureReasonProject(
-        `Effect.fail(new EvidenceRejected({ message: "first line\\n  second line\\n\\nthird line\\n" }))`,
+        `Effect.fail(new EvidenceRejected({ message: "first line\\n  second line\\n\\n  \\nthird line\\n" }))`,
       );
       expect(ran.exitCode).toBe(1);
       expect(ran.runLine).toStartWith("run: ");
       expect(ran.linesBeforeTheSummary).toEqual([
         `error: ${ROOT_TASK_FAILURE_PREFIX}: EvidenceRejected: first line`,
         "error: [main]   second line",
-        "error: [main]",
+        "error: [main]   ",
         "error: [main] third line",
         MAIN_OUTPUT_FILE_LINE,
         endedLineOf("main", "failed"),
@@ -2035,7 +2035,7 @@ export default Task.make({ name: "main", run: Effect.fail(new ReportedErrors({ r
 );
 
 export const failureReasonOfLongMessage = makeTest(
-  "the error line keeps the whole first line of a long message, and its recap cuts it with a note counting what it leaves out",
+  "the error line and its recap keep the whole first line of a long message",
   Effect.scoped(
     Effect.gen(function* () {
       const ran = yield* runFailureReasonProject(
@@ -2047,9 +2047,8 @@ export const failureReasonOfLongMessage = makeTest(
         `error: ${ROOT_TASK_FAILURE_PREFIX}: EvidenceRejected: ${"0".repeat(PRINTED_ZERO_COUNT)}`,
         MAIN_OUTPUT_FILE_LINE,
       ]);
-      expect(countOccurrences(ran.standardError, "0".repeat(PRINTED_ZERO_COUNT))).toBe(1);
-      expect(ran.standardError).toMatch(
-        /^recap: \[main\] 1\.output \| .+ \(\d+ more characters are not shown\)$/mu,
+      expect(ran.standardError).toContain(
+        `recap: [main] 1.output | ${ROOT_TASK_FAILURE_PREFIX.slice("[main] ".length)}: EvidenceRejected: ${"0".repeat(PRINTED_ZERO_COUNT)}\n`,
       );
     }),
   ),
@@ -2349,7 +2348,7 @@ export default Task.make({ name: "main", run: Effect.all([plain, nested], { mode
 const MOST_WRITTEN_STACK_FRAMES = 100;
 
 export const stackFramesInTheTaskFile = makeTest(
-  "a failed task's file holds a block of stack frames for its error, each inner error and its cause, each named by its error, after its error lines and before the line naming its file, at most 100 frames per error, while the terminal prints none of them",
+  "a failed task's file holds a block of stack frames for its error, each inner error and its cause, each named by its error, before its error lines, which end right before the line naming its file, at most 100 frames per error, while the terminal prints none of them",
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({
@@ -2391,10 +2390,11 @@ export default Task.make({ name: "main", run: Effect.sync(() => deep(150)) });`,
         /^\d+ more stack frames left out, past the first 100$/u,
       );
       const fileLines = file.split("\n");
-      const lastErrorLine = fileLines.indexOf(errorLines.at(-1) ?? "");
-      expect(fileLines[lastErrorLine + 1]).toBe(
-        "error: [main] stack frames of AggregateError: OUTER_MARK",
-      );
+      const firstErrorLine = fileLines.indexOf(errorLines[0] ?? "");
+      expect(
+        fileLines.indexOf("error: [main] stack frames of AggregateError: OUTER_MARK"),
+      ).toBeLessThan(firstErrorLine);
+      expect(file).toContain(`${errorLines.join("\n")}\n${outputLine}\n`);
       expect(withoutStackFrames(file)).toContain(`${errorLines.join("\n")}\n${outputLine}\n`);
     }),
   ),

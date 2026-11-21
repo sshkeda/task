@@ -5,8 +5,9 @@ import {
   formatCauseLines,
   listErrorLines,
 } from "../../../shared/format-error-lines.ts";
+import { escapeControlAndLineBreakCharacters } from "../../../shared/label-lines.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
-import { describeLinesNotShown, recapLine } from "../../../shared/recap-entries.ts";
+import { describeLinesNotShown } from "../../../shared/recap-entries.ts";
 import { reportCause } from "../../../shared/report-cause.ts";
 import { failureValuesOfReason } from "../../../shared/select-cause-reasons.ts";
 import { isAwaitedTasksFailurePrintable } from "../../../shared/task-errors.ts";
@@ -48,7 +49,7 @@ const recapErrorLines = (detailLines: readonly string[]) => {
 const recapError = (error: PrintableError) => {
   const [firstLine = "", ...detailLines] = describeErrorLines(Struct.omit(error, ["context"]));
   return {
-    text: recapLine(firstLine),
+    text: escapeControlAndLineBreakCharacters(firstLine),
     outputLines: error.outputLines ?? recapErrorLines(detailLines),
   };
 };
