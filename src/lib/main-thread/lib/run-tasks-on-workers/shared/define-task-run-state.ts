@@ -84,6 +84,14 @@ export const makeTaskRun = (initial: {
     | typeof AwaitedTasksFailure.Type
   >(),
   bodyStartedAtMillisecondsDeferred: Deferred.makeUnsafe<number>(),
+  runningCommandsById: new Map<
+    string,
+    {
+      readonly programName: string;
+      readonly calledAt: string | null;
+      readonly startedAtMilliseconds: number;
+    }
+  >(),
   stop: makeTaskStop(),
   bodyFinishedDeferred: Deferred.makeUnsafe<void>(),
   cleanupSpan: Ref.makeUnsafe<Tracer.Span | null>(null),

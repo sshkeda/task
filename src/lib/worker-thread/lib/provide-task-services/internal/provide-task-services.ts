@@ -9,6 +9,7 @@ import {
   readCommandRecap,
 } from "../../../../../shared/command-recap-file.ts";
 import {
+  CommandCalledAt,
   CurrentTaskName,
   TaskLines,
 } from "../../../../../shared/mark-task-worker-thread-contexts.ts";
@@ -103,6 +104,23 @@ export const provideTaskServices =
           const workingDirectory = path.resolve(startMessage.runDirectoryPath, command.cwd);
           const { runMarker } = workerState;
           const programName = command.command.slice(command.command.lastIndexOf("/") + 1);
+          const commandId = SecureRandom.uuidV4Unsafe();
+          const reportCommandStarted = Effect.gen(function* () {
+            yield* workerState.reportToMainThread(
+              TaskEvent.cases.TaskFiberStartedTerminalCommand.make({
+                taskName: startMessage.taskName,
+                commandId,
+                programName,
+                calledAt: yield* CommandCalledAt,
+              }),
+            );
+          });
+          const reportCommandEnded = workerState.reportToMainThread(
+            TaskEvent.cases.TaskFiberEndedTerminalCommand.make({
+              taskName: startMessage.taskName,
+              commandId,
+            }),
+          );
           return checkWorkingDirectoryBeforeSpawn(
             programName,
             startMessage.runDirectoryPath,
@@ -110,34 +128,36 @@ export const provideTaskServices =
           ).pipe(
             workerState.provideRuntimeServices,
             Effect.andThen(
-              workerState
-                .runInTerminal({
-                  ...command,
-                  env:
-                    runMarker === null
-                      ? command.env
-                      : {
-                          ...command.env,
-                          [RUN_MARKERS_VARIABLE_NAME]: markCommandOfTask(
-                            runMarker,
-                            startMessage.taskName,
-                          ),
-                        },
-                  id: SecureRandom.uuidV4Unsafe(),
-                  cwd: workingDirectory,
-                  cleanup: startMessage.cleanup,
-                })
-                .pipe(
-                  Effect.flatMap(failUnlessStarted(command.command)),
-                  Effect.catchTag("PlatformError", (spawnFailure) =>
-                    recheckWorkingDirectoryAfterSpawnFailure(
-                      programName,
-                      startMessage.runDirectoryPath,
-                      workingDirectory,
-                      spawnFailure,
-                    ).pipe(workerState.provideRuntimeServices),
-                  ),
+              reportCommandStarted.pipe(
+                Effect.andThen(
+                  workerState.runInTerminal({
+                    ...command,
+                    env:
+                      runMarker === null
+                        ? command.env
+                        : {
+                            ...command.env,
+                            [RUN_MARKERS_VARIABLE_NAME]: markCommandOfTask(
+                              runMarker,
+                              startMessage.taskName,
+                            ),
+                          },
+                    id: commandId,
+                    cwd: workingDirectory,
+                    cleanup: startMessage.cleanup,
+                  }),
                 ),
+                Effect.flatMap(failUnlessStarted(command.command)),
+                Effect.catchTag("PlatformError", (spawnFailure) =>
+                  recheckWorkingDirectoryAfterSpawnFailure(
+                    programName,
+                    startMessage.runDirectoryPath,
+                    workingDirectory,
+                    spawnFailure,
+                  ).pipe(workerState.provideRuntimeServices),
+                ),
+                Effect.ensuring(reportCommandEnded),
+              ),
             ),
           );
         }),

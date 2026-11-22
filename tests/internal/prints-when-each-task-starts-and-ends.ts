@@ -237,12 +237,69 @@ export default Task.make({ name: "slow", timeout: "300 millis", run: Effect.neve
       expect(ran.exitCode, ran.standardError).toBe(1);
       expect(linesBetweenTheRunLines(ran.standardError)).toEqual([
         "error: [slow] main.ts:3:21: TaskTimedOut: timed out after 300ms",
+        "error: [slow] no command was running",
         "error: [slow] its output is in <run folder>/1.output",
         "ended: [slow], <seconds>, failed",
         "recap: [slow] 1.output | main.ts:3:21: TaskTimedOut: timed out after 300ms",
+        "recap: [slow] no command was running",
         "failed: [slow] (1 of 1 task), <seconds>",
       ]);
       yield* expectEachEndedLineToSayItsTaskState(project, ran);
+    }),
+  ),
+);
+
+export const timedOutTaskNamesItsRunningCommands = makeTest(
+  "a task that times out names each command still running, where it was called and for how long, in its error and its recap",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "migrate", timeout: "1 second", run: Effect.gen(function* () {
+  yield* Effect.forkChild(Task.exec("sleep", ["30"]));
+  yield* Effect.sleep("300 millis");
+  yield* Task.exec("sh", ["-c", "echo applying 002_users.sql; sleep 30"]);
+}) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(linesBetweenTheRunLines(ran.standardError)).toEqual([
+        "[migrate] applying 002_users.sql",
+        "error: [migrate] main.ts:3:21: TaskTimedOut: timed out after 1s",
+        "error: [migrate] sleep was still running, called at main.ts:4:32, for <seconds>",
+        "error: [migrate] sh was still running, called at main.ts:6:15, for <seconds>",
+        "error: [migrate] its output is in <run folder>/1.output",
+        "ended: [migrate], <seconds>, failed",
+        "recap: [migrate] 1.output | main.ts:3:21: TaskTimedOut: timed out after 1s",
+        "recap: [migrate] sleep was still running, called at main.ts:4:32, for <seconds>",
+        "recap: [migrate] sh was still running, called at main.ts:6:15, for <seconds>",
+        "failed: [migrate] (1 of 1 task), <seconds>",
+      ]);
+    }),
+  ),
+);
+
+export const timedOutTaskWithOnlyEndedCommands = makeTest(
+  "a task that times out after its commands have ended says that no command was running",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({ name: "e2e", timeout: "1 second", run: Effect.gen(function* () {
+  yield* Task.exec("sh", ["-c", "echo build done"]);
+  yield* Effect.never;
+}) });`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(linesBetweenTheRunLines(ran.standardError)).toContain(
+        "error: [e2e] no command was running",
+      );
+      expect(linesBetweenTheRunLines(ran.standardError)).toContain(
+        "recap: [e2e] no command was running",
+      );
     }),
   ),
 );

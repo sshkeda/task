@@ -1,6 +1,7 @@
 import {
   Clock,
   Context,
+  DateTime,
   Duration,
   Effect,
   Fiber,
@@ -23,7 +24,6 @@ import {
   queueLineToAwaitItsWrite,
 } from "../../../shared/print-to-standard-error.ts";
 import { endTaskSpan, startTaskSpan } from "../../../shared/task-spans.ts";
-import { formatIsoTimestamp } from "../shared/format-task-lines.ts";
 import { RunRootTaskConfig } from "../shared/provide-run-root-task-config.ts";
 import { StopState } from "../shared/provide-stop-state.ts";
 import { TaskOutputFiles, makeTaskOutputFiles } from "../shared/write-task-output-files.ts";
@@ -52,10 +52,9 @@ const isRunProcessAlive = (runDirectoryName: string) => {
 };
 
 const runDirectoryPathOf = (runRootTaskConfig: RunRootTaskConfig["Service"]) => {
-  const timestamp = formatIsoTimestamp(runRootTaskConfig.runStartedAtMilliseconds).replaceAll(
-    ":",
-    "-",
-  );
+  const timestamp = DateTime.formatIso(
+    DateTime.makeUnsafe(runRootTaskConfig.runStartedAtMilliseconds),
+  ).replaceAll(":", "-");
   return `${runRootTaskConfig.stateDirectoryPath}/runs/${runRootTaskConfig.projectRunsDirectoryName}/${timestamp}-${runRootTaskConfig.runProcessId}`;
 };
 

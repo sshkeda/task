@@ -311,7 +311,7 @@ export default witness;`,
       });
       const witnessRun = yield* runTaskProcess(timeoutWitness, "main.ts");
       expect(witnessRun.standardError).toMatch(
-        /^run: \S+\/\nerror: \[witness\] main\.ts:3:29: TaskTimedOut: timed out after 5s\nerror: \[witness\] its output is in \S+\/1\.output\nended: \[witness\], [\d.]+s, failed\nrecap: \[witness\] 1\.output \| main\.ts:3:29: TaskTimedOut: timed out after 5s\nfailed: \[witness\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+        /^run: \S+\/\nerror: \[witness\] main\.ts:3:29: TaskTimedOut: timed out after 5s\nerror: \[witness\] no command was running\nerror: \[witness\] its output is in \S+\/1\.output\nended: \[witness\], [\d.]+s, failed\nrecap: \[witness\] 1\.output \| main\.ts:3:29: TaskTimedOut: timed out after 5s\nrecap: \[witness\] no command was running\nfailed: \[witness\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
       yield* gate.write(new TextEncoder().encode("\n"));
 

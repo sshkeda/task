@@ -327,21 +327,44 @@ const onMessageAboutTask = Effect.fn(function* (
   yield* Match.value(messageFromWorker).pipe(
     Match.tagsExhaustive({
       TaskFiberStartedProcess: (started) =>
-        processGroups
-          .record(started.processId, started.taskName, started.startTime)
-          .pipe(
-            Effect.andThen(
-              WorkerPool.use((workerPool) =>
-                workerPool.acknowledgeProcessRecorded(started.recordId),
-              ),
+        Effect.sync(() => {
+          taskRun.runningCommandsById.set(`process ${started.processId}`, {
+            programName: started.programName,
+            calledAt: started.calledAt,
+            startedAtMilliseconds: clock.currentTimeMillisUnsafe(),
+          });
+        }).pipe(
+          Effect.andThen(
+            processGroups.record(started.processId, started.taskName, started.startTime),
+          ),
+          Effect.andThen(
+            WorkerPool.use((workerPool) => workerPool.acknowledgeProcessRecorded(started.recordId)),
+          ),
+        ),
+      TaskFiberProcessLeaderExited: (exited) =>
+        Effect.sync(() => {
+          taskRun.runningCommandsById.delete(`process ${exited.processId}`);
+        }).pipe(
+          Effect.andThen(
+            processGroups.recordLeaderExit(
+              exited.processId,
+              exited.taskName,
+              exited.membersAtLeaderExit,
             ),
           ),
-      TaskFiberProcessLeaderExited: (exited) =>
-        processGroups.recordLeaderExit(
-          exited.processId,
-          exited.taskName,
-          exited.membersAtLeaderExit,
         ),
+      TaskFiberStartedTerminalCommand: (started) =>
+        Effect.sync(() => {
+          taskRun.runningCommandsById.set(`terminal ${started.commandId}`, {
+            programName: started.programName,
+            calledAt: started.calledAt,
+            startedAtMilliseconds: clock.currentTimeMillisUnsafe(),
+          });
+        }),
+      TaskFiberEndedTerminalCommand: (ended) =>
+        Effect.sync(() => {
+          taskRun.runningCommandsById.delete(`terminal ${ended.commandId}`);
+        }),
       TaskFiberClaimingProcessReports: (claiming) =>
         processGroups
           .claimProcessesToReport(claiming.processes)

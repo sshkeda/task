@@ -102,7 +102,7 @@ export default Task.make({ name: "main", run: other });`,
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain("[other] waiting");
       expect(ran.standardError).toContain(
-        "\nerror: [waiter] main.ts:3:28: TaskTimedOut: timed out after 1s\nerror: [waiter] main.ts:3:28: TaskCleanupNotStarted: its worker did not start its cleanup within 1s, so task terminated that worker\n",
+        "\nerror: [waiter] main.ts:3:28: TaskTimedOut: timed out after 1s\nerror: [waiter] no command was running\nerror: [waiter] main.ts:3:28: TaskCleanupNotStarted: its worker did not start its cleanup within 1s, so task terminated that worker\n",
       );
       for (const taskPrefix of ["error: [other] main.ts:8:27", "error: [main] main.ts:13:21"]) {
         expect(ran.standardError).toContain(
@@ -310,7 +310,7 @@ export default Task.make({ name: "main", run: spin });`,
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toContain("[spin] spinning");
       expect(ran.standardError).toContain(
-        "\nerror: [spin] main.ts:3:26: TaskTimedOut: timed out after 1s\nerror: [spin] main.ts:3:26: TaskCleanupNotStarted: its worker did not start its cleanup within 1s, so task terminated that worker\n",
+        "\nerror: [spin] main.ts:3:26: TaskTimedOut: timed out after 1s\nerror: [spin] no command was running\nerror: [spin] main.ts:3:26: TaskCleanupNotStarted: its worker did not start its cleanup within 1s, so task terminated that worker\n",
       );
       expect(ran.standardError).toMatch(
         /\nfailed: \[spin\] \[main\] \(2 of 2 tasks\), [\d.]+s\nrun: \S+\/$/u,

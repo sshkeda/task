@@ -131,6 +131,13 @@ export const TASK_EVENT_FIELDS = {
     processId: Schema.Int,
     membersAtLeaderExit: Schema.Array(ProcessIdentity),
   },
+  TaskFiberStartedTerminalCommand: {
+    taskName: Schema.String,
+    commandId: Schema.String,
+    programName: Schema.String,
+    calledAt: Schema.NullOr(Schema.String),
+  },
+  TaskFiberEndedTerminalCommand: { taskName: Schema.String, commandId: Schema.String },
   TaskFiberServed: { taskName: Schema.String, value: Schema.optional(Schema.Json) },
   TaskFiberBodyEnded: { taskName: Schema.String, endedAtUnixNano: Schema.BigIntFromString },
   TaskFiberStartedCleanUp: { taskName: Schema.String },
@@ -147,6 +154,8 @@ export const StartedProcess = Schema.Struct({
   taskName: Schema.String,
   processId: Schema.Int,
   startTime: Schema.NullOr(Schema.String),
+  programName: Schema.String,
+  calledAt: Schema.NullOr(Schema.String),
 });
 
 export const ProcessReportsToClaim = Schema.Struct({

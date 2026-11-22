@@ -641,3 +641,29 @@ export default Task.make({
     }),
   ),
 );
+
+export const timedOutTerminalCommandIsNamed = makeTest(
+  "a task that times out while its terminal command runs names that command, not that no command was running",
+  Effect.scoped(
+    Effect.gen(function* () {
+      const project = yield* makeProject({
+        "main.ts": `import { Effect } from "effect";
+import { Task } from "@sshkeda/task";
+export default Task.make({
+  name: "main",
+  timeout: "1 second",
+  run: Effect.asVoid(Task.exec("sleep", ["30"], { stdio: "inherit" })),
+});`,
+      });
+      const ran = yield* runTaskProcess(project, "main.ts");
+      expect(ran.exitCode, ran.standardError).toBe(1);
+      expect(ran.standardError).toMatch(
+        /^error: \[main\] sleep was still running, called at main\.ts:6:\d+, for [\d.]+s$/mu,
+      );
+      expect(ran.standardError).toMatch(
+        /^recap: \[main\] sleep was still running, called at main\.ts:6:\d+, for [\d.]+s$/mu,
+      );
+      expect(ran.standardError).not.toContain("no command was running");
+    }),
+  ),
+);

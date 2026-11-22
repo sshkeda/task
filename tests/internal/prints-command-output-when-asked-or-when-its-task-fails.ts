@@ -170,9 +170,11 @@ export const timedOutCommand = makeTest(
         "[main] listening",
         "[main] request failed",
         "error: [main] main.ts:<location>: TaskTimedOut: timed out after 1s",
+        "error: [main] bash was still running, called at main.ts:<location>, for <seconds>",
         "error: [main] its output is in <run folder>/1.output",
         "ended: [main], <seconds>, failed",
         "recap: [main] 1.output | main.ts:<location>: TaskTimedOut: timed out after 1s",
+        "recap: [main] bash was still running, called at main.ts:<location>, for <seconds>",
         "failed: [main] (1 of 1 task), <seconds>",
       ]);
     }),
@@ -192,10 +194,12 @@ export const outputAfterTimeout = makeTest(
       expect(ran.exitCode, ran.standardError).toBe(1);
       expect(withLocationsNamed(linesBetweenTheRunLines(ran.standardError))).toEqual([
         "error: [main] main.ts:<location>: TaskTimedOut: timed out after 1s",
+        "error: [main] no command was running",
         "[main] while-stopping",
         "error: [main] its output is in <run folder>/1.output",
         "ended: [main], <seconds>, failed",
         "recap: [main] 1.output | main.ts:<location>: TaskTimedOut: timed out after 1s",
+        "recap: [main] no command was running",
         "failed: [main] (1 of 1 task), <seconds>",
       ]);
     }),
@@ -287,10 +291,12 @@ export const awaitedServerCrash = makeTest(
         "[server] error: missing setting databaseUrl",
         "[server]     at loadConfig (src/config.ts:17)",
         "error: [e2e] main.ts:<location>: TaskTimedOut: timed out after 1s",
+        "error: [e2e] no command was running",
         "error: [e2e] its output is in <run folder>/1.output",
         "ended: [e2e], <seconds>, failed",
         "closed: [server]",
         "recap: [e2e] 1.output | main.ts:<location>: TaskTimedOut: timed out after 1s",
+        "recap: [e2e] no command was running",
         "failed: [e2e] (1 of 2 tasks), <seconds>",
       ]);
     }),

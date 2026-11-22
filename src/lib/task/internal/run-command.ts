@@ -21,7 +21,7 @@ import { CommandRecapFiles } from "../../../shared/command-recap-file.ts";
 import { findCallingUserLocation } from "../../../shared/find-user-locations-in-stack-traces.ts";
 import { splitOutputPieces } from "../../../shared/label-output.ts";
 import type { PRINTED_TO } from "../../../shared/label-output.ts";
-import { TaskLines } from "../../../shared/mark-task-worker-thread-contexts.ts";
+import { CommandCalledAt, TaskLines } from "../../../shared/mark-task-worker-thread-contexts.ts";
 import { recapNestedRunIn } from "../../../shared/nested-recap-lines.ts";
 import { takeOutputStreamId } from "../../../shared/output-stream-ids.ts";
 import {
@@ -201,6 +201,7 @@ export const exec = <
         ),
         cwd: options.cwd ?? ".",
       }).pipe(
+        Effect.provideService(CommandCalledAt, location ?? null),
         Effect.mapError(
           (failure) => new CommandNotStarted({ command, cause: failure, ...calledAt }),
         ),
@@ -239,6 +240,7 @@ export const exec = <
             stdin: options.stdin === undefined ? "ignore" : "pipe",
             stderr: "pipe",
           }).pipe(
+            Effect.provideService(CommandCalledAt, location ?? null),
             Effect.mapError(
               (failure) => new CommandNotStarted({ command, cause: failure, ...calledAt }),
             ),

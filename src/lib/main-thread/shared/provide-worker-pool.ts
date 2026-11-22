@@ -166,6 +166,8 @@ export const FromWorker = Schema.TaggedUnion({
     recordId: Schema.Int,
     processId: Schema.Int,
     startTime: Schema.NullOr(Schema.String),
+    programName: Schema.String,
+    calledAt: Schema.NullOr(Schema.String),
   },
   TaskFiberClaimingProcessReports: {
     taskName: Schema.String,

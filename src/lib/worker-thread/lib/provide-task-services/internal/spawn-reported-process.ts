@@ -3,6 +3,7 @@ import { ChildProcessSpawner } from "effect/process";
 import type { ChildProcess } from "effect/process";
 
 import type { ProcessIdentity } from "../../../../../shared/claim-processes-to-report.ts";
+import { CommandCalledAt } from "../../../../../shared/mark-task-worker-thread-contexts.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../../../shared/names-from-package-json.ts";
 import { TaskEvent } from "../../../../../shared/rpc.ts";
 import type { StartTaskFiber } from "../../../../../shared/rpc.ts";
@@ -36,6 +37,7 @@ export const spawnReportedProcess = Effect.fn(function* (
 ) {
   const workerState = yield* WorkerState;
   const programName = formatProgramNames(command);
+  const calledAt = yield* CommandCalledAt;
   const processSpan = yield* startTaskSpan("process", programName, {
     parent: Option.getOrNull(yield* Effect.serviceOption(Tracer.ParentSpan)),
     attributes: { "process.executable.name": programName },
@@ -135,11 +137,13 @@ export const spawnReportedProcess = Effect.fn(function* (
           }),
         ),
         Effect.flatMap((leaderStartTime) =>
-          workerState.reportStartedProcessAndAwaitRecord(
-            startMessage.taskName,
-            spawnedProcess.handle.pid,
-            leaderStartTime,
-          ),
+          workerState.reportStartedProcessAndAwaitRecord({
+            taskName: startMessage.taskName,
+            processId: spawnedProcess.handle.pid,
+            startTime: leaderStartTime,
+            programName,
+            calledAt,
+          }),
         ),
       ),
     ),
