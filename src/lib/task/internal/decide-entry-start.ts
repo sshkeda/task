@@ -162,20 +162,18 @@ export const decideEntryStart = (facts: {
       }),
     );
   }
+  const entryFileName = facts.entryFilePath.slice(facts.entryFilePath.lastIndexOf("/") + 1);
   const defaultRoot =
     defaultTaskMade === undefined
       ? Option.getOrNull(
-          Option.map(decodeGroup(defaultExport), ({ [TASK_GROUP_KEY]: taskGroup }) => {
-            const name = facts.entryFilePath.slice(facts.entryFilePath.lastIndexOf("/") + 1);
-            return {
-              name,
-              listedTasks: taskGroup.taskNames.flatMap((taskName) =>
-                madeTasks.filter((madeTask) => madeTask.name === taskName).slice(0, 1),
-              ),
-              group: { name, ...taskGroup },
-              checksForgottenTasks: true,
-            };
-          }),
+          Option.map(decodeGroup(defaultExport), ({ [TASK_GROUP_KEY]: taskGroup }) => ({
+            name: entryFileName,
+            listedTasks: taskGroup.taskNames.flatMap((taskName) =>
+              madeTasks.filter((madeTask) => madeTask.name === taskName).slice(0, 1),
+            ),
+            group: { name: entryFileName, ...taskGroup },
+            checksForgottenTasks: true,
+          })),
         )
       : rootOfTask(defaultTaskMade.task, true);
   if (defaultRoot === null) {
@@ -207,22 +205,41 @@ export const decideEntryStart = (facts: {
     return refuse(facts.commandLine.failure);
   }
   const { words, values, asksForHelp, flatFlags } = facts.commandLine.success;
-  const isOneTaskName =
-    words.length === 1 && words.every((word) => word.trim() !== "" && !word.startsWith("-"));
-  const areArgumentsRefused = Arrays.isReadonlyArrayNonEmpty(words) && !isOneTaskName;
-  if (areArgumentsRefused) {
-    return refuse(new RunArgumentsNotAccepted({ givenArguments: words }));
+  const refusedWords = words.filter((word) => word.trim() === "" || word.startsWith("-"));
+  if (Arrays.isArrayNonEmpty(refusedWords)) {
+    return refuse(new RunArgumentsNotAccepted({ givenArguments: refusedWords }));
   }
-  const [startTaskName] = words;
-  const startTask =
-    startTaskName === undefined
-      ? undefined
-      : madeTasks.find((madeTask) => madeTask.name === startTaskName);
-  const isStartTaskMissing = startTaskName !== undefined && startTask === undefined;
-  if (isStartTaskMissing) {
-    return refuse(new StartTaskNotMade({ startTaskName }));
+  const namedTaskNames = Arrays.dedupe(words);
+  const namedTasks: Task[] = [];
+  const missingTaskNames: string[] = [];
+  for (const name of namedTaskNames) {
+    const task = madeTasks.find((madeTask) => madeTask.name === name);
+    if (task === undefined) {
+      missingTaskNames.push(name);
+    } else {
+      namedTasks.push(task);
+    }
   }
-  const root = startTask === undefined ? defaultRoot : rootOfTask(startTask, false);
+  if (Arrays.isArrayNonEmpty(missingTaskNames)) {
+    return refuse(new StartTaskNotMade({ startTaskNames: missingTaskNames }));
+  }
+  const [firstNamedTask, secondNamedTask] = namedTasks;
+  const defaultOrSingleRoot =
+    firstNamedTask === undefined ? defaultRoot : rootOfTask(firstNamedTask, false);
+  const root =
+    secondNamedTask === undefined
+      ? defaultOrSingleRoot
+      : {
+          name: entryFileName,
+          listedTasks: namedTasks,
+          group: RootTaskGroup.make({
+            name: entryFileName,
+            mode: "allSettled",
+            taskNames: namedTaskNames,
+            concurrency: "unbounded",
+          }),
+          checksForgottenTasks: false,
+        };
   if (facts.isStandaloneExecutable) {
     return refuse(new RunCalledInStandaloneExecutable({ rootTaskName: root.name }));
   }
@@ -233,7 +250,7 @@ export const decideEntryStart = (facts: {
     return refuse(new RunCalledInBunEvaluation({ flag: facts.evaluationFlag.value }));
   }
   if (asksForHelp) {
-    const command = [...facts.entryCommand, ...(startTask === undefined ? [] : [startTask.name])]
+    const command = [...facts.entryCommand, ...namedTaskNames]
       .map((word) => quoteForShell(word))
       .join(" ");
     const startTaskNames = root.listedTasks.map((listedTask) => listedTask.name);

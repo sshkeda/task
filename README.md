@@ -112,7 +112,7 @@ The `recap:` lines repeat each failure at the end, so you see them even after a 
 - `return yield* Task.serve(value)` ends a task's body but keeps the task running, such as a dev server, and hands `value` to the tasks that use it.
 - `Task.all(tasks)` runs tasks in parallel and stops at the first failure. `Task.allSettled(tasks)` lets every task finish, then reports each failure.
 - `bun scripts/ci.ts` runs the file's default export and everything it uses.
-- `bun scripts/ci.ts "e2e"` runs only that task and the tasks it uses.
+- One or more task names, as in `bun scripts/ci.ts lint build`, run only those tasks and the tasks they use.
 - `bun scripts/ci.ts --help` prints the task the file runs and the flags each task reads, without starting a task.
 - `SSHKEDA_TASK_LOG=error` leaves out what tasks print and the `ended:` and `running:` lines. `SSHKEDA_TASK_LOG=debug` adds a `started:` line for every task and an `ended:` line for each task that passed.
 

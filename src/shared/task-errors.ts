@@ -189,18 +189,23 @@ export class RunArgumentsNotAccepted extends Schema.TaggedError<RunArgumentsNotA
   },
 ) {
   public override get message() {
-    const isOneArgument = this.givenArguments.length === 1;
-    return `the ${isOneArgument ? "argument" : "arguments"} ${this.givenArguments.map((givenArgument) => `"${givenArgument}"`).join(" ")} ${isOneArgument ? "is" : "are"} not the name of one task to start`;
+    const argumentsText = this.givenArguments.map((argument) => `"${argument}"`).join(" ");
+    return this.givenArguments.length === 1
+      ? `the argument ${argumentsText} is not the name of a task to start`
+      : `the arguments ${argumentsText} are not names of tasks to start`;
   }
 }
 
 export class StartTaskNotMade extends Schema.TaggedError<StartTaskNotMade>()("StartTaskNotMade", {
   ...TASK_ERROR_FIELDS,
   ...UNATTRIBUTED_FAILURE_FIELDS,
-  startTaskName: Schema.String,
+  startTaskNames: Schema.NonEmptyArray(Schema.String),
 }) {
   public override get message() {
-    return `the argument "${this.startTaskName}" is not the name of a task made while the task files loaded`;
+    const argumentsText = this.startTaskNames.map((name) => `"${name}"`).join(" ");
+    return this.startTaskNames.length === 1
+      ? `the argument ${argumentsText} is not the name of a task made while the task files loaded`
+      : `the arguments ${argumentsText} are not the names of tasks made while the task files loaded`;
   }
 }
 

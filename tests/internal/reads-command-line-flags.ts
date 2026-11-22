@@ -7,7 +7,7 @@ import { FAILURE_EXIT_CODE, USAGE_ERROR_EXIT_CODE } from "../shared/exit-codes-o
 import { failureAsValue } from "../shared/failure-as-value.ts";
 import { makeProject } from "../shared/make-projects.ts";
 import { makeTest } from "../shared/make-tests.ts";
-import { runTaskProcess } from "../shared/run-task-processes.ts";
+import { runMainWithArguments } from "../shared/run-main-with-arguments.ts";
 import { typeCheckSource } from "../shared/type-check-source.ts";
 
 const RECORD_FLAGS = `const record = (name: string, flags: object) =>
@@ -43,12 +43,6 @@ export default Task.make({
     }),
 });
 `;
-
-const runWithArguments = (
-  project: Effect.Success<ReturnType<typeof makeProject>>,
-  scriptArguments: readonly string[],
-  environment: Readonly<Record<string, string>> = {},
-) => runTaskProcess(project, "main.ts", environment, project.directory, scriptArguments);
 
 const readMarker = (directory: string, marker: string) =>
   Effect.gen(function* () {
@@ -89,7 +83,7 @@ export const decodedFlags = makeTest(
         ],
       ] as const) {
         const project = yield* makeProject({ "main.ts": DEPLOY_FILE });
-        const ran = yield* runWithArguments(project, scriptArguments);
+        const ran = yield* runMainWithArguments(project, scriptArguments);
         expect(ran.standardError).toMatch(/^passed: 3 tasks, [\d.]+s$/mu);
         expect(ran.exitCode).toBe(0);
         expect(yield* readDeployMarkers(project.directory)).toEqual(markers);
@@ -126,7 +120,12 @@ export default Task.make({
 });
 `,
       });
-      const ran = yield* runWithArguments(project, ["--notes", "first release", "--stage", "prod"]);
+      const ran = yield* runMainWithArguments(project, [
+        "--notes",
+        "first release",
+        "--stage",
+        "prod",
+      ]);
       expect(ran.exitCode, ran.standardError).toBe(0);
       expect(yield* read(`${project.directory}/build-flags`)).toBe('{"stage":"prod"}');
       expect(yield* read(`${project.directory}/release-flags`)).toBe(
@@ -138,12 +137,16 @@ export default Task.make({
 );
 
 export const taskNameWithFlags = makeTest(
-  "a bare word is the task to start and combines with flags, while the word after a flag that is not a boolean is that flag's value",
+  "bare words name the tasks to start and combine with flags, while the word after a flag that is not a boolean is that flag's value",
   Effect.scoped(
     Effect.gen(function* () {
       for (const [scriptArguments, markers] of [
         [["migrate", "--stage", "prod"], { deploy: null, migrate: '{"stage":"prod"}', lint: null }],
         [["--stage", "prod", "migrate"], { deploy: null, migrate: '{"stage":"prod"}', lint: null }],
+        [
+          ["migrate", "lint", "--stage", "dev"],
+          { deploy: null, migrate: '{"stage":"dev"}', lint: "" },
+        ],
         [
           ["--dry-run", "migrate", "--stage", "dev"],
           { deploy: null, migrate: '{"stage":"dev"}', lint: null },
@@ -154,7 +157,7 @@ export const taskNameWithFlags = makeTest(
         ],
       ] as const) {
         const project = yield* makeProject({ "main.ts": DEPLOY_FILE });
-        const ran = yield* runWithArguments(project, scriptArguments);
+        const ran = yield* runMainWithArguments(project, scriptArguments);
         expect(ran.exitCode, ran.standardError).toBe(0);
         expect(yield* readDeployMarkers(project.directory)).toEqual(markers);
       }
@@ -163,7 +166,7 @@ export const taskNameWithFlags = makeTest(
 );
 
 export const refusedCommandLines = makeTest(
-  "a missing, malformed or unaccepted flag of the task the run starts with, a flag no task reads, or a second task name fails the run with one line before any task starts and exits 2",
+  "a missing, malformed or unaccepted flag of any task the run starts with or a flag no task reads fails the run with one line before any task starts and exits 2",
   Effect.scoped(
     Effect.gen(function* () {
       for (const [scriptArguments, refusal] of [
@@ -188,11 +191,11 @@ export const refusedCommandLines = makeTest(
         [["--stagee", "dev"], "FlagNotRead: the flag --stagee is not read by any task"],
         [["--dryRun", "--stage", "dev"], "FlagNotRead: the flag --dryRun is not read by any task"],
         [
-          ["migrate", "lint", "--stage", "dev"],
-          'RunArgumentsNotAccepted: the arguments "migrate" "lint" are not the name of one task to start',
+          ["migrate"],
+          "FlagMissing: the task [migrate] reads the flag --stage, which was not given",
         ],
         [
-          ["migrate"],
+          ["lint", "migrate"],
           "FlagMissing: the task [migrate] reads the flag --stage, which was not given",
         ],
         [
@@ -201,7 +204,7 @@ export const refusedCommandLines = makeTest(
         ],
       ] as const) {
         const project = yield* makeProject({ "main.ts": DEPLOY_FILE });
-        const ran = yield* runWithArguments(project, scriptArguments);
+        const ran = yield* runMainWithArguments(project, scriptArguments);
         expect(ran.standardError).toBe(`error: ${refusal}`);
         expect(ran.standardOutput).toBe("");
         expect(ran.exitCode).toBe(USAGE_ERROR_EXIT_CODE);
@@ -231,7 +234,7 @@ export default Task.make({
 });
 `,
       });
-      const ran = yield* runWithArguments(project, ["--start", "9", "--end=3"]);
+      const ran = yield* runMainWithArguments(project, ["--start", "9", "--end=3"]);
       expect(ran.standardError).toBe(
         'error: FlagsInvalid: the flags --start "9" --end "3" are not accepted together by the task [window]: start must come before end',
       );
@@ -282,7 +285,7 @@ export default Task.make({
 });
 `,
         });
-        const ran = yield* runWithArguments(project, []);
+        const ran = yield* runMainWithArguments(project, []);
         expect(ran.standardError).toBe(`error: ${refusal}`);
         expect(ran.exitCode).toBe(FAILURE_EXIT_CODE);
         expect(yield* exists(`${project.directory}/deploy-ran`)).toBe(false);
@@ -341,7 +344,7 @@ export const flagReadDifferently = makeTest(
         ],
       ] as const) {
         const project = yield* makeProject({ "main.ts": MODE_FILE });
-        const ran = yield* runWithArguments(project, scriptArguments);
+        const ran = yield* runMainWithArguments(project, scriptArguments);
         expect(ran.exitCode, ran.standardError).toBe(0);
         expect(yield* readModeMarkers(project.directory)).toEqual(markers);
       }
@@ -354,7 +357,7 @@ export const flagFitsOneReader = makeTest(
   Effect.scoped(
     Effect.gen(function* () {
       const project = yield* makeProject({ "main.ts": MODE_FILE });
-      const ran = yield* runWithArguments(project, ["--mode", "fast"]);
+      const ran = yield* runMainWithArguments(project, ["--mode", "fast"]);
       expect(ran.standardError).toMatch(
         /^error: \[audit\] main\.ts:10:27: FlagInvalid: the flag --mode is "fast", which the task \[audit\] does not accept: Expected "strict" \| "loose"$/mu,
       );
@@ -367,7 +370,7 @@ export const flagFitsOneReader = makeTest(
         release: null,
       });
       const refusedProject = yield* makeProject({ "main.ts": MODE_FILE });
-      const refused = yield* runWithArguments(refusedProject, ["check", "--mode", "strict"]);
+      const refused = yield* runMainWithArguments(refusedProject, ["check", "--mode", "strict"]);
       expect(refused.standardError).toBe(
         'error: FlagInvalid: the flag --mode is "strict", which the task [check] does not accept: Expected "fast" | "full"',
       );
@@ -403,7 +406,7 @@ export default Task.make({
 });
 `,
       });
-      const ran = yield* runWithArguments(project, []);
+      const ran = yield* runMainWithArguments(project, []);
       expect(ran.standardError).toMatch(
         /^error: \[notify\] main\.ts:3:28: FlagMissing: the task \[notify\] reads the flag --channel, which was not given$/mu,
       );
@@ -417,7 +420,7 @@ export default Task.make({
 );
 
 export const helpOutput = makeTest(
-  "--help prints the command with any task name given, quoted for the shell, the task the run would start and every loaded task that reads flags, then exits 0 without running any task",
+  "asking for --help prints the command with the task names given, quoted for the shell, the tasks the run would start and every loaded task that reads flags, then exits 0 without running any task",
   Effect.scoped(
     Effect.gen(function* () {
       for (const [scriptArguments, printed] of [
@@ -447,7 +450,7 @@ The task "deploy" reads:
         ],
       ] as const) {
         const project = yield* makeProject({ "main.ts": DEPLOY_FILE });
-        const ran = yield* runWithArguments(project, scriptArguments);
+        const ran = yield* runMainWithArguments(project, scriptArguments);
         expect(ran.standardOutput).toBe(printed);
         expect(ran.standardError).toBe("");
         expect(ran.exitCode).toBe(0);
@@ -458,7 +461,7 @@ The task "deploy" reads:
         });
       }
       const readDifferently = yield* makeProject({ "main.ts": MODE_FILE });
-      const ranReadDifferently = yield* runWithArguments(readDifferently, ["--help"]);
+      const ranReadDifferently = yield* runMainWithArguments(readDifferently, ["--help"]);
       expect(ranReadDifferently.standardOutput).toBe(`bun main.ts starts the task "release".
 The task "release" reads:
   --mode text
@@ -477,7 +480,7 @@ export const test = Task.make({ name: "test", run: Effect.void });
 export default Task.all([lint, test]);
 `,
       });
-      const ranListed = yield* runWithArguments(listed, ["--help"]);
+      const ranListed = yield* runMainWithArguments(listed, ["--help"]);
       expect(ranListed.standardOutput).toBe(
         'bun main.ts starts the tasks "lint", "test".\nNo task reads flags.\n',
       );
@@ -486,14 +489,22 @@ export default Task.all([lint, test]);
         "main.ts": `import { Effect } from "effect";
 import { Task } from "@sshkeda/task";
 export const migrate = Task.make({ name: "db migrate", run: Effect.promise(() => Bun.write("migrate-ran", "")).pipe(Effect.asVoid) });
+export const lint = Task.make({ name: "lint", run: Effect.promise(() => Bun.write("lint-ran", "")).pipe(Effect.asVoid) });
 export default Task.make({ name: "deploy", run: migrate });
 `,
       });
-      const ranSpaced = yield* runWithArguments(spaced, ["db migrate", "--help"]);
+      const ranSpaced = yield* runMainWithArguments(spaced, ["db migrate", "--help"]);
       expect(ranSpaced.standardOutput).toBe(
         "bun main.ts 'db migrate' starts the task \"db migrate\".\nNo task reads flags.\n",
       );
       expect(ranSpaced.exitCode).toBe(0);
+      const ranSeveral = yield* runMainWithArguments(spaced, ["lint", "db migrate", "--help"]);
+      expect(ranSeveral.standardOutput).toBe(
+        'bun main.ts lint \'db migrate\' starts the tasks "lint", "db migrate".\nNo task reads flags.\n',
+      );
+      expect(ranSeveral.standardError).toBe("");
+      expect(ranSeveral.exitCode).toBe(0);
+      expect(yield* exists(`${spaced.directory}/lint-ran`)).toBe(false);
       expect(yield* exists(`${spaced.directory}/migrate-ran`)).toBe(false);
     }),
   ),
@@ -523,7 +534,7 @@ export default Task.make({
 });
 `,
       });
-      const ran = yield* runWithArguments(project, ["--help"]);
+      const ran = yield* runMainWithArguments(project, ["--help"]);
       expect(ran.standardOutput).toBe(`bun main.ts starts the task "deploy".
 The task "deploy" reads:
   --stage dev | prod       which stage to deploy
@@ -565,12 +576,12 @@ export const defaultedFlags = makeTest(
         ],
       ] as const) {
         const project = yield* makeProject({ "main.ts": DEFAULTS_FILE });
-        const ran = yield* runWithArguments(project, scriptArguments);
+        const ran = yield* runMainWithArguments(project, scriptArguments);
         expect(ran.exitCode, ran.standardError).toBe(0);
         expect(yield* read(`${project.directory}/deploy-flags`)).toBe(recorded);
       }
       const helped = yield* makeProject({ "main.ts": DEFAULTS_FILE });
-      const ranHelp = yield* runWithArguments(helped, ["--help"]);
+      const ranHelp = yield* runMainWithArguments(helped, ["--help"]);
       expect(ranHelp.standardOutput).toBe(`bun main.ts starts the task "deploy".
 The task "deploy" reads:
   --stage text (optional)
@@ -608,7 +619,7 @@ export default Task.make({
 });
 `,
       });
-      const ran = yield* runWithArguments(project, ["--stage", "prod"]);
+      const ran = yield* runMainWithArguments(project, ["--stage", "prod"]);
       expect(ran.exitCode, ran.standardError).toBe(0);
       expect(yield* read(`${project.directory}/outer-flags`)).toBe('{"stage":"prod"}');
       expect(yield* read(`${project.directory}/inner-flags`)).toBe("{}");
@@ -644,7 +655,7 @@ export const flagsOnWorkers = makeTest(
         [true, {}],
       ] as const) {
         const project = yield* makeWorkerProject(isolated);
-        const ran = yield* runWithArguments(
+        const ran = yield* runMainWithArguments(
           project,
           ["--stage", "prod", "--retries=3"],
           environment,
