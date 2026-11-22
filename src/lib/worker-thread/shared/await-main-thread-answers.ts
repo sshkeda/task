@@ -5,7 +5,12 @@ import type { RpcClient, RpcClientError } from "effect/rpc";
 import type { ProcessIdentity } from "../../../shared/claim-processes-to-report.ts";
 import { dieOnInvariantFailure } from "../../../shared/invariant-errors.ts";
 import { TaskEvent } from "../../../shared/rpc.ts";
-import type { MainThreadRpcs, StandardInputRead, TaskMadeInBody } from "../../../shared/rpc.ts";
+import type {
+  MainThreadRpcs,
+  StandardInputRead,
+  StartedProcess,
+  TaskMadeInBody,
+} from "../../../shared/rpc.ts";
 import type { TerminalCommand } from "../../../shared/run-in-terminal.ts";
 import { isAwaitedTaskFailed } from "../../../shared/task-errors.ts";
 
@@ -82,12 +87,8 @@ export const makeMainThreadAnswers = Effect.fn(function* (
         ),
         dieUnlessAnswered,
       ),
-    reportStartedProcessAndAwaitRecord: (
-      taskName: string,
-      processId: number,
-      startTime: string | null,
-    ) =>
-      mainThread.RecordStartedProcess({ taskName, processId, startTime }).pipe(dieUnlessAnswered),
+    reportStartedProcessAndAwaitRecord: (started: typeof StartedProcess.Type) =>
+      mainThread.RecordStartedProcess(started).pipe(dieUnlessAnswered),
     claimProcessesToReport: (
       taskName: string,
       processes: readonly (typeof ProcessIdentity.Type)[],

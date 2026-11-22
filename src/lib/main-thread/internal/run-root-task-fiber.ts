@@ -10,6 +10,7 @@ import {
   Fiber,
 } from "effect";
 
+import { formatSeconds } from "../../../shared/format-seconds.ts";
 import { dieOnInvariantFailure } from "../../../shared/invariant-errors.ts";
 import { labelLine, nameTask } from "../../../shared/label-lines.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../shared/names-from-package-json.ts";
@@ -19,7 +20,6 @@ import { TaskBodyFailed } from "../../../shared/task-errors.ts";
 import { endTaskSpan } from "../../../shared/task-spans.ts";
 import { TaskRuns } from "../lib/run-tasks-on-workers/index.ts";
 import { failRun, failRunOnFailure } from "../shared/fail-run.ts";
-import { formatSeconds } from "../shared/format-task-lines.ts";
 import {
   NoTaskStarted,
   RootTaskWorkingDirectoryUnavailable,

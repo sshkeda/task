@@ -1206,8 +1206,12 @@ const BODY_STOPS = [
     options: ', timeout: "3 seconds", cleanup: "5 seconds"',
     exitCode: 1,
     timeoutLines: ["error: [main] TaskTimedOut: timed out after 3s"],
+    timeoutRecapLines: [
+      "error: [main] TaskTimedOut: timed out after 3s",
+      "recap: [main] no command was running",
+    ],
   },
-  { stoppedBy: "Ctrl-C", options: "", exitCode: 130, timeoutLines: [] },
+  { stoppedBy: "Ctrl-C", options: "", exitCode: 130, timeoutLines: [], timeoutRecapLines: [] },
 ] as const;
 
 const ensuringCleanup = (cleanup: string) =>
@@ -1219,7 +1223,7 @@ const scopeCleanup = (cleanup: string) =>
 const stopBody = (body: string, cleanupLines: readonly string[]) =>
   Effect.forEach(
     BODY_STOPS,
-    ({ stoppedBy, options, exitCode, timeoutLines }) =>
+    ({ stoppedBy, options, exitCode, timeoutLines, timeoutRecapLines }) =>
       Effect.scoped(
         Effect.gen(function* () {
           const project = yield* makeProject({
@@ -1242,9 +1246,10 @@ export default Task.make({ name: "main", run: ${body}${options} });`,
           const recapLines = (exited.standardError.match(/^recap: .*$/gmu) ?? []).map((line) =>
             line.replace(/^recap: \[main\] 1\.output \| \S+: /u, "error: [main] "),
           );
-          const latestErrorLines = cleanupLines.length === 0 ? timeoutLines : cleanupLines;
+          const recapOfTheLatestError: readonly string[] =
+            cleanupLines.length === 0 ? timeoutRecapLines : cleanupLines.slice(-1);
           expect(recapLines, `${stoppedBy}: ${body}`).toEqual(
-            timeoutLines.length === 0 ? [] : latestErrorLines.slice(-1),
+            timeoutLines.length === 0 ? [] : [...recapOfTheLatestError],
           );
         }),
       ),
@@ -1464,7 +1469,7 @@ export default Task.make({
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode, ran.standardError).toBe(1);
       expect(ran.standardError).toMatch(
-        /\nerror: \[main\] main\.ts:3:21: TaskTimedOut: timed out after 1s\nerror: \[main\] main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 3s, so the run stopped waiting for it\nerror: \[main\] its output is in \S+\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 3s, so the run stopped waiting for it\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+        /\nerror: \[main\] main\.ts:3:21: TaskTimedOut: timed out after 1s\nerror: \[main\] no command was running\nerror: \[main\] main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 3s, so the run stopped waiting for it\nerror: \[main\] its output is in \S+\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 3s, so the run stopped waiting for it\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
       expect(ran.standardError).not.toContain(STILL_STOPPING);
       const [trace] = yield* readTraces(yield* readProjectRunsDirectory(project, ran));
@@ -1632,7 +1637,7 @@ export default Task.make({
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.exitCode).toBe(1);
       expect(ran.standardError).toMatch(
-        /^run: \S+\/\nerror: \[main\] main\.ts:3:21: TaskTimedOut: timed out after 1s\nerror: \[main\] main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it\nerror: \[main\] its output is in \S+\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+        /^run: \S+\/\nerror: \[main\] main\.ts:3:21: TaskTimedOut: timed out after 1s\nerror: \[main\] no command was running\nerror: \[main\] main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it\nerror: \[main\] its output is in \S+\/1\.output\nended: \[main\], [\d.]+s, failed\nrecap: \[main\] 1\.output \| main\.ts:3:21: TaskCleanupTimedOut: its cleanup did not finish within 5s, so the run stopped waiting for it\nfailed: \[main\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
     }),
   ),

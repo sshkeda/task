@@ -16,10 +16,12 @@ import {
   findProjectLocation,
   findUserLocationInStack,
 } from "./find-user-locations-in-stack-traces.ts";
+import { formatSeconds } from "./format-seconds.ts";
 import { joinMessages } from "./join-messages.ts";
 import { nameTask } from "./label-lines.ts";
 import { reportWrappedCause } from "./report-cause.ts";
 import { ErrorStack, readErrorMessage } from "./report-errors.ts";
+import { relativeToStartDirectory } from "./start-directory-path.ts";
 import { TASK_PACKAGE } from "./task-package.ts";
 
 export class TaskModuleImportFailed extends Schema.TaggedError<TaskModuleImportFailed>()(
@@ -45,13 +47,47 @@ export class TaskModuleImportFailed extends Schema.TaggedError<TaskModuleImportF
   }
 }
 
+export const RunningCommand = Schema.Struct({
+  programName: Schema.String,
+  calledAt: Schema.NullOr(Schema.String),
+  runningMilliseconds: Schema.Finite,
+});
+
+const MOST_RUNNING_COMMANDS_NAMED = 5;
+
+const describeRunningCommand = (command: typeof RunningCommand.Type) =>
+  [
+    `${command.programName} was still running`,
+    ...(command.calledAt === null
+      ? []
+      : [`called at ${relativeToStartDirectory(command.calledAt)}`]),
+    `for ${formatSeconds(command.runningMilliseconds)}`,
+  ].join(", ");
+
+const describeRunningCommands = (commands: readonly (typeof RunningCommand.Type)[]) => {
+  if (commands.length === 0) {
+    return ["no command was running"];
+  }
+  const unnamedCount = commands.length - MOST_RUNNING_COMMANDS_NAMED;
+  return [
+    ...commands
+      .slice(0, MOST_RUNNING_COMMANDS_NAMED)
+      .map((command) => describeRunningCommand(command)),
+    ...(unnamedCount > 0 ? [`and ${unnamedCount} more commands were still running`] : []),
+  ];
+};
+
 export class TaskTimedOut extends Schema.TaggedError<TaskTimedOut>()("TaskTimedOut", {
   ...TASK_ERROR_FIELDS,
   taskName: Schema.String,
   timeoutMilliseconds: Schema.Finite,
+  runningCommands: Schema.optionalKey(Schema.Array(RunningCommand)),
 }) {
   public override get message() {
-    return `timed out after ${Duration.format(Duration.millis(this.timeoutMilliseconds))}`;
+    return [
+      `timed out after ${Duration.format(Duration.millis(this.timeoutMilliseconds))}`,
+      ...(this.runningCommands === undefined ? [] : describeRunningCommands(this.runningCommands)),
+    ].join("\n");
   }
 }
 

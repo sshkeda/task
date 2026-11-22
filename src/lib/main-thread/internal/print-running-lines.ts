@@ -1,7 +1,7 @@
 import { Clock, Duration, Effect, Ref } from "effect";
 
+import { formatSeconds } from "../../../shared/format-seconds.ts";
 import { labelLine, nameTask } from "../../../shared/label-lines.ts";
-import { formatSeconds } from "../shared/format-task-lines.ts";
 import { cutToCodeUnits } from "./cut-to-code-units.ts";
 
 export const QUIET_MILLISECONDS_BEFORE_A_RUNNING_LINE = 60_000;

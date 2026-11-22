@@ -1041,7 +1041,7 @@ export default Task.make({ name: "main", run: Effect.gen(function* () {
       expect(ran.standardError).toContain("[broken] cleanup started");
       expect(ran.standardError).toContain("[main] main caught it");
       expect(ran.standardError).toMatch(
-        /\nerror: \[broken\] main\.ts:13:28: TaskTimedOut: timed out after 300ms\nended: \[main\], [\d.]+s, stopped\nerror: \[broken\] main\.ts:13:28: TaskCleanupTimedOut: its cleanup did not finish within 300ms, so the run stopped waiting for it\nerror: \[broken\] its output is in \S+\/2\.output\nended: \[broken\], [\d.]+s, failed\nrecap: \[broken\] 2\.output \| main\.ts:13:28: TaskCleanupTimedOut: its cleanup did not finish within 300ms, so the run stopped waiting for it\nfailed: \[broken\] \(1 of 2 tasks\), 1 stopped, [\d.]+s\nrun: .+\/$/u,
+        /\nerror: \[broken\] main\.ts:13:28: TaskTimedOut: timed out after 300ms\nerror: \[broken\] no command was running\nended: \[main\], [\d.]+s, stopped\nerror: \[broken\] main\.ts:13:28: TaskCleanupTimedOut: its cleanup did not finish within 300ms, so the run stopped waiting for it\nerror: \[broken\] its output is in \S+\/2\.output\nended: \[broken\], [\d.]+s, failed\nrecap: \[broken\] 2\.output \| main\.ts:13:28: TaskCleanupTimedOut: its cleanup did not finish within 300ms, so the run stopped waiting for it\nfailed: \[broken\] \(1 of 2 tasks\), 1 stopped, [\d.]+s\nrun: .+\/$/u,
       );
       expect(ran.standardError).not.toContain(STOPPED_LINE);
       expect(yield* findTaskNamesWhoseRunEnded(project, ran, ["main"])).toEqual(["main"]);

@@ -22,6 +22,11 @@ export const CurrentTaskName = Context.Reference<string | null>(
   { defaultValue: () => null },
 );
 
+export const CommandCalledAt = Context.Reference<string | null>(
+  `${TASK_PACKAGE.name}/CommandCalledAt`,
+  { defaultValue: () => null },
+);
+
 export const CommandLineFlags = Context.Reference<Readonly<Record<string, string>>>(
   `${TASK_PACKAGE.name}/CommandLineFlags`,
   { defaultValue: () => ({}) },

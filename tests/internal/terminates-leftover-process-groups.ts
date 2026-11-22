@@ -57,7 +57,7 @@ export default hang;`,
       const ran = yield* runTaskProcess(project, "main.ts");
       expect(ran.standardError).toContain("[hang] cleaned up");
       expect(ran.standardError).toMatch(
-        /^run: \S+\/\nerror: \[hang\] main\.ts:4:26: TaskTimedOut: timed out after 5s\n\[hang\] cleaned up\nerror: \[hang\] its output is in \S+\/1\.output\nended: \[hang\], [\d.]+s, failed\nrecap: \[hang\] 1\.output \| main\.ts:4:26: TaskTimedOut: timed out after 5s\nfailed: \[hang\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
+        /^run: \S+\/\nerror: \[hang\] main\.ts:4:26: TaskTimedOut: timed out after 5s\nerror: \[hang\] sh was still running, for [\d.]+s\n\[hang\] cleaned up\nerror: \[hang\] its output is in \S+\/1\.output\nended: \[hang\], [\d.]+s, failed\nrecap: \[hang\] 1\.output \| main\.ts:4:26: TaskTimedOut: timed out after 5s\nrecap: \[hang\] sh was still running, for [\d.]+s\nfailed: \[hang\] \(1 of 1 task\), [\d.]+s\nrun: \S+\/$/u,
       );
       expect(findKilledProcesses(ran.standardError)).toEqual([]);
       const processIds = (yield* read(`${project.directory}/pids`)).trim().split(" ");

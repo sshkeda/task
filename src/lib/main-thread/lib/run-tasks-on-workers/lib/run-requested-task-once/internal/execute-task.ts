@@ -11,6 +11,7 @@ import {
   Schema,
 } from "effect";
 
+import { formatSeconds } from "../../../../../../../shared/format-seconds.ts";
 import { dieOnInvariantFailure } from "../../../../../../../shared/invariant-errors.ts";
 import { labelLine, nameTask } from "../../../../../../../shared/label-lines.ts";
 import { TASK_TRACE_LABEL_PREFIX } from "../../../../../../../shared/names-from-package-json.ts";
@@ -18,14 +19,13 @@ import { WorkerExited } from "../../../../../../../shared/process-errors.ts";
 import { TaskSetupTimedOut, TaskTimedOut } from "../../../../../../../shared/task-errors.ts";
 import { withTaskSpan } from "../../../../../../../shared/task-spans.ts";
 import { failRun, failTask } from "../../../../../shared/fail-run.ts";
-import { formatSeconds } from "../../../../../shared/format-task-lines.ts";
 import { WorkerTerminatedForAnotherTask } from "../../../../../shared/main-thread-errors.ts";
 import { RunRootTaskConfig } from "../../../../../shared/provide-run-root-task-config.ts";
 import { StopState } from "../../../../../shared/provide-stop-state.ts";
 import { FromWorker, WorkerPool } from "../../../../../shared/provide-worker-pool.ts";
 import { reportTaskFailure } from "../../../../../shared/report-task-failure.ts";
 import { printTaskLines, TaskOutputFiles } from "../../../../../shared/write-task-output-files.ts";
-import type { makeTaskRunsState } from "../../../shared/define-task-run-state.ts";
+import type { makeTaskRun, makeTaskRunsState } from "../../../shared/define-task-run-state.ts";
 import {
   isBeforeBody,
   isOnWorker,
@@ -43,8 +43,22 @@ const isTaskSetupTimedOut = Schema.is(TaskSetupTimedOut);
 
 const RUN_ENDED_EVENT = "run ended before it finished";
 
-const taskTimedOut = (taskName: string, timeoutDuration: Duration.Duration) =>
-  new TaskTimedOut({ taskName, timeoutMilliseconds: Duration.toMillis(timeoutDuration) });
+const taskTimedOut = Effect.fn(function* (
+  taskName: string,
+  timeoutDuration: Duration.Duration,
+  taskRun: ReturnType<typeof makeTaskRun>,
+) {
+  const nowMilliseconds = yield* Clock.currentTimeMillis;
+  return new TaskTimedOut({
+    taskName,
+    timeoutMilliseconds: Duration.toMillis(timeoutDuration),
+    runningCommands: [...taskRun.runningCommandsById.values()].map((command) => ({
+      programName: command.programName,
+      calledAt: command.calledAt,
+      runningMilliseconds: nowMilliseconds - command.startedAtMilliseconds,
+    })),
+  });
+});
 
 const awaitWithinTimeout = <Success, Failure, Services>(
   awaiting: Effect.Effect<Success, Failure, Services>,
@@ -81,7 +95,10 @@ const failRunWhenCleanupOutlastsTimeout = Effect.fn(function* (
     timeoutDuration,
   );
   if (Option.isNone(bodyFinished)) {
-    yield* failRun(taskTimedOut(taskName, timeoutDuration), taskRunsState.markFailed);
+    yield* failRun(
+      yield* taskTimedOut(taskName, timeoutDuration, taskRun),
+      taskRunsState.markFailed,
+    );
   }
 });
 
@@ -174,7 +191,7 @@ export const executeTask = Effect.fn(
         timeoutDuration,
       );
       if (Option.isNone(outcome)) {
-        const timedOut = taskTimedOut(taskName, timeoutDuration);
+        const timedOut = yield* taskTimedOut(taskName, timeoutDuration, taskRun);
         yield* failTask(timedOut, taskRunsState.markFailed);
         yield* FiberSet.run(
           taskRunsState.taskFibers,

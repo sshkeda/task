@@ -2,6 +2,7 @@ import { Clock, Context, Deferred, Effect, FileSystem, Path, Ref, Semaphore } fr
 import type { PlatformError, Tracer } from "effect";
 
 import { writeCommandRecap } from "../../../shared/command-recap-file.ts";
+import { formatSeconds } from "../../../shared/format-seconds.ts";
 import { labelLine, nameTask, prefixTaskLines } from "../../../shared/label-lines.ts";
 import { joinOutput, OutputToJoin } from "../../../shared/label-output.ts";
 import type { OutputPiece, PRINTED_TO } from "../../../shared/label-output.ts";
@@ -17,7 +18,6 @@ import type { StackFrameBlocks } from "../../../shared/rpc.ts";
 import { TASK_PACKAGE } from "../../../shared/task-package.ts";
 import { describeCutCommandOutput } from "./cut-command-output.ts";
 import { formatRecapLines } from "./format-recap-lines.ts";
-import { formatSeconds } from "./format-task-lines.ts";
 import { makeHeldCommandOutput } from "./hold-command-output.ts";
 import { TaskOutputFilesIncomplete } from "./main-thread-errors.ts";
 import { RunRootTaskConfig } from "./provide-run-root-task-config.ts";
